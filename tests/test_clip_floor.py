@@ -34,7 +34,7 @@ def _clip(start, window_id, score=80):
     }
 
 
-def _run(monkeypatch, detail_responses):
+def _run(monkeypatch, detail_responses, stage_cost=None, return_result=False):
     """Drive get_viral_clips with canned stage results; returns (clips, calls)."""
     calls = []
 
@@ -47,18 +47,18 @@ def _run(monkeypatch, detail_responses):
             # The prompt asks for every window to be scored.
             return {"windows": [{"id": i, "start": 0, "end": 90, "score": 90 - n,
                                  "reason": "r"}
-                                for n, i in enumerate(ids)]}, None
+                                for n, i in enumerate(ids)]}, stage_cost
         windows = json.loads(prompt.split("CANDIDATE_WINDOWS_JSON:")[-1]
                              .split("Return only:")[0])
         ids = [w["id"] for w in windows]
         calls.append(("detail", ids))
-        return {"shorts": detail_responses.pop(0)}, None
+        return {"shorts": detail_responses.pop(0)}, stage_cost
 
     monkeypatch.setattr(main, "_run_gemini_stage", fake_stage)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(main.genai, "Client", lambda api_key=None: object())
     out = main.get_viral_clips(_transcript(), 600.0)
-    return (out or {}).get("shorts", []), calls
+    return (out if return_result else (out or {}).get("shorts", [])), calls
 
 
 def test_a_short_detail_result_asks_the_unused_windows(monkeypatch):
@@ -99,3 +99,24 @@ def test_scoring_fills_the_shortlist_it_targets(monkeypatch):
                                        for i in range(6)]])
     detail_windows = [c[1] for c in calls if c[0] == "detail"][0]
     assert len(detail_windows) == 8
+
+
+def test_local_cost_metadata_survives_two_pass_aggregation(monkeypatch):
+    """The dashboard needs this flag to avoid displaying local work as Gemini."""
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+    monkeypatch.setenv("LLM_MODEL", "qwen2.5:7b")
+    local_cost = {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_cost": 0.0,
+        "local": True,
+    }
+    enough = [_clip(i * 60, f"window_{i + 1:03d}") for i in range(6)]
+    result, _ = _run(
+        monkeypatch,
+        [enough],
+        stage_cost=local_cost,
+        return_result=True,
+    )
+    assert result["cost_analysis"]["local"] is True
+    assert result["cost_analysis"]["model"] == "qwen2.5:7b"
