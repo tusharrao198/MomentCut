@@ -2174,7 +2174,7 @@ function App() {
                     {results?.cost_analysis && !isManaged && (
                       <span className="readout bg-paper3 px-2.5 py-1 rounded-full" title={`Input: ${results.cost_analysis.input_tokens} | Output: ${results.cost_analysis.output_tokens}`}>
                         {results.cost_analysis.local
-                          ? `LOCAL · ${results.cost_analysis.model || 'OLLAMA'}`
+                          ? `LOCAL LLM · ${results.cost_analysis.model || 'OLLAMA'}`
                           : `GEMINI · $${results.cost_analysis.total_cost.toFixed(5)}`}
                       </span>
                     )}

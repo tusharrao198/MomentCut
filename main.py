@@ -2130,8 +2130,15 @@ def get_viral_clips(transcript_result, video_duration):
                 "output_tokens": sum(c.get("output_tokens", 0) for c in costs),
                 "total_cost": sum(c.get("total_cost", 0) for c in costs),
                 "model": model_name,
+                # Preserve the backend identity through the two-pass
+                # aggregation so the dashboard never labels a local Ollama
+                # run as a zero-cost Gemini request.
+                "local": all(c.get("local") is True for c in costs),
             }
-            print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
+            if cost_analysis["local"]:
+                print(f"\U0001f916  Local LLM analysis ({model_name}, 2-pass, {len(costs)} calls).")
+            else:
+                print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
 
         if not shorts:
             print("⚠️ 2-pass returned no clips.")
