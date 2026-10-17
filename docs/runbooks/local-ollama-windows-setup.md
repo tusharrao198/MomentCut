@@ -30,8 +30,10 @@ For the code architecture and test contract, see
 
 You need:
 
-- The `feature/local-ollama-vision` OpenShorts branch, including the local
-  Ollama vision implementation.
+- An OpenShorts branch containing the local Ollama vision implementation:
+  `feature/local-ollama-vision` for local vision alone, or
+  `feature/openshorts-postiz-youtube` for local vision plus direct local
+  Postiz → YouTube handoff.
 - Docker Desktop running in Linux-container mode.
 - NVIDIA drivers and Docker GPU support working for OpenShorts.
 - Ollama installed on the Windows host, not inside Docker.
@@ -44,10 +46,11 @@ git branch --show-current
 git log -1 --oneline
 ```
 
-Expected branch:
+Either of these branches is valid:
 
 ```text
 feature/local-ollama-vision
+feature/openshorts-postiz-youtube
 ```
 
 ### Required Docker GPU override
