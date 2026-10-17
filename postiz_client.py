@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 import os
 from pathlib import Path
 from typing import Any, Dict, List
@@ -23,6 +24,8 @@ MIN_TIMEOUT_SECONDS = 30.0
 MAX_TIMEOUT_SECONDS = 900.0
 POST_TYPES = frozenset(("draft", "now"))
 PRIVACY_TYPES = frozenset(("private", "unlisted", "public"))
+THUMBNAIL_MIME_TYPES = frozenset(("image/jpeg", "image/png"))
+MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
 
 
 class PostizError(RuntimeError):
@@ -248,6 +251,36 @@ def upload_file(config: PostizConfig, file_path: str | Path, filename: str) -> d
     return _uploaded_media(_json(response, "media upload"))
 
 
+def upload_thumbnail(
+    config: PostizConfig,
+    content: bytes,
+    filename: str,
+    content_type: str,
+) -> dict:
+    """Upload one validated JPEG/PNG thumbnail to Postiz."""
+    if content_type not in THUMBNAIL_MIME_TYPES:
+        raise PostizError("Thumbnail must be a JPEG or PNG image.")
+    if not content:
+        raise PostizError("Thumbnail image is empty.")
+    if len(content) > MAX_THUMBNAIL_BYTES:
+        raise PostizError("Thumbnail image exceeds the 2 MB limit.")
+
+    try:
+        with BytesIO(content) as thumbnail, _client(config) as client:
+            response = client.post(
+                _endpoint(config, "upload"),
+                headers=_headers(config),
+                files={"file": (filename, thumbnail, content_type)},
+            )
+    except httpx.RequestError as exc:
+        # This upload alone cannot create a YouTube post. Retrying is safe,
+        # though Postiz may retain an unused media record.
+        raise PostizError(f"Postiz thumbnail upload failed: {type(exc).__name__}.") from exc
+    if response.status_code >= 400 or response.is_redirect:
+        _raise_definite_http_error(response, "thumbnail upload")
+    return _uploaded_media(_json(response, "thumbnail upload"))
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -258,6 +291,7 @@ def create_youtube_post(
     media: dict,
     title: str,
     description: str,
+    thumbnail: dict | None = None,
 ) -> str:
     """Create one Postiz YouTube draft/now post.
 
@@ -274,6 +308,21 @@ def create_youtube_post(
         raise PostizError("Postiz returned an invalid YouTube integration id.")
     if not media_id or not media_path:
         raise PostizError("Saved Postiz media state is invalid.")
+
+    thumbnail_settings = {}
+    if thumbnail is not None:
+        thumbnail_id = thumbnail.get("id") if isinstance(thumbnail, dict) else None
+        thumbnail_path = thumbnail.get("path") if isinstance(thumbnail, dict) else None
+        thumbnail_id = thumbnail_id.strip() if isinstance(thumbnail_id, str) else ""
+        thumbnail_path = thumbnail_path.strip() if isinstance(thumbnail_path, str) else ""
+        if not thumbnail_id or not thumbnail_path:
+            raise PostizError("Saved Postiz thumbnail state is invalid.")
+        thumbnail_settings = {
+            "thumbnail": {
+                "id": thumbnail_id,
+                "path": thumbnail_path,
+            }
+        }
 
     payload = {
         "type": config.post_type,
@@ -292,6 +341,7 @@ def create_youtube_post(
                 "type": config.privacy_status,
                 "selfDeclaredMadeForKids": "no",
                 "tags": [],
+                **thumbnail_settings,
             },
         }],
     }

@@ -93,6 +93,38 @@ def test_upload_rejects_redirect_and_malformed_response(tmp_path, monkeypatch):
         pc.upload_file(pc.configuration(), clip, "clip.mp4")
 
 
+def test_upload_thumbnail_uses_raw_authorization_header_and_validates_input(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["authorization"] = request.headers.get("authorization")
+        seen["body"] = request.read()
+        return httpx.Response(
+            201, json={"id": "thumbnail-1", "path": "/uploads/thumbnail.png"}
+        )
+
+    _install_transport(monkeypatch, handler)
+    thumbnail = b"\x89PNG\r\n\x1a\nsmall-thumbnail"
+    media = pc.upload_thumbnail(
+        pc.configuration(), thumbnail, "thumbnail.png", "image/png"
+    )
+
+    assert media == {"id": "thumbnail-1", "path": "/uploads/thumbnail.png"}
+    assert seen["authorization"] == "postiz-test-key"
+    assert b'name="file"' in seen["body"]
+    assert thumbnail in seen["body"]
+
+    with pytest.raises(pc.PostizError, match="JPEG or PNG"):
+        pc.upload_thumbnail(pc.configuration(), b"image", "thumbnail.gif", "image/gif")
+    with pytest.raises(pc.PostizError, match="2 MB"):
+        pc.upload_thumbnail(
+            pc.configuration(),
+            b"x" * (pc.MAX_THUMBNAIL_BYTES + 1),
+            "thumbnail.png",
+            "image/png",
+        )
+
+
 def test_resolve_youtube_requires_enabled_identifier_and_unambiguous_choice(monkeypatch):
     config = pc.configuration()
 
@@ -176,6 +208,30 @@ def test_create_post_has_exact_youtube_media_shape_and_parses_array_response(mon
                 "tags": [],
             },
         }],
+    }
+
+
+def test_create_post_includes_optional_youtube_thumbnail(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(201, json=[{"postId": "post-123"}])
+
+    _install_transport(monkeypatch, handler)
+    post_id = pc.create_youtube_post(
+        pc.configuration(),
+        "yt-1",
+        {"id": "media-1", "path": "/uploads/clip.mp4"},
+        "A valid title",
+        "Description",
+        {"id": "thumbnail-1", "path": "/uploads/thumbnail.png"},
+    )
+
+    assert post_id == "post-123"
+    assert seen["body"]["posts"][0]["settings"]["thumbnail"] == {
+        "id": "thumbnail-1",
+        "path": "/uploads/thumbnail.png",
     }
 
 
