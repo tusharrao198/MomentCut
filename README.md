@@ -323,6 +323,19 @@ code architecture. Three things to know:
   video picker does not automatically make those unrelated optional features
   local.
 
+### 7. Send finished clips to local Postiz (optional)
+
+If you self-host [Postiz](https://postiz.com) with a YouTube account already
+connected, OpenShorts can send the current rendered MP4 directly to Postiz
+from the completed clip card. Postiz then creates a YouTube draft (the default)
+or receives the clip for immediate publishing, according to your local
+configuration.
+
+The Postiz API key stays in the OpenShorts backend `.env`; it is never exposed
+to the browser. The two Docker stacks communicate only on a private Docker
+network and their browser ports stay bound to `127.0.0.1`. Follow the
+[`local Postiz → YouTube runbook`](docs/runbooks/postiz-youtube-local.md).
+
 ## Technical Pipeline
 
 ### Clip Generator
@@ -443,7 +456,7 @@ lives in [`examples/n8n/`](examples/n8n/).
 | Frontend | React 18, Vite 4, Tailwind CSS 3.4 |
 | AI APIs | Google Gemini, fal.ai (Flux, Hailuo, VEED, Kling), ElevenLabs |
 | Infrastructure | Docker + Docker Compose, AWS S3 |
-| Publishing | Upload-Post API (TikTok, Instagram, YouTube) |
+| Publishing | Upload-Post API (TikTok, Instagram, YouTube); optional self-hosted Postiz bridge for YouTube |
 
 ---
 
@@ -465,6 +478,12 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `VISION_PROVIDER` | Set to `ollama` to enable local visual selection for silent / wordless videos |
 | `VISION_BASE_URL` | Allow-listed local native Ollama endpoint (default `http://host.docker.internal:11434`) |
 | `VISION_MODEL` | Local visual model (default `qwen2.5vl:3b`) |
+| `POSTIZ_API_BASE_URL` | Fixed private Docker endpoint for optional local Postiz publishing (`http://postiz:5000/api/public/v1`) |
+| `POSTIZ_API_KEY` | Postiz Public API key; backend-only |
+| `POSTIZ_YOUTUBE_INTEGRATION_ID` | Connected Postiz YouTube integration; required only if more than one is enabled |
+| `POSTIZ_DEFAULT_POST_TYPE` | `draft` (default) or `now` |
+| `POSTIZ_YOUTUBE_PRIVACY_STATUS` | `private` (recommended), `unlisted`, or `public` |
+| `POSTIZ_TIMEOUT_SECONDS` | Postiz request timeout, 30–900 seconds (default 300) |
 
 **Client-side (encrypted in localStorage):**
 | Key | Description |

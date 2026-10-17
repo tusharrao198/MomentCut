@@ -175,7 +175,7 @@ def test_resumed_job_keeps_its_safety_cap(dirs, monkeypatch):
 def test_child_env_drops_server_secrets(monkeypatch):
     for name in ("STRIPE_SECRET_KEY", "JWT_SECRET", "DATABASE_URL", "SMTP_PASSWORD",
                  "TELEGRAM_BOT_TOKEN", "AGENTLEDGER_API_KEY", "R2_SECRET_ACCESS_KEY",
-                 "MANAGED_UPLOAD_POST_API_KEY", "GOOGLE_CLIENT_SECRET"):
+                 "MANAGED_UPLOAD_POST_API_KEY", "GOOGLE_CLIENT_SECRET", "POSTIZ_API_KEY"):
         monkeypatch.setenv(name, "secret")
     for name in ("YOUTUBE_COOKIES", "PROXY_URL", "STATIC_PROXY_URLS", "GEMINI_API_KEY",
                  "BGUTIL_SCRIPT_PATH", "FFMPEG_ENCODER", "WHISPER_MODEL"):

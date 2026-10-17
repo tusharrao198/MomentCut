@@ -1,0 +1,12 @@
+services:
+  # Only the backend needs Postiz access. The frontend remains on its normal
+  # default network and the browser-facing ports remain loopback-only.
+  backend:
+    networks:
+      - default
+      - openshorts-postiz
+
+networks:
+  openshorts-postiz:
+    external: true
+    name: openshorts-postiz
