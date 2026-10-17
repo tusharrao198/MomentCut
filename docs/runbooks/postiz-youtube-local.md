@@ -16,6 +16,10 @@ secret in OpenShorts.
 
 - Postiz must already be locally running and connected to YouTube.
 - Upgrade Postiz to `v2.21.3` or newer.
+- When Postiz uses `STORAGE_PROVIDER=local`, apply the companion local-media
+  patch before using this integration. It lets Postiz read its own private
+  `/uploads` files for both YouTube MP4 and thumbnail uploads without weakening
+  SSRF protection.
 - Create a **Postiz Public API key** in the same Postiz account that owns the
   YouTube connection.
 - Keep both dashboard host ports on `127.0.0.1`.
@@ -179,13 +183,18 @@ integration ID in `POSTIZ_YOUTUBE_INTEGRATION_ID` and recreate the backend.
 ## Use it
 
 1. Generate clips in OpenShorts.
-2. On the chosen finished clip, click **send to postiz**.
-3. With `draft`, find the new draft in Postiz and review/schedule it.
-4. With `now`, Postiz uploads it to YouTube using its connected account.
+2. Optional: click **add thumbnail** on that clip and choose a JPEG or PNG
+   image up to 2 MB. You can click it again to replace the selection, or
+   **clear thumb** to send the clip without one.
+3. Click **send to postiz**.
+4. With `draft`, find the new draft in Postiz and review/schedule it.
+5. With `now`, Postiz uploads it to YouTube using its connected account.
 
 OpenShorts sends the current edited version of the MP4. A subtitle, hook,
 reframe, or edit changes the file fingerprint, so the updated clip may be
-sent once as its own version.
+sent once as its own version. The optional thumbnail travels from the dashboard
+to OpenShorts, then through the same private Docker network to Postiz. The
+Postiz API key never reaches the dashboard or browser storage.
 
 ## Safety and recovery
 

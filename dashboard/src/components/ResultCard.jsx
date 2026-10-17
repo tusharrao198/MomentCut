@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Languages, FileText, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Languages, FileText, Scissors, Crosshair, TrendingUp, ImagePlus, X } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import SubtitleModal from './SubtitleModal';
@@ -176,10 +176,14 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
 
     const [postizSending, setPostizSending] = useState(false);
     const [postizResult, setPostizResult] = useState(null);
+    const postizThumbnailInputRef = useRef(null);
+    const [postizThumbnail, setPostizThumbnail] = useState(null);
     const [copied, setCopied] = useState(null);
 
     useEffect(() => {
         setPostizResult(null);
+        setPostizThumbnail(null);
+        if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
     }, [clip.video_url]);
 
     const handleCopy = async (field, text) => {
@@ -623,11 +627,21 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
         setPostizSending(true);
         setPostizResult(null);
         try {
-            const res = await apiFetch('/api/postiz/publish', {
+            let path = '/api/postiz/publish';
+            let options = {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ job_id: jobId, clip_index: index })
-            });
+            };
+            if (postizThumbnail) {
+                const form = new FormData();
+                form.append('job_id', jobId);
+                form.append('clip_index', String(index));
+                form.append('thumbnail', postizThumbnail);
+                path = '/api/postiz/publish-thumbnail';
+                options = { method: 'POST', body: form };
+            }
+            const res = await apiFetch(path, options);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.detail || "Could not send this clip to Postiz.");
             setPostizResult({ success: true, msg: data.message || "Sent to Postiz." });
@@ -636,6 +650,23 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
         } finally {
             setPostizSending(false);
         }
+    };
+
+    const handlePostizThumbnailChange = (event) => {
+        const selected = event.target.files?.[0] || null;
+        if (!selected) return;
+        if (selected.type && !['image/jpeg', 'image/png'].includes(selected.type)) {
+            setPostizResult({ success: false, msg: 'Thumbnail must be a JPEG or PNG image.' });
+            event.target.value = '';
+            return;
+        }
+        if (selected.size > 2 * 1024 * 1024) {
+            setPostizResult({ success: false, msg: 'Thumbnail image exceeds the 2 MB limit.' });
+            event.target.value = '';
+            return;
+        }
+        setPostizResult(null);
+        setPostizThumbnail(selected);
     };
 
     const isVideoChanging = isEditing || isSubtitling || isHooking || isTranslating
@@ -881,6 +912,39 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                         {isTranslating ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Languages size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
                         {isTranslating ? 'translating…' : 'dub voice'}
                     </button>
+
+                    <input
+                        ref={postizThumbnailInputRef}
+                        type="file"
+                        accept="image/jpeg,image/png"
+                        className="hidden"
+                        onChange={handlePostizThumbnailChange}
+                    />
+                    <button
+                        onClick={() => postizThumbnailInputRef.current?.click()}
+                        disabled={postizSending || isVideoChanging}
+                        title={postizThumbnail
+                            ? `Selected thumbnail: ${postizThumbnail.name}. Click to replace it.`
+                            : 'Optional: select a JPEG or PNG YouTube thumbnail (maximum 2 MB)'}
+                        className={QUIET_BTN}
+                    >
+                        <ImagePlus size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                        {postizThumbnail ? 'thumb ready' : 'add thumbnail'}
+                    </button>
+                    {postizThumbnail && (
+                        <button
+                            onClick={() => {
+                                setPostizThumbnail(null);
+                                if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
+                            }}
+                            disabled={postizSending}
+                            title="Remove the selected thumbnail before sending"
+                            className={QUIET_BTN}
+                        >
+                            <X size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                            clear thumb
+                        </button>
+                    )}
 
                     <button
                         onClick={handleSendToPostiz}

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 
@@ -11,6 +12,9 @@ app_module = pytest.importorskip("app")
 
 JOB_ID = "12345678-1234-1234-1234-123456789abc"
 ORIGIN = "http://localhost:5175"
+VALID_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL0bQAAAABJRU5ErkJggg=="
+)
 
 
 def _request(method, path, **kwargs):
@@ -59,6 +63,16 @@ def _publish():
         "/api/postiz/publish",
         headers={"Origin": ORIGIN},
         json={"job_id": JOB_ID, "clip_index": 0},
+    )
+
+
+def _publish_with_thumbnail(content=VALID_PNG, content_type="image/png"):
+    return _request(
+        "post",
+        "/api/postiz/publish-thumbnail",
+        headers={"Origin": ORIGIN},
+        data={"job_id": JOB_ID, "clip_index": "0"},
+        files={"thumbnail": ("thumbnail.png", content, content_type)},
     )
 
 
@@ -121,6 +135,71 @@ def test_postiz_publish_creates_once_then_reuses_same_rendered_version(postiz_jo
     assert second.json()["reused"] is True
     assert uploaded == [(str(postiz_job[0] / "clip.mp4"), "clip.mp4")]
     assert created == [True]
+
+
+def test_postiz_publish_thumbnail_uploads_and_attaches_it(postiz_job, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        postiz_client,
+        "resolve_youtube_integration",
+        lambda _config: {"id": "yt-1", "identifier": "youtube"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_file",
+        lambda *_args: {"id": "media-1", "path": "/uploads/clip.mp4"},
+    )
+
+    def upload_thumbnail(_config, content, filename, content_type):
+        captured.update(
+            thumbnail_content=content,
+            thumbnail_filename=filename,
+            thumbnail_content_type=content_type,
+        )
+        return {"id": "thumbnail-1", "path": "/uploads/thumbnail.png"}
+
+    def create_post(_config, _integration_id, _media, _title, _description, thumbnail=None):
+        captured["thumbnail_media"] = thumbnail
+        return "post-1"
+
+    monkeypatch.setattr(postiz_client, "upload_thumbnail", upload_thumbnail)
+    monkeypatch.setattr(postiz_client, "create_youtube_post", create_post)
+
+    response = _publish_with_thumbnail()
+
+    assert response.status_code == 200
+    assert captured["thumbnail_content"] == VALID_PNG
+    assert captured["thumbnail_content_type"] == "image/png"
+    assert captured["thumbnail_filename"].endswith(".png")
+    assert captured["thumbnail_media"] == {
+        "id": "thumbnail-1",
+        "path": "/uploads/thumbnail.png",
+    }
+    state = json.loads(
+        (postiz_job[0] / app_module.POSTIZ_PUBLISH_STATE_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+    record = next(iter(state["versions"].values()))
+    assert record["thumbnail"]["media"] == captured["thumbnail_media"]
+
+
+def test_postiz_publish_thumbnail_rejects_invalid_image_before_upload(postiz_job, monkeypatch):
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_file",
+        lambda *_args: pytest.fail("must not upload the video"),
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_thumbnail",
+        lambda *_args: pytest.fail("must not upload the thumbnail"),
+    )
+
+    response = _publish_with_thumbnail(b"not-an-image")
+
+    assert response.status_code == 400
+    assert "valid JPEG or PNG" in response.json()["detail"]
 
 
 def test_postiz_pending_state_fails_closed_after_restart(postiz_job, monkeypatch):

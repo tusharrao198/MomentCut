@@ -17,6 +17,7 @@ import math
 import itertools
 import functools
 import asyncio
+import io
 import signal
 import socket
 from pathlib import Path
@@ -31,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
+from PIL import Image, UnidentifiedImageError
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
@@ -5620,6 +5622,8 @@ async def translate_clip(
 POSTIZ_PUBLISH_STATE_FILE = ".postiz_publish_state.json"
 _postiz_publish_locks: Dict[tuple[str, int], asyncio.Lock] = {}
 _postiz_publish_locks_guard = asyncio.Lock()
+POSTIZ_THUMBNAIL_CHUNK_BYTES = 64 * 1024
+POSTIZ_THUMBNAIL_MAX_PIXELS = 16_000_000
 
 
 class PostizStateError(RuntimeError):
@@ -5629,6 +5633,53 @@ class PostizStateError(RuntimeError):
 class PostizPublishRequest(BaseModel):
     job_id: str
     clip_index: int
+
+
+async def _read_postiz_thumbnail(upload: UploadFile) -> dict:
+    """Read a small, valid JPEG/PNG thumbnail without trusting browser metadata."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = await upload.read(POSTIZ_THUMBNAIL_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > postiz_client.MAX_THUMBNAIL_BYTES:
+            raise HTTPException(status_code=413, detail="Thumbnail image exceeds the 2 MB limit.")
+        chunks.append(chunk)
+
+    content = b"".join(chunks)
+    if not content:
+        raise HTTPException(status_code=400, detail="Thumbnail image is empty.")
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            image_format = image.format
+            width, height = image.size
+            image.verify()
+    except (
+        Image.DecompressionBombError,
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ):
+        raise HTTPException(status_code=400, detail="Thumbnail must be a valid JPEG or PNG image.")
+    if image_format == "JPEG":
+        content_type, extension = "image/jpeg", "jpg"
+    elif image_format == "PNG":
+        content_type, extension = "image/png", "png"
+    else:
+        raise HTTPException(status_code=400, detail="Thumbnail must be a JPEG or PNG image.")
+    if width <= 0 or height <= 0 or width * height > POSTIZ_THUMBNAIL_MAX_PIXELS:
+        raise HTTPException(status_code=400, detail="Thumbnail dimensions are too large.")
+
+    digest = hashlib.sha256(content).hexdigest()
+    return {
+        "content": content,
+        "content_type": content_type,
+        "filename": f"openshorts-thumbnail-{digest[:16]}.{extension}",
+        "sha256": digest,
+    }
 
 
 def _require_postiz_dashboard_origin(request: Request) -> None:
@@ -5786,9 +5837,12 @@ def _postiz_http_error(error: postiz_client.PostizError) -> HTTPException:
     return HTTPException(status_code=status, detail=str(error))
 
 
-@app.post("/api/postiz/publish")
-async def post_to_postiz(req: PostizPublishRequest, request: Request):
-    """Send the selected current MP4 to the one configured Postiz YouTube account."""
+async def _post_to_postiz(
+    req: PostizPublishRequest,
+    request: Request,
+    thumbnail: Optional[dict] = None,
+):
+    """Send the selected current MP4 and optional thumbnail to local Postiz."""
     _require_postiz_dashboard_origin(request)
     try:
         config = postiz_client.configuration()
@@ -5895,6 +5949,65 @@ async def post_to_postiz(req: PostizPublishRequest, request: Request):
         if not isinstance(media, dict) or not media.get("id") or not media.get("path"):
             raise HTTPException(status_code=409, detail="Saved Postiz media state is invalid.")
 
+        thumbnail_media = None
+        stored_thumbnail = record.get("thumbnail")
+        if thumbnail is not None:
+            thumbnail_fingerprint = thumbnail.get("sha256")
+            thumbnail_content = thumbnail.get("content")
+            thumbnail_filename = thumbnail.get("filename")
+            thumbnail_content_type = thumbnail.get("content_type")
+            if (
+                not isinstance(thumbnail_fingerprint, str)
+                or not thumbnail_fingerprint
+                or not isinstance(thumbnail_content, bytes)
+                or not isinstance(thumbnail_filename, str)
+                or not isinstance(thumbnail_content_type, str)
+            ):
+                raise HTTPException(status_code=400, detail="Thumbnail image is invalid.")
+
+            same_thumbnail = (
+                isinstance(stored_thumbnail, dict)
+                and stored_thumbnail.get("sha256") == thumbnail_fingerprint
+                and isinstance(stored_thumbnail.get("media"), dict)
+                and stored_thumbnail["media"].get("id")
+                and stored_thumbnail["media"].get("path")
+            )
+            if same_thumbnail:
+                thumbnail_media = stored_thumbnail["media"]
+            else:
+                try:
+                    thumbnail_media = await asyncio.to_thread(
+                        postiz_client.upload_thumbnail,
+                        config,
+                        thumbnail_content,
+                        thumbnail_filename,
+                        thumbnail_content_type,
+                    )
+                except postiz_client.PostizError as exc:
+                    raise _postiz_http_error(exc) from exc
+                record["thumbnail"] = {
+                    "filename": thumbnail_filename,
+                    "sha256": thumbnail_fingerprint,
+                    "media": thumbnail_media,
+                }
+                try:
+                    await asyncio.to_thread(_write_postiz_state, state_path, state)
+                except PostizStateError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+        elif stored_thumbnail is not None:
+            if (
+                not isinstance(stored_thumbnail, dict)
+                or not isinstance(stored_thumbnail.get("sha256"), str)
+                or not isinstance(stored_thumbnail.get("media"), dict)
+                or not stored_thumbnail["media"].get("id")
+                or not stored_thumbnail["media"].get("path")
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Saved Postiz thumbnail state is invalid. Check Postiz before retrying.",
+                )
+            thumbnail_media = stored_thumbnail["media"]
+
         # This durable transition is deliberately before the non-idempotent
         # create request. A crash after Postiz accepts the call cannot result in
         # OpenShorts blindly creating a second YouTube post on the next click.
@@ -5908,14 +6021,25 @@ async def post_to_postiz(req: PostizPublishRequest, request: Request):
 
         title, description = _postiz_metadata(clip_snapshot)
         try:
-            post_id = await asyncio.to_thread(
-                postiz_client.create_youtube_post,
-                config,
-                str(integration.get("id") or ""),
-                media,
-                title,
-                description,
-            )
+            if thumbnail_media is None:
+                post_id = await asyncio.to_thread(
+                    postiz_client.create_youtube_post,
+                    config,
+                    str(integration.get("id") or ""),
+                    media,
+                    title,
+                    description,
+                )
+            else:
+                post_id = await asyncio.to_thread(
+                    postiz_client.create_youtube_post,
+                    config,
+                    str(integration.get("id") or ""),
+                    media,
+                    title,
+                    description,
+                    thumbnail_media,
+                )
         except postiz_client.PostizOutcomeUnknown as exc:
             record["state"] = "post_create_unknown"
             try:
@@ -5958,6 +6082,32 @@ async def post_to_postiz(req: PostizPublishRequest, request: Request):
             "postId": post_id,
             "message": message,
         }
+
+
+@app.post("/api/postiz/publish")
+async def post_to_postiz(req: PostizPublishRequest, request: Request):
+    """Send the selected current MP4 to the one configured Postiz YouTube account."""
+    return await _post_to_postiz(req, request)
+
+
+@app.post("/api/postiz/publish-thumbnail")
+async def post_to_postiz_with_thumbnail(
+    request: Request,
+    job_id: str = Form(...),
+    clip_index: int = Form(...),
+    thumbnail: UploadFile = File(...),
+):
+    """Send the selected current MP4 and a custom thumbnail to local Postiz."""
+    _require_postiz_dashboard_origin(request)
+    try:
+        selected_thumbnail = await _read_postiz_thumbnail(thumbnail)
+        return await _post_to_postiz(
+            PostizPublishRequest(job_id=job_id, clip_index=clip_index),
+            request,
+            selected_thumbnail,
+        )
+    finally:
+        await thumbnail.close()
 
 
 class SocialPostRequest(BaseModel):
