@@ -66,6 +66,13 @@ def test_accepts_docker_host_endpoint(local_vision):
     assert local_vision.base_url == "http://host.docker.internal:11434"
 
 
+def test_blank_model_uses_the_approved_default(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "ollama")
+    monkeypatch.setenv("VISION_BASE_URL", "http://localhost:11434")
+    monkeypatch.setenv("VISION_MODEL", "")
+    assert vision._config(60).model == "qwen2.5vl:3b"
+
+
 def test_clamps_tunables_and_rejects_window_that_cannot_cover_a_clip(monkeypatch):
     monkeypatch.setenv("VISION_PROVIDER", "ollama")
     monkeypatch.setenv("VISION_BASE_URL", "http://localhost:11434")
@@ -120,6 +127,11 @@ def test_overlapping_windows_cover_every_maximum_length_candidate():
                    for window_start, window_end in windows)
 
 
+def test_low_regular_frame_count_still_adds_at_most_two_scene_frames():
+    samples = vision._sample_times(0, 120, list(range(1, 120)), 4)
+    assert len(samples) == 6
+
+
 def test_scene_snap_only_applies_when_duration_remains_valid():
     assert vision._snap_to_scenes(
         10.9, 40.2, [11.0, 41.0], 15, 60, 2
@@ -163,6 +175,21 @@ def test_bad_json_gets_exactly_one_corrective_retry(local_vision, monkeypatch):
     assert result["shorts"][0]["predicted_score"] == 80
     assert len(calls) == 2
     assert "prior response was invalid" in calls[1]["messages"][0]["content"]
+
+
+def test_two_bad_json_replies_fail_after_one_corrective_retry(local_vision):
+    calls = {"count": 0}
+
+    class Client:
+        def post(self, _url, json):
+            calls["count"] += 1
+            return httpx.Response(200, json={"message": {"content": "not json"}})
+
+    with pytest.raises(vision.LocalVisionError, match="after one correction attempt"):
+        vision._window_response(
+            Client(), local_vision, "prompt", ["frame"], "Local vision window 0s–60s"
+        )
+    assert calls["count"] == 2
 
 
 def test_503_retries_are_bounded(local_vision, monkeypatch):
@@ -231,6 +258,41 @@ def test_one_failed_window_fails_the_job_and_attempts_unload(local_vision, monke
             "source.mp4", 180, "en", 1, 3, 15, 60
         )
     assert unloaded == [True]
+
+
+def test_decode_failure_names_the_failed_window(local_vision, monkeypatch):
+    class Capture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(vision.cv2, "VideoCapture", Capture)
+    monkeypatch.setattr(vision, "_client", lambda **_kwargs: Client())
+    monkeypatch.setattr(vision, "_preflight_model", lambda *_args: None)
+    monkeypatch.setattr(vision, "_scene_boundaries", lambda *_args: [])
+    monkeypatch.setattr(
+        vision, "_decode_samples",
+        lambda *_args: (_ for _ in ()).throw(
+            vision.LocalVisionError("could not decode any frame")),
+    )
+    monkeypatch.setattr(vision, "_unload", lambda *_args: None)
+
+    with pytest.raises(
+            vision.LocalVisionError,
+            match=r"Local vision window 0\.000s–120\.000s: could not decode any frame"):
+        vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
 
 
 def test_duplicate_candidates_keep_the_higher_score():

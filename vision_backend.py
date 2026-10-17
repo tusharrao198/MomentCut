@@ -293,13 +293,17 @@ def _sample_times(window_start: float, window_end: float,
             candidates.append(min(window_end - 0.001, max(window_start, boundary + 0.02)))
 
     remaining = set(candidates)
-    while remaining and len(selected) < _MAX_IMAGES_PER_WINDOW:
+    # Scene cuts supplement the regular grid; they do not replace it or grow
+    # without bound when the caller deliberately lowers the regular frame count.
+    extra_limit = min(2, _MAX_IMAGES_PER_WINDOW - len(selected))
+    while remaining and extra_limit > 0:
         candidate = max(
             remaining,
             key=lambda value: min(abs(value - existing) for existing in selected),
         )
         selected.append(candidate)
         remaining.remove(candidate)
+        extra_limit -= 1
 
     return sorted({round(max(window_start, min(window_end, value)), 3)
                    for value in selected})[:_MAX_IMAGES_PER_WINDOW]
@@ -619,8 +623,16 @@ def select_clips(video_path: str, video_duration: float, language: str,
                 sample_times = _sample_times(
                     window_start, window_end, scene_boundaries,
                     config.frames_per_window)
-                frame_timestamps, images = _decode_samples(
-                    video_path, duration, sample_times, config.max_frame_width)
+                try:
+                    frame_timestamps, images = _decode_samples(
+                        video_path, duration, sample_times, config.max_frame_width)
+                except LocalVisionError as exc:
+                    raise LocalVisionError(f"{label}: {exc}") from exc
+                except Exception as exc:
+                    raise LocalVisionError(
+                        f"{label}: local frame decoding failed "
+                        f"({type(exc).__name__}: {exc})."
+                    ) from exc
                 prompt = _visual_prompt(
                     window_start=window_start,
                     window_end=window_end,
