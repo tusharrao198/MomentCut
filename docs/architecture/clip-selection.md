@@ -33,19 +33,27 @@ Music-only footage and mic-muted recordings transcribe to a handful of stray
 words; without the second test the picker scores those words and cuts around
 them.
 
-The vision pass uploads the video, Gemini returns the same `{"shorts"}` shape
-(`gemini_worker.VisualResponse`) in the same 15-60 s band, so every later stage
-is identical. `CLIP_TARGET_MIN`/`MAX` apply directly (there are no scoring
-windows). The transcript is stored as `{"language": "none", "segments": []}`, so
-the clips have no subtitles, which is correct.
+By default, the vision pass uploads the video to Gemini and receives the same
+`{"shorts"}` shape (`gemini_worker.VisualResponse`) in the same 15-60 s band,
+so every later stage is identical. `CLIP_TARGET_MIN`/`MAX` apply directly
+(there are no transcript scoring windows). The transcript is stored as
+`{"language": "none", "segments": []}`, so the clips have no subtitles, which is
+correct.
 
-**This is the one stage that sends Gemini the video instead of frames, on
-purpose**: frames can say what kind of video it is, not which 40 seconds to cut.
-The ceiling: ~300 tokens/second, so an hour is ~1.08M tokens, past a 1M window,
-and **nothing guards the length**. If that needs fixing, add a guard or segment
-the source; do not port the frame trick. Gemini-only: a text-only `LLM_BASE_URL`
-server cannot see footage, and without `GEMINI_API_KEY` the function logs one
-line and returns None, which fails the job.
+`VISION_PROVIDER=ollama` opts silent-video selection into the private local
+adapter instead. It sends only timestamped JPEG frame samples to the
+allow-listed local Ollama endpoint and uses `qwen2.5vl:3b` by default. It never
+falls back to Gemini on failure. The local path supports clip maxima through
+60 seconds and uses 120-second windows with 60-second overlap; see
+[`../runbooks/local-ollama-windows-setup.md`](../runbooks/local-ollama-windows-setup.md)
+for configuration and operating steps, and
+[`local-ollama-vision.md`](local-ollama-vision.md) for implementation and test
+behavior.
+
+The default Gemini path is still the one stage that sends Gemini the whole
+video rather than frames. Its length ceiling remains unguarded; add a guard or
+segment the source if that becomes a concern. A text-only `LLM_BASE_URL` server
+alone cannot see footage.
 
 The public `/gta-5-clips` page states these thresholds and this ceiling; if the
 behaviour changes, change `dashboard/seo/pages.js` too.
@@ -59,5 +67,7 @@ server-side, so `main.py` sees one shape. `main.score_batch_size` drops to 3
 windows per call there (local contexts are 4-8k; a truncated prompt scores garbage
 silently). Self-host `/api/process` then accepts a request without
 `X-Gemini-Key` and `/api/config.localLlm` tells the dashboard not to demand one.
-Frame-based stages (`layout_picker`, `screencast_layout`, `get_visual_clips`)
-stay on Gemini. Never wired in cloud mode: `BILLING_ENABLED` ignores it.
+Frame-based stages (`layout_picker`, `screencast_layout`) stay on Gemini.
+`get_visual_clips` stays on Gemini unless `VISION_PROVIDER=ollama` activates
+the local adapter. Never wired in cloud mode: `BILLING_ENABLED` ignores the
+local text route.

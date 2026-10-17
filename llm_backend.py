@@ -6,12 +6,12 @@ Ollama, LM Studio, vLLM, llama.cpp's server, LocalAI and OpenRouter all speak
 ``main.get_viral_clips`` go here instead of Gemini, so a self-hosted install
 can run the whole pipeline without a Google key.
 
-What stays on Gemini, because it needs a model that can look at frames or a
-video file: the layout picker (``layout_picker.py``), the on-screen content
-detector (``screencast_layout.py``) and the silent-video path
-(``main.get_visual_clips``). Without a Gemini key those degrade the way they
-already did: the first two return "none", the third fails the job with a clear
-message. Nothing in this module is imported by them.
+What stays on Gemini by default, because it needs a model that can look at
+frames or a video file: the layout picker (``layout_picker.py``), the
+on-screen content detector (``screencast_layout.py``) and the silent-video
+path (``main.get_visual_clips``). ``VISION_PROVIDER=ollama`` opts the last
+one into the separate native-Ollama adapter in ``vision_backend.py``. Nothing
+in this module is imported by those frame-based stages.
 
 Structured output: the prompts already spell out the exact JSON shape, so a
 plain ``json_object`` mode is enough for most models. The request first asks

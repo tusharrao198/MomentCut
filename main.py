@@ -29,6 +29,7 @@ import gemini_worker
 import hook_grounding
 import layout_picker
 import llm_backend
+import vision_backend
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
@@ -2169,9 +2170,34 @@ def speech_is_sparse(transcript, duration):
 
 
 def get_visual_clips(video_path, video_duration, language="en"):
-    """Clip a SILENT video by vision: Gemini watches the footage and picks the
-    most engaging visual moments (no transcript). Returns the same
-    {"shorts", "cost_analysis"} shape as get_viral_clips, or None."""
+    """Clip a silent video by vision, locally when configured or via Gemini.
+
+    Both paths return the same ``{"shorts", "cost_analysis"}`` shape as
+    ``get_viral_clips``. Local vision deliberately raises a precise error when
+    unavailable instead of silently uploading footage to Gemini.
+    """
+    if vision_backend.active():
+        print("🎥  Silent video — analyzing with local Ollama vision (no transcript)...")
+
+        def _env_int(name, default):
+            try:
+                return max(1, int(os.environ.get(name, "")))
+            except ValueError:
+                return default
+
+        min_clips = _env_int("CLIP_TARGET_MIN", 3)
+        max_clips = max(min_clips, _env_int("CLIP_TARGET_MAX", 15))
+        min_secs, max_secs = clip_duration_bounds()
+        return vision_backend.select_clips(
+            video_path=video_path,
+            video_duration=video_duration,
+            language=language,
+            min_clips=min_clips,
+            max_clips=max_clips,
+            min_seconds=min_secs,
+            max_seconds=max_secs,
+        )
+
     print("🎥  Silent video — analyzing with Gemini vision (no transcript)...")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
