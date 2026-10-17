@@ -1,5 +1,6 @@
 import os
 import llm_backend
+import postiz_client
 import re
 import sys
 import uuid
@@ -18,6 +19,8 @@ import functools
 import asyncio
 import signal
 import socket
+from pathlib import Path
+from urllib.parse import urlsplit
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
@@ -86,6 +89,7 @@ CHILD_ENV_DENYLIST = frozenset({
     "GOOGLE_CLIENT_SECRET",
     "AGENTLEDGER_API_KEY",
     "MANAGED_UPLOAD_POST_API_KEY", "MANAGED_GEMINI_API_KEY", "UPLOAD_POST_API_KEY",
+    "POSTIZ_API_KEY",
     "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
     "OPENPANEL_CLIENT_SECRET", "ELEVENLABS_API_KEY",
@@ -124,6 +128,53 @@ for _stream in (sys.stdout, sys.stderr):
 # when BILLING_ENABLED is set. With the flag off, the app behaves exactly as the
 # self-hosted BYOK app does today (no extra dependencies required).
 BILLING_ENABLED = os.environ.get("BILLING_ENABLED", "").lower() in ("1", "true", "yes")
+
+
+_DEFAULT_LOCAL_DASHBOARD_ORIGINS = (
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+)
+
+
+def _local_dashboard_origins() -> tuple[str, ...]:
+    """Validated loopback-only browser origins for a self-hosted dashboard.
+
+    A server-held Postiz key turns this API into a local publishing capability.
+    Wildcard CORS would let a malicious webpage opened in the user's browser
+    ask localhost to publish, so self-host uses an explicit origin allow-list.
+    """
+    raw = (os.environ.get("LOCAL_DASHBOARD_ORIGINS") or "").strip()
+    values = [v.strip().rstrip("/") for v in raw.split(",") if v.strip()] \
+        if raw else list(_DEFAULT_LOCAL_DASHBOARD_ORIGINS)
+    if not values:
+        raise RuntimeError("LOCAL_DASHBOARD_ORIGINS must contain a loopback dashboard origin.")
+    normalized = []
+    for value in values:
+        try:
+            parsed = urlsplit(value)
+            valid = (
+                parsed.scheme == "http"
+                and parsed.hostname in ("localhost", "127.0.0.1")
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path in ("", "/")
+                and not parsed.query
+                and not parsed.fragment
+                and parsed.port is not None
+                and 1 <= parsed.port <= 65535
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise RuntimeError(
+                "LOCAL_DASHBOARD_ORIGINS accepts only http://localhost:<port> "
+                "or http://127.0.0.1:<port> origins."
+            )
+        normalized.append(value)
+    return tuple(dict.fromkeys(normalized))
+
+
+LOCAL_DASHBOARD_ORIGINS = _local_dashboard_origins()
 
 # Job/file retention (issue #46). Self-host defaults to 24h: the 1h sweep kept
 # deleting finished projects under users who never touched their env, and the
@@ -2448,11 +2499,13 @@ app.include_router(_mcp_server.router)
 import free_tools as _free_tools
 app.include_router(_free_tools.router)
 
-# Enable CORS for frontend. Cloud mode locks this down to the configured origins;
-# self-host keeps the permissive wildcard it has always used.
+# Enable CORS for the dashboard. Cloud mode uses its configured origins;
+# self-host accepts only explicit loopback dashboard origins. This matters even
+# on a personal laptop: browser JavaScript from an unrelated site must not be
+# able to drive localhost endpoints that hold a server-side publishing key.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else ["*"],
+    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else list(LOCAL_DASHBOARD_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2805,6 +2858,10 @@ async def get_config():
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        # Non-secret Postiz status for the local dashboard. The key, network
+        # endpoint and integration id intentionally never leave the backend.
+        "postizConfigured": False if BILLING_ENABLED else postiz_client.is_configured(),
+        "postizPostType": None if BILLING_ENABLED else postiz_client.configured_post_type(),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -5559,6 +5616,349 @@ async def translate_clip(
         "success": True,
         "new_video_url": f"/videos/{req.job_id}/{output_filename}"
     }
+
+POSTIZ_PUBLISH_STATE_FILE = ".postiz_publish_state.json"
+_postiz_publish_locks: Dict[tuple[str, int], asyncio.Lock] = {}
+_postiz_publish_locks_guard = asyncio.Lock()
+
+
+class PostizStateError(RuntimeError):
+    """A local publish-state problem that must fail closed to avoid duplicates."""
+
+
+class PostizPublishRequest(BaseModel):
+    job_id: str
+    clip_index: int
+
+
+def _require_postiz_dashboard_origin(request: Request) -> None:
+    """Allow the local dashboard, never arbitrary browser pages, to publish."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=403, detail="Postiz publishing is available only in self-host mode.")
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    if origin not in LOCAL_DASHBOARD_ORIGINS:
+        raise HTTPException(
+            status_code=403,
+            detail="Send to Postiz requests must come from the local OpenShorts dashboard.",
+        )
+
+
+async def _postiz_publish_lock(job_id: str, clip_index: int) -> asyncio.Lock:
+    async with _postiz_publish_locks_guard:
+        return _postiz_publish_locks.setdefault((job_id, clip_index), asyncio.Lock())
+
+
+def _postiz_state_path(job_id: str) -> Path:
+    return Path(OUTPUT_DIR) / job_id / POSTIZ_PUBLISH_STATE_FILE
+
+
+def _read_postiz_state(path: Path) -> dict:
+    if not path.exists():
+        return {"versions": {}}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise PostizStateError(
+            "Existing Postiz publish state is unreadable. Check Postiz before retrying."
+        ) from exc
+    if not isinstance(state, dict) or not isinstance(state.get("versions"), dict):
+        raise PostizStateError(
+            "Existing Postiz publish state is invalid. Check Postiz before retrying."
+        )
+    return state
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    """Persist an atomic rename where the host filesystem supports directory fsync."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(str(path.parent), flags)
+    except OSError:
+        return  # Windows does not support opening/fsyncing directories this way.
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_postiz_state(path: Path, state: dict) -> None:
+    """Crash-safe JSON replacement: temp write + file fsync + replace + dir fsync."""
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("x", encoding="utf-8") as fh:
+            json.dump(state, fh, separators=(",", ":"), sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        _fsync_parent_directory(path)
+    except OSError as exc:
+        raise PostizStateError("Could not save Postiz publish state; refusing to publish.") from exc
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_postiz_clip(job_id: str, clips: list, clip_index: int) -> tuple[Path, str, str]:
+    """Return an in-job MP4 plus its filename and version fingerprint.
+
+    The filename is supplied by server-owned clip metadata. ``resolve`` and
+    ``relative_to`` still enforce containment so a corrupt metadata file or a
+    symlink cannot turn this publishing endpoint into an arbitrary-file reader.
+    """
+    if not _JOB_ID_RE.fullmatch(job_id or ""):
+        raise PostizStateError("Invalid OpenShorts job id.")
+    if clip_index < 0 or clip_index >= len(clips):
+        raise PostizStateError("Clip not found.")
+    clip = clips[clip_index]
+    if not isinstance(clip, dict):
+        raise PostizStateError("Clip metadata is invalid.")
+    video_url = clip.get("video_url")
+    if not isinstance(video_url, str) or not video_url:
+        raise PostizStateError("The current rendered clip file is unavailable.")
+    filename = os.path.basename(video_url.split("?", 1)[0])
+    if not filename or filename in (".", ".."):
+        raise PostizStateError("The current rendered clip file is invalid.")
+
+    job_dir = Path(OUTPUT_DIR) / job_id
+    try:
+        resolved_job_dir = job_dir.resolve(strict=True)
+        resolved_file = (job_dir / filename).resolve(strict=True)
+        resolved_file.relative_to(resolved_job_dir)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise PostizStateError("The rendered clip path is invalid or outside its job folder.") from exc
+
+    if not resolved_file.is_file() or resolved_file.suffix.lower() != ".mp4":
+        raise PostizStateError("The current rendered MP4 was not found.")
+    try:
+        size = resolved_file.stat().st_size
+    except OSError as exc:
+        raise PostizStateError("Could not inspect the rendered MP4.") from exc
+    if size <= 0:
+        raise PostizStateError("The rendered MP4 is empty.")
+    if size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise PostizStateError("The rendered MP4 exceeds the OpenShorts file-size limit.")
+    try:
+        fingerprint = _sha256_file(resolved_file)
+    except OSError as exc:
+        raise PostizStateError("Could not fingerprint the rendered MP4.") from exc
+    return resolved_file, filename, fingerprint
+
+
+def _postiz_metadata(clip: dict) -> tuple[str, str]:
+    title_value = clip.get("video_title_for_youtube_short") or clip.get("title")
+    title = title_value.strip() if isinstance(title_value, str) else ""
+    title = title[:100].strip()
+    if len(title) < 2:
+        title = "OpenShorts clip"
+    description_value = (
+        clip.get("video_description_for_instagram")
+        or clip.get("video_description_for_tiktok")
+    )
+    description = description_value.strip() if isinstance(description_value, str) else ""
+    return title, description
+
+
+def _postiz_http_error(error: postiz_client.PostizError) -> HTTPException:
+    # The browser talks to OpenShorts, not Postiz. Return a local configuration
+    # error for local setup failures, preserve definite client-side vendor
+    # errors (especially 429 retry timing), and use a gateway error for 5xx.
+    if error.status_code is not None and error.status_code >= 500:
+        status = 502
+    elif error.status_code is not None and 400 <= error.status_code < 500:
+        status = error.status_code
+    else:
+        status = 400
+    return HTTPException(status_code=status, detail=str(error))
+
+
+@app.post("/api/postiz/publish")
+async def post_to_postiz(req: PostizPublishRequest, request: Request):
+    """Send the selected current MP4 to the one configured Postiz YouTube account."""
+    _require_postiz_dashboard_origin(request)
+    try:
+        config = postiz_client.configuration()
+    except postiz_client.PostizError as exc:
+        raise _postiz_http_error(exc) from exc
+    if not _JOB_ID_RE.fullmatch(req.job_id or ""):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not await _ensure_job_files(req.job_id, request) or req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    clips = (job.get("result") or {}).get("clips") or []
+    if req.clip_index < 0 or req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    lock = await _postiz_publish_lock(req.job_id, req.clip_index)
+    async with lock:
+        current_clip = clips[req.clip_index]
+        if not isinstance(current_clip, dict):
+            raise HTTPException(status_code=409, detail="Clip metadata is invalid.")
+        # Rendering/edit actions replace clip metadata in memory. Freeze the
+        # server-owned values for this request so the transferred MP4 and its
+        # title/description always refer to the same selected version.
+        clip_snapshot = dict(current_clip)
+        try:
+            file_path, filename, fingerprint = await asyncio.to_thread(
+                _resolve_postiz_clip, req.job_id, [clip_snapshot], 0
+            )
+            state_path = _postiz_state_path(req.job_id)
+            state = await asyncio.to_thread(_read_postiz_state, state_path)
+        except PostizStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        version_key = f"{filename}:{fingerprint}"
+        versions = state["versions"]
+        record = versions.get(version_key)
+        if record is not None:
+            if not isinstance(record, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Saved Postiz publish state is invalid. Check Postiz before retrying.",
+                )
+            state_name = record.get("state")
+            if state_name == "post_created" and isinstance(record.get("post_id"), str):
+                return {
+                    "success": True,
+                    "reused": True,
+                    "action": record.get("action") or config.post_type,
+                    "postId": record["post_id"],
+                    "message": "This exact clip version was already sent to Postiz.",
+                }
+            if state_name in ("post_create_pending", "post_create_unknown"):
+                if state_name == "post_create_pending":
+                    record["state"] = "post_create_unknown"
+                    try:
+                        await asyncio.to_thread(_write_postiz_state, state_path, state)
+                    except PostizStateError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Postiz may already have created this post. Check Postiz drafts/history "
+                        "before trying again."
+                    ),
+                )
+            if state_name not in ("media_uploaded", "post_created"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Saved Postiz publish state is invalid. Check Postiz before retrying.",
+                )
+            if state_name == "post_created":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Saved Postiz publish state is incomplete. Check Postiz before retrying.",
+                )
+
+        try:
+            integration = await asyncio.to_thread(
+                postiz_client.resolve_youtube_integration, config
+            )
+        except postiz_client.PostizError as exc:
+            raise _postiz_http_error(exc) from exc
+
+        if not isinstance(record, dict) or record.get("state") != "media_uploaded":
+            try:
+                media = await asyncio.to_thread(
+                    postiz_client.upload_file, config, file_path, filename
+                )
+            except postiz_client.PostizError as exc:
+                raise _postiz_http_error(exc) from exc
+            record = {
+                "state": "media_uploaded",
+                "filename": filename,
+                "sha256": fingerprint,
+                "media": media,
+            }
+            versions[version_key] = record
+            try:
+                await asyncio.to_thread(_write_postiz_state, state_path, state)
+            except PostizStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        media = record.get("media")
+        if not isinstance(media, dict) or not media.get("id") or not media.get("path"):
+            raise HTTPException(status_code=409, detail="Saved Postiz media state is invalid.")
+
+        # This durable transition is deliberately before the non-idempotent
+        # create request. A crash after Postiz accepts the call cannot result in
+        # OpenShorts blindly creating a second YouTube post on the next click.
+        record["state"] = "post_create_pending"
+        record["integration_id"] = str(integration.get("id") or "")
+        record["action"] = config.post_type
+        try:
+            await asyncio.to_thread(_write_postiz_state, state_path, state)
+        except PostizStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        title, description = _postiz_metadata(clip_snapshot)
+        try:
+            post_id = await asyncio.to_thread(
+                postiz_client.create_youtube_post,
+                config,
+                str(integration.get("id") or ""),
+                media,
+                title,
+                description,
+            )
+        except postiz_client.PostizOutcomeUnknown as exc:
+            record["state"] = "post_create_unknown"
+            try:
+                await asyncio.to_thread(_write_postiz_state, state_path, state)
+            except PostizStateError:
+                pass
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except postiz_client.PostizError as exc:
+            # A definite 4xx response did not create a post. Retain the media
+            # reference so correcting configuration does not upload it again.
+            record["state"] = "media_uploaded"
+            try:
+                await asyncio.to_thread(_write_postiz_state, state_path, state)
+            except PostizStateError as state_exc:
+                raise HTTPException(status_code=409, detail=str(state_exc)) from state_exc
+            raise _postiz_http_error(exc) from exc
+
+        record["state"] = "post_created"
+        record["post_id"] = post_id
+        try:
+            await asyncio.to_thread(_write_postiz_state, state_path, state)
+        except PostizStateError as exc:
+            # The pending record remains on disk if this final write failed, so
+            # the next click fails closed instead of creating a duplicate.
+            raise HTTPException(
+                status_code=409,
+                detail="Postiz confirmed the post, but OpenShorts could not save its state. Check Postiz.",
+            ) from exc
+
+        action = record.get("action") or config.post_type
+        message = (
+            "Postiz draft created."
+            if action == "draft"
+            else "Sent to Postiz for YouTube publishing."
+        )
+        return {
+            "success": True,
+            "reused": False,
+            "action": action,
+            "postId": post_id,
+            "message": message,
+        }
+
 
 class SocialPostRequest(BaseModel):
     job_id: str

@@ -1,24 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Languages, FileText, Scissors, Crosshair, TrendingUp } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 import Modal from './ui/Modal';
-import SegmentedControl from './ui/SegmentedControl';
 import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
-import TikTokDraftNotice from './TikTokDraftNotice';
 import { useAuth } from '../contexts/AuthContext';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
 const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2.5 sm:py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
-
-const PLATFORM_OPTIONS = [
-    { value: 'tiktok', label: 'tiktok', icon: <Video size={16} /> },
-    { value: 'instagram', label: 'instagram', icon: <Instagram size={16} /> },
-    { value: 'youtube', label: 'youtube', icon: <Youtube size={16} /> },
-];
 
 function clipDurationSeconds(clip) {
     // A recut clip's start/end are the covering source range (segments may be
@@ -36,8 +28,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
-    const [showModal, setShowModal] = useState(false);
+export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, elevenLabsKey, isManaged, postizConfigured, postizPostType, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
     // sentence in a popover that floats over the card instead of growing it.
@@ -183,19 +174,13 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [clip.video_url]);
 
-    const [platforms, setPlatforms] = useState({
-        tiktok: true,
-        instagram: true,
-        youtube: true
-    });
-    const [postTitle, setPostTitle] = useState("");
-    const [postDescription, setPostDescription] = useState("");
-    const [isScheduling, setIsScheduling] = useState(false);
-    const [scheduleDate, setScheduleDate] = useState("");
-
-    const [posting, setPosting] = useState(false);
-    const [postResult, setPostResult] = useState(null);
+    const [postizSending, setPostizSending] = useState(false);
+    const [postizResult, setPostizResult] = useState(null);
     const [copied, setCopied] = useState(null);
+
+    useEffect(() => {
+        setPostizResult(null);
+    }, [clip.video_url]);
 
     const handleCopy = async (field, text) => {
         try {
@@ -254,42 +239,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             })
             .catch(() => {});
     }, [jobId, index]);
-
-    // Which platforms the selected profile actually has linked. `null` means
-    // unknown (profile list not loaded) — in that case nothing is gated.
-    const knownConnections = Array.isArray(connectedPlatforms);
-    const noAccountsConnected = knownConnections && connectedPlatforms.length === 0;
-    const platformOptions = knownConnections
-        ? PLATFORM_OPTIONS.map((o) => (connectedPlatforms.includes(o.value) ? o : { ...o, disabled: true, hint: 'not connected' }))
-        : PLATFORM_OPTIONS;
-
-    const handleConnectAccounts = () => {
-        setShowModal(false);
-        if (onConnectSocials) onConnectSocials();
-        else window.open('https://app.upload-post.com', '_blank', 'noopener');
-    };
-
-    // Initialize/Reset form when modal opens
-    useEffect(() => {
-        if (showModal) {
-            setPostTitle(clip.video_title_for_youtube_short || "Viral Short");
-            setPostDescription(clip.video_description_for_instagram || clip.video_description_for_tiktok || "");
-            setIsScheduling(false);
-            setScheduleDate("");
-            setPostResult(null);
-            // Only preselect platforms the profile can actually publish to.
-            if (knownConnections) {
-                setPlatforms({
-                    tiktok: connectedPlatforms.includes('tiktok'),
-                    instagram: connectedPlatforms.includes('instagram'),
-                    youtube: connectedPlatforms.includes('youtube'),
-                });
-            }
-        }
-        // Reset only when the modal opens for a clip; connection changes while
-        // it is open must not wipe the user's selection.
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [showModal, clip]);
 
     const handleAutoEdit = async () => {
         setIsEditing(true);
@@ -663,80 +612,34 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         }
     };
 
-    // Managed (cloud plan/trial) users post with the server-side key — no BYOK needed
-    const canPost = isManaged || (uploadPostKey && uploadUserId);
-
-    const handlePost = async () => {
-        if (!canPost) {
-            setPostResult({ success: false, msg: "Missing API Key or User ID." });
+    const handleSendToPostiz = async () => {
+        if (!postizConfigured) {
+            setPostizResult({
+                success: false,
+                msg: "Configure Postiz in OpenShorts .env, then restart the backend."
+            });
             return;
         }
-
-        if (noAccountsConnected) {
-            setPostResult({ success: false, msg: "Connect a social account first." });
-            return;
-        }
-
-        const selectedPlatforms = Object.keys(platforms).filter(k => platforms[k]);
-        if (selectedPlatforms.length === 0) {
-            setPostResult({ success: false, msg: "Select at least one platform." });
-            return;
-        }
-
-        if (isScheduling && !scheduleDate) {
-            setPostResult({ success: false, msg: "Please select a date and time." });
-            return;
-        }
-
-        setPosting(true);
-        setPostResult(null);
-
+        setPostizSending(true);
+        setPostizResult(null);
         try {
-            const payload = {
-                job_id: jobId,
-                clip_index: index,
-                api_key: uploadPostKey,
-                user_id: uploadUserId,
-                platforms: selectedPlatforms,
-                title: postTitle,
-                description: postDescription
-            };
-
-            if (isScheduling && scheduleDate) {
-                // Convert to ISO-8601
-                payload.scheduled_date = new Date(scheduleDate).toISOString();
-                // Optional: pass timezone if needed, backend defaults to UTC or we can send user's timezone
-                payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-            }
-
-            const res = await apiFetch('/api/social/post', {
+            const res = await apiFetch('/api/postiz/publish', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
+                body: JSON.stringify({ job_id: jobId, clip_index: index })
             });
-
-            if (!res.ok) {
-                const errText = await res.text();
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch (e) {
-                    throw new Error(errText);
-                }
-            }
-
-            setPostResult({ success: true, msg: isScheduling ? "Scheduled successfully!" : "Posted successfully!" });
-            setTimeout(() => {
-                setShowModal(false);
-                setPostResult(null);
-            }, 3000);
-
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || "Could not send this clip to Postiz.");
+            setPostizResult({ success: true, msg: data.message || "Sent to Postiz." });
         } catch (e) {
-            setPostResult({ success: false, msg: `Failed: ${e.message}` });
+            setPostizResult({ success: false, msg: e.message || "Could not send this clip to Postiz." });
         } finally {
-            setPosting(false);
+            setPostizSending(false);
         }
     };
+
+    const isVideoChanging = isEditing || isSubtitling || isHooking || isTranslating
+        || (bulkProgress?.running ?? false);
 
     // Browser-rendered previews (Remotion) live in a blob: URL that exists only
     // in this tab, so they always win over the durable copy.
@@ -914,6 +817,12 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         {editError}
                     </div>
                 )}
+                {postizResult && (
+                    <div className={`mb-3 px-3 py-2 rounded-input text-xs flex items-center gap-2 ${postizResult.success ? 'text-ok bg-[color-mix(in_oklab,var(--color-ok)_10%,transparent)]' : 'text-danger bg-[color-mix(in_oklab,var(--color-danger)_10%,transparent)]'}`}>
+                        {postizResult.success ? <Check size={14} className="shrink-0" /> : <AlertCircle size={14} className="shrink-0" />}
+                        {postizResult.msg}
+                    </div>
+                )}
 
                 {/* Actions Footer */}
                 <div className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2 mt-auto pt-4 border-t border-rule">
@@ -974,10 +883,25 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     </button>
 
                     <button
-                        onClick={() => setShowModal(true)}
-                        className="btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap"
+                        onClick={handleSendToPostiz}
+                        disabled={postizSending || !postizConfigured || isVideoChanging}
+                        title={isVideoChanging
+                            ? 'Wait for the current video edit to finish before sending it to Postiz'
+                            : postizConfigured
+                            ? (postizPostType === 'now'
+                                ? 'Send this clip to Postiz for YouTube publishing'
+                                : 'Create a Postiz YouTube draft')
+                            : 'Configure Postiz in OpenShorts .env, then restart the backend'}
+                        className="btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap disabled:opacity-45 disabled:cursor-not-allowed"
                     >
-                        <Share2 size={16} className="shrink-0" /> post
+                        {postizSending
+                            ? <Loader2 size={16} className="animate-spin shrink-0" />
+                            : <Share2 size={16} className="shrink-0" />}
+                        {postizSending
+                            ? 'sending…'
+                            : postizConfigured
+                                ? 'send to postiz'
+                                : 'configure postiz'}
                     </button>
                     <button
                         onClick={(e) => {
@@ -1038,124 +962,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                             {clip.video_description_for_tiktok || clip.video_description_for_instagram}
                         </p>
                     </div>
-                </div>
-            </Modal>
-
-            {/* Post Modal */}
-            <Modal
-                isOpen={showModal}
-                onClose={() => setShowModal(false)}
-                eyebrow="PUBLISH"
-                title="post clip"
-                size="md"
-                footer={
-                    noAccountsConnected ? (
-                        <button onClick={handleConnectAccounts} className="btn-primary w-full">
-                            <Link2 size={16} /> connect accounts
-                        </button>
-                    ) : (
-                        <button
-                            onClick={handlePost}
-                            disabled={posting || !canPost}
-                            className="btn-primary w-full"
-                        >
-                            {posting ? <><Loader2 size={16} className="animate-spin" /> {isScheduling ? 'scheduling…' : 'publishing…'}</> : <><Share2 size={16} /> {isScheduling ? 'schedule post' : 'publish now'}</>}
-                        </button>
-                    )
-                }
-            >
-                {!canPost && (
-                    <div className="mb-4 px-3 py-2 rounded-input text-xs text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)] flex items-start gap-2">
-                        <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                        <div className="lowercase">configure api key in settings first.</div>
-                    </div>
-                )}
-
-                {noAccountsConnected && (
-                    <div className="mb-4 px-3 py-2 rounded-input text-xs text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)] flex items-start gap-2">
-                        <AlertCircle size={14} className="mt-0.5 shrink-0" />
-                        <div className="lowercase">no social accounts connected yet — link tiktok, instagram or youtube to publish this clip.</div>
-                    </div>
-                )}
-
-                {/* Both the title/description fields below and the schedule
-                    button are downstream of this: on a tiktok draft neither
-                    travels. See TikTokDraftNotice. */}
-                {platforms.tiktok && <TikTokDraftNotice />}
-
-                <div className="space-y-4">
-                    {/* Title & Description */}
-                    <div>
-                        <label className="eyebrow block mb-1.5">TITLE</label>
-                        <input
-                            type="text"
-                            value={postTitle}
-                            onChange={(e) => setPostTitle(e.target.value)}
-                            className="input-field"
-                            placeholder="enter a catchy title…"
-                        />
-                    </div>
-
-                    <div>
-                        <label className="eyebrow block mb-1.5">CAPTION</label>
-                        <textarea
-                            value={postDescription}
-                            onChange={(e) => setPostDescription(e.target.value)}
-                            rows={4}
-                            className="input-field resize-none"
-                            placeholder="write a caption for your post…"
-                        />
-                    </div>
-
-                    {/* Scheduling */}
-                    <div className="p-3 bg-paper rounded-input border border-rule">
-                        <label className="flex items-center justify-between cursor-pointer">
-                            <span className="flex items-center gap-2 text-sm text-ink2 lowercase">
-                                <Calendar size={16} className={isScheduling ? 'text-brass' : 'text-muted'} /> schedule post
-                            </span>
-                            <input
-                                type="checkbox"
-                                checked={isScheduling}
-                                onChange={(e) => setIsScheduling(e.target.checked)}
-                                className="w-4 h-4 accent-brass cursor-pointer"
-                            />
-                        </label>
-
-                        {isScheduling && (
-                            <div className="mt-3 animate-fade">
-                                <label className="eyebrow block mb-1.5">DATE · TIME</label>
-                                <input
-                                    type="datetime-local"
-                                    value={scheduleDate}
-                                    onChange={(e) => setScheduleDate(e.target.value)}
-                                    className="input-field [color-scheme:dark]"
-                                />
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Platforms */}
-                    <div>
-                        <label className="eyebrow block mb-2">PLATFORMS</label>
-                        <SegmentedControl
-                            multi
-                            columns={3}
-                            options={platformOptions}
-                            value={Object.keys(platforms).filter(k => platforms[k])}
-                            onChange={(arr) => setPlatforms({
-                                tiktok: arr.includes('tiktok'),
-                                instagram: arr.includes('instagram'),
-                                youtube: arr.includes('youtube'),
-                            })}
-                        />
-                    </div>
-
-                    {postResult && (
-                        <div className={postResult.success ? 'badge-ok' : 'badge-danger'}>
-                            {postResult.success ? <Check size={12} className="shrink-0" /> : <AlertCircle size={12} className="shrink-0" />}
-                            {postResult.msg}
-                        </div>
-                    )}
                 </div>
             </Modal>
 
