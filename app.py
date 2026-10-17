@@ -73,11 +73,11 @@ MIN_SOURCE_SECONDS = int(os.environ.get("MIN_SOURCE_SECONDS", "45"))
 QUALITY_PROBE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quality_probe.py")
 
 # Server credentials the pipeline subprocesses (main.py, quality_probe.py) never
-# read: main.py and everything it imports use GEMINI_API_KEY / LLM_* / the
-# proxies / YOUTUBE_COOKIES and nothing from cloud/. A child that runs yt-dlp
-# and ffmpeg on user-supplied URLs and files has no business holding the
-# Stripe key, the JWT signing secret or the database password; one exploit
-# in that stack would otherwise hand over all of them.
+# read: main.py and everything it imports use GEMINI_API_KEY / LLM_* /
+# VISION_* / the proxies / YOUTUBE_COOKIES and nothing from cloud/. A child
+# that runs yt-dlp and ffmpeg on user-supplied URLs and files has no business
+# holding the Stripe key, the JWT signing secret or the database password; one
+# exploit in that stack would otherwise hand over all of them.
 CHILD_ENV_DENYLIST = frozenset({
     "DATABASE_URL", "POSTGRES_PASSWORD", "JWT_SECRET",
     "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
@@ -3099,8 +3099,8 @@ async def process_endpoint(
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
         # Self-host with an OpenAI-compatible server configured needs no
         # Google key for the core pipeline: the moment picker runs there and
-        # the frame-based stages degrade on their own (layout_picker returns
-        # "none", silent videos fail with a message that says why).
+        # frame-based stages degrade on their own. Silent videos use Gemini
+        # unless VISION_PROVIDER=ollama activates the local VLM adapter.
         raise gemini_missing_error()
 
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
@@ -3215,7 +3215,10 @@ async def process_endpoint(
     if api_key:
         env["GEMINI_API_KEY"] = api_key # Override with key from request
     else:
-        env.pop("GEMINI_API_KEY", None)  # local-LLM job: main.py must not find a stale key
+        # A local text/vision job must not silently use an ambient server key;
+        # GEMINI_API_KEY enters a self-hosted child only via this request's
+        # explicit browser key or the resolved self-host fallback above.
+        env.pop("GEMINI_API_KEY", None)
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job

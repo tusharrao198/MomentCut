@@ -69,7 +69,7 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 
 **Clip selection**
 - The scoring pass ranks every window (global top N), never "choose up to K per batch". The `min_clips` floor is enforced in code.
-- `get_visual_clips` is the only stage that sends Gemini the video; nothing guards its length.
+- With `VISION_PROVIDER=ollama`, `get_visual_clips` sends timestamped JPEG samples only to the allow-listed local Ollama endpoint; no Gemini fallback is permitted on that path. Without that opt-in it retains the Gemini video path, whose source-length ceiling remains unguarded.
 
 **Jobs, GPU, deploys**
 - Call `transcribe_backends.release_models()` after any ASR (job processes and in-API transcriptions alike). Size `MAX_CONCURRENT_JOBS` by free VRAM first.

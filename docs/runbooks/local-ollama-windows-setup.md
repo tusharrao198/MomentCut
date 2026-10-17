@@ -1,0 +1,285 @@
+# Runbook: Run OpenShorts with local Ollama on Windows
+
+This is the complete operator setup for the private local clip-selection
+workflow:
+
+```text
+Talking video
+  -> Whisper transcript (local)
+  -> qwen2.5:7b through Ollama (local)
+  -> selected clip timestamps
+  -> existing OpenShorts render pipeline
+
+No-audio or sparse-speech video
+  -> audio-stream check, then Whisper only when an audio track exists
+  -> timestamped JPEG samples (local)
+  -> qwen2.5vl:3b through Ollama (local)
+  -> selected clip timestamps
+  -> existing OpenShorts render pipeline
+```
+
+No source video or clip-selection frame sample is sent to Gemini when local
+visual selection is enabled. Other optional OpenShorts features, such as
+automatic layout selection, remain independently Gemini-backed when a Gemini
+key is configured.
+
+For the code architecture and test contract, see
+[`../architecture/local-ollama-vision.md`](../architecture/local-ollama-vision.md).
+
+## 1. Prerequisites
+
+You need:
+
+- The `feature/local-ollama-vision` OpenShorts branch, including commit
+  `9f0d053`.
+- Docker Desktop running in Linux-container mode.
+- NVIDIA drivers and Docker GPU support working for OpenShorts.
+- Ollama installed on the Windows host, not inside Docker.
+- At least 12 GB of GPU VRAM and 32 GB RAM for the selected configuration.
+
+Confirm the intended branch before editing any configuration:
+
+```powershell
+git branch --show-current
+git log -1 --oneline
+```
+
+Expected branch:
+
+```text
+feature/local-ollama-vision
+```
+
+## 2. Install and configure Ollama
+
+Install Ollama on Windows if it is not already installed. Then open a fresh
+PowerShell window and download both models:
+
+```powershell
+ollama pull qwen2.5:7b
+ollama pull qwen2.5vl:3b
+ollama list
+```
+
+Expected model names include:
+
+```text
+qwen2.5:7b
+qwen2.5vl:3b
+```
+
+Configure the Windows Ollama process to keep only one model and one request in
+GPU memory at a time:
+
+```powershell
+[Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS", "1", "User")
+[Environment]::SetEnvironmentVariable("OLLAMA_NUM_PARALLEL", "1", "User")
+[Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "8192", "User")
+```
+
+These are **Windows user environment variables**, not entries in OpenShorts'
+`.env`. Quit Ollama completely from the system tray and start it again after
+setting them.
+
+Confirm that Ollama is serving locally:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:11434/api/tags
+```
+
+This should return JSON listing the downloaded models.
+
+## 3. Configure OpenShorts `.env`
+
+At the OpenShorts repository root, edit the existing `.env` file. Do not
+overwrite an existing file containing keys or other personal settings.
+
+Add or replace the local-model settings with this block:
+
+```env
+# Talking videos: Whisper transcript -> local text model selects clip moments.
+LLM_BASE_URL=http://host.docker.internal:11434/v1
+LLM_MODEL=qwen2.5:7b
+LLM_API_KEY=
+LLM_SCORE_BATCH=3
+LLM_TIMEOUT=600
+
+# Silent / wordless videos: timestamped frame samples -> local vision model.
+VISION_PROVIDER=ollama
+VISION_BASE_URL=http://host.docker.internal:11434
+VISION_MODEL=qwen2.5vl:3b
+VISION_TIMEOUT_SECONDS=180
+VISION_RETRY_ATTEMPTS=3
+
+# Local visual-analysis windows. The maximum supported local clip length is 60s.
+VISION_WINDOW_SECONDS=120
+VISION_WINDOW_OVERLAP_SECONDS=60
+VISION_FRAMES_PER_WINDOW=8
+VISION_MAX_FRAME_WIDTH=640
+VISION_NUM_CTX=4096
+VISION_CANDIDATES_PER_WINDOW=2
+VISION_SCENE_SNAP_SECONDS=2
+
+# A 12 GB laptop GPU should process one OpenShorts job at a time.
+MAX_CONCURRENT_JOBS=1
+ASR_GPU_CONCURRENCY=1
+```
+
+Use plain values, one per line. Do not paste smart quotes or hidden characters.
+Standard dotenv parsers support valid quoted values, but unquoted values avoid
+copy/paste and Compose interpolation mistakes.
+
+Important limits:
+
+- Keep `CLIP_MAX_SECONDS` at `60` or lower while `VISION_PROVIDER=ollama` is
+  enabled. A larger value fails clearly rather than producing incompletely
+  sampled clips.
+- Do not add an Ollama service or port mapping to `docker-compose.yml`.
+  `host.docker.internal` lets the backend container reach Ollama on the same
+  Windows laptop.
+- OpenShorts' own dashboard, API, and renderer are bound to `127.0.0.1`; other
+  devices on Wi-Fi cannot reach them.
+
+## 4. Build and start OpenShorts
+
+From the OpenShorts repository root:
+
+```powershell
+docker compose config
+docker compose down
+docker compose up --build -d
+docker compose ps
+```
+
+The first build can take several minutes. `docker compose ps` should show
+`openshorts-backend`, `openshorts-frontend`, and `openshorts-renderer` running.
+
+Open the dashboard:
+
+```text
+http://localhost:5175
+```
+
+For later starts, when nothing changed:
+
+```powershell
+docker compose up -d
+```
+
+## 5. Verify container-to-Ollama connectivity
+
+The following command must print `200`:
+
+```powershell
+docker exec openshorts-backend python -c "import httpx; print(httpx.get('http://host.docker.internal:11434/api/tags', timeout=10).status_code)"
+```
+
+If it does not, do not start a video job yet. Check that Ollama is running on
+Windows and repeat the host-side test from step 2.
+
+## 6. Generate test clips
+
+Use Clip Generator in the dashboard and test these three sources:
+
+| Source | Expected route | Expected result |
+|---|---|---|
+| Video with spoken dialogue | Whisper → `qwen2.5:7b` | Speech-driven clips with subtitles. |
+| Video with no audio stream | Qwen2.5-VL directly | Visual clips, no subtitles. |
+| Music/ambience-only video | Whisper establishes sparse speech → Qwen2.5-VL | Visual clips, no subtitles. |
+
+Watch backend logs during the job:
+
+```powershell
+docker compose logs -f backend
+```
+
+For a silent source, look for:
+
+```text
+Silent video — analyzing with local Ollama vision
+```
+
+For a talking source, look for the normal local text-model analysis log. It
+should not load the vision model.
+
+## 7. Confirm GPU use and memory release
+
+During a silent-video job, in a second PowerShell window:
+
+```powershell
+nvidia-smi -l 1
+```
+
+Expected sequence:
+
+1. Ollama / `qwen2.5vl:3b` occupies GPU memory during visual selection.
+2. OpenShorts asks Ollama to unload the vision model once selection completes.
+3. OpenShorts renders the selected clips.
+
+You can also inspect loaded Ollama models:
+
+```powershell
+ollama ps
+```
+
+If an interrupted job leaves the vision model in memory, release it manually:
+
+```powershell
+ollama stop qwen2.5vl:3b
+```
+
+## 8. Everyday operations and recovery
+
+| Need | Command |
+|---|---|
+| Start OpenShorts | `docker compose up -d` |
+| Follow backend logs | `docker compose logs -f backend` |
+| Stop containers cleanly | `docker compose down` |
+| Force-stop stuck containers | `docker compose kill` then `docker compose down` |
+| Rebuild after code/config change | `docker compose up --build -d` |
+| Check container state | `docker compose ps` |
+| Release a loaded VLM | `ollama stop qwen2.5vl:3b` |
+
+Use `docker system prune` or `docker builder prune` only when you intentionally
+want to remove unused Docker data. They are not part of ordinary startup or
+shutdown.
+
+## 9. Troubleshooting
+
+| Symptom | Check / resolution |
+|---|---|
+| `Connection refused` or timeout to `host.docker.internal:11434` | Start Ollama, run the host-side API test, then run the container connectivity test from step 5. |
+| `HTTP 404` from `/api/show` | Run `ollama pull qwen2.5vl:3b`; the vision model is missing. |
+| `CLIP_MAX_SECONDS up to 60` error | Set `CLIP_MAX_SECONDS=60` or remove it if it was overridden. |
+| GPU out-of-memory | Keep `MAX_CONCURRENT_JOBS=1`, `ASR_GPU_CONCURRENCY=1`, `OLLAMA_NUM_PARALLEL=1`, and `OLLAMA_MAX_LOADED_MODELS=1`. Close other GPU-heavy apps. |
+| Silent job fails after retry attempts | Inspect the named time window in the backend log. It identifies the exact failed 120-second analysis window. |
+| Docker daemon error | Start Docker Desktop, wait until it reports that the engine is running, then rerun `docker compose up -d`. |
+| Changes in `.env` appear ignored | Recreate the backend: `docker compose up -d --force-recreate backend`. |
+
+## 10. Switch back to Gemini
+
+No code rollback is needed.
+
+To switch **silent-video selection only** back to Gemini, remove this line from
+`.env`:
+
+```env
+VISION_PROVIDER=ollama
+```
+
+To also switch **talking-video transcript selection** back to Gemini, either
+remove `LLM_BASE_URL` or add:
+
+```env
+LLM_PROVIDER=gemini
+```
+
+Ensure a Gemini key is configured in OpenShorts Settings, then recreate the
+backend:
+
+```powershell
+docker compose up -d --force-recreate backend
+```
+
+You may also mix the routes: local Qwen text selection with Gemini vision, or
+Gemini text selection with local Qwen-VL vision.

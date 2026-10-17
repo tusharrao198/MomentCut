@@ -84,7 +84,7 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 
 ### Clip Generator
 - **Viral Moment Detection**: Google Gemini 3.1 Flash-Lite analyzes transcripts and scene boundaries to detect 3-15 high-potential moments
-- **Runs fully local if you want**: point `LLM_BASE_URL` at Ollama, LM Studio, vLLM or any OpenAI-compatible server and the moment picker runs on your own model, no Google key needed (see [Run without a Google key](#6-run-without-a-google-key-local-llm-optional))
+- **Runs fully local if you want**: point `LLM_BASE_URL` at Ollama, LM Studio, vLLM or any OpenAI-compatible server and the moment picker runs on your own model, no Google key needed (see [Run without a Google key](#6-run-without-a-google-key-local-llm-and-vision-optional))
 - **Smart 9:16 Cropping**: AI reframing per scene — TRACK mode (MediaPipe + YOLOv8 face tracking), GENERAL mode (blurred background), SPLIT mode (two speakers stacked, captions on the seam) and SCREENCAST mode (screen over presenter); the layout is picked per video by Gemini or forced from the dashboard
 - **Auto Subtitles**: faster-whisper with word-level timestamps, styled and burned into clips
 - **AI Voice Dubbing**: ElevenLabs integration for 30+ languages with voice cloning (bring your own ElevenLabs key, on the cloud too)
@@ -275,34 +275,53 @@ The backend log on the first job reports the chosen encoder and transcription de
 
 ---
 
-### 6. Run without a Google key (local LLM, optional)
+### 6. Run without a Google key (local LLM and vision, optional)
 
-The only cloud call in the clip pipeline is the moment picker: it sends the
-transcript (never the video) to Gemini. Point it at any OpenAI-compatible
-server instead and the whole pipeline stays on your box:
+The transcript moment picker sends text (never the video) to Gemini by
+default. Point it at any OpenAI-compatible server instead:
 
 ```bash
 # .env
 LLM_BASE_URL=http://host.docker.internal:11434/v1   # Ollama on the host
-LLM_MODEL=qwen2.5:14b                                # any chat model that follows instructions
+LLM_MODEL=qwen2.5:7b                                 # any chat model that follows instructions
 # LLM_API_KEY=...                                    # only if your server checks one (vLLM --api-key, OpenRouter)
 ```
 
 Works with Ollama, LM Studio, vLLM, llama.cpp server, LocalAI and OpenRouter.
-The dashboard stops asking for a Gemini key when this is set. Two things to
-know:
+The dashboard stops asking for a Gemini key when this is set. For a fully
+local clip-selection route—including silent videos—add the local vision block:
+
+```bash
+# .env
+VISION_PROVIDER=ollama
+VISION_BASE_URL=http://host.docker.internal:11434
+VISION_MODEL=qwen2.5vl:3b
+VISION_WINDOW_SECONDS=120
+VISION_WINDOW_OVERLAP_SECONDS=60
+MAX_CONCURRENT_JOBS=1
+```
+
+With this opt-in, silent-video selection sends timestamped JPEG samples only
+to Ollama on the same machine; it does not upload the source video to Gemini
+and it does not fall back to Gemini if Ollama fails. See the
+[`Windows local-Ollama runbook`](docs/runbooks/local-ollama-windows-setup.md)
+for the complete configuration and operating steps, and the
+[`implementation design`](docs/architecture/local-ollama-vision.md) for the
+code architecture. Three things to know:
 
 - **Context length.** A scoring call carries three transcript windows
   (~2-3k tokens) and the detail call up to ten (~5k on a long podcast).
   Ollama defaults to a 4096-token context and truncates silently, so run it
-  with `OLLAMA_CONTEXT_LENGTH=16384` (or set `num_ctx` in a Modelfile); raise
+  with `OLLAMA_CONTEXT_LENGTH=8192` (or set `num_ctx` in a Modelfile); raise
   `LLM_SCORE_BATCH` above 3 only if your context allows it. 7-8B models
   return valid JSON reliably, 3B ones do not.
-- **What still needs Gemini.** Anything that has to look at frames: the
-  automatic layout picker (`AUTO_LAYOUT`), the on-screen content detector
-  and silent videos (no speech to clip by). Without a Gemini key those fall
-  back to the plain face-tracking crop, and a silent video fails with a
-  message that says so. Add a key alongside `LLM_BASE_URL` and you get both.
+- **Silent footage.** Without `VISION_PROVIDER=ollama`, silent videos retain
+  the original Gemini vision path and need a Gemini key. The local VLM path
+  supports a maximum clip length of 60 seconds.
+- **What still needs Gemini.** The automatic layout picker (`AUTO_LAYOUT`)
+  and the on-screen content detector remain Gemini-backed. A local silent
+  video picker does not automatically make those unrelated optional features
+  local.
 
 ## Technical Pipeline
 
@@ -310,7 +329,7 @@ know:
 1. **Ingest** — Local video upload (or self-hosted URL ingest via yt-dlp)
 2. **Transcribe** — faster-whisper with word-level timestamps
 3. **Detect** — PySceneDetect for scene boundaries
-4. **Analyze** — Gemini identifies 3-15 viral moments (15-60s each)
+4. **Analyze** — Gemini by default, or local Qwen through Ollama when configured, identifies 3-15 viral moments (15-60s each)
 5. **Extract** — FFmpeg precise clip cutting
 6. **Reframe** — AI vertical cropping with subject tracking
 7. **Effects** — Subtitles, hooks, AI video effects
@@ -443,11 +462,14 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `LLM_MODEL` | Model name on that server (default `llama3.1:8b`) |
 | `LLM_API_KEY` | Bearer token for that server, if it checks one |
 | `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini) |
+| `VISION_PROVIDER` | Set to `ollama` to enable local visual selection for silent / wordless videos |
+| `VISION_BASE_URL` | Allow-listed local native Ollama endpoint (default `http://host.docker.internal:11434`) |
+| `VISION_MODEL` | Local visual model (default `qwen2.5vl:3b`) |
 
 **Client-side (encrypted in localStorage):**
 | Key | Description |
 |-----|------------|
-| `GEMINI_API_KEY` | Google Gemini — required unless `LLM_BASE_URL` is set (then only for layout picking and silent videos) |
+| `GEMINI_API_KEY` | Google Gemini — optional when local text and local vision are configured; still used by optional Gemini-backed features such as layout picking |
 | `FAL_KEY` | fal.ai — required for AI Shorts |
 | `ELEVENLABS_API_KEY` | ElevenLabs — required for voiceover/dubbing |
 | `UPLOAD_POST_API_KEY` | Upload-Post — required, for social posting |

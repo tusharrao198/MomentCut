@@ -2475,12 +2475,13 @@ has no transcript to read, so OpenShorts does not use one.</p>
 <p>It switches paths on its own, and it does not need to be told to. Footage
 with no audio track at all, and footage whose transcript comes back under 8
 words or under 5 words per minute (music-only streams, a mic that was muted the
-whole session), both trip the same branch: the video itself goes to Gemini,
-which watches it and returns the same 3 to 15 moments in the same 15 to 60
-second band as the transcript path. Everything downstream is identical, layouts
-and inset detection included. The one difference is that the clips come out
-without captions, which is correct rather than a bug: there is no speech to
-caption.</p>
+whole session), both trip the same vision branch. By default Gemini watches the
+video and returns the same 3 to 15 moments in the same 15 to 60 second band as
+the transcript path. A self-hosted install can instead opt into local Ollama
+vision: it sends timestamped JPEG samples to a local Qwen-VL model and never
+falls back to Gemini. Everything downstream is identical, layouts and inset
+detection included. The one difference is that the clips come out without
+captions, which is correct rather than a bug: there is no speech to caption.</p>
 <p class="note"><span class="label">The one ceiling worth knowing</span>
 This is the single stage that sends Gemini the footage instead of a handful of
 frames, and Gemini bills video at roughly 300 tokens per second. An hour of
@@ -2518,7 +2519,7 @@ ${faqBlock([
   },
   {
     q: 'Does it work on gameplay with no commentary?',
-    a: 'Yes, and it switches by itself. Footage with no audio track, or whose transcript comes back under 8 words or under 5 words per minute, goes down a vision pass instead: Gemini watches the footage and returns the same 3 to 15 moments, with the same layouts and inset detection after it. The clips come out without captions, since there is no speech to caption. The practical limit is length, because that pass sends Gemini the video rather than a few frames: give it the session you care about, not a silent eight-hour VOD.',
+    a: 'Yes, and it switches by itself. Footage with no audio track, or whose transcript comes back under 8 words or under 5 words per minute, goes down a vision pass instead. By default Gemini watches the footage and returns the same 3 to 15 moments. A self-hosted install can opt into local Ollama vision, which sends timestamped JPEG samples to a local Qwen-VL model instead. The clips come out without captions, since there is no speech to caption.',
   },
   {
     q: 'Is it free for streamers?',
@@ -2548,7 +2549,7 @@ ${sources([
     },
     {
       q: 'Does it work on gameplay with no commentary?',
-      a: 'Yes. When a video has no audio track, or under 8 words of speech, OpenShorts switches automatically to a vision pass where Gemini watches the footage and picks the same 3 to 15 moments. Those clips have no captions, because there is no speech to caption.',
+      a: 'Yes. When a video has no audio track, or under 8 words of speech, OpenShorts switches automatically to a vision pass. By default Gemini watches the footage; self-hosted installs can instead configure local Ollama vision with Qwen-VL. Those clips have no captions, because there is no speech to caption.',
     },
   ],
   /* HowTo is emitted alongside the Article because the primary query here is a
