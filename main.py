@@ -2481,8 +2481,8 @@ if __name__ == '__main__':
         duration = frame_count / fps
         cap.release()
 
-        # 3. Transcribe — unless the video has no audio, in which case fall back
-        # to Gemini vision (picks clips from the imagery instead of the speech).
+        # 3. Transcribe — unless the video has no audio, in which case use the
+        # configured visual selector (local Ollama or the Gemini fallback).
         from transcribe_backends import NoAudioError
         transcript = None
         # Module handover (issue #68): another module already transcribed this
@@ -2531,7 +2531,7 @@ if __name__ == '__main__':
                   f"switching to visual analysis.")
             transcript = None
 
-        # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
+        # 4. Clip analysis (transcript-driven, or visual for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
         if (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):

@@ -89,7 +89,9 @@ these limits regardless of `.env` values:
 | `VISION_SCENE_SNAP_SECONDS` | 0–3 seconds | 2 |
 
 Missing or non-numeric settings use their defaults. Numeric values outside the
-range are clamped. Invalid endpoints and model names fail closed.
+range are clamped. A missing or blank `VISION_MODEL` intentionally uses the
+approved `qwen2.5vl:3b` default; a supplied model name containing control
+characters fails closed. Invalid endpoints always fail closed.
 
 The local visual path accepts `CLIP_MAX_SECONDS` through 60 seconds. It rejects
 a larger duration and rejects a window that is not strictly larger than
@@ -141,7 +143,8 @@ Windows are 120 seconds with a 60-second overlap by default. Each window
 samples eight evenly spaced timestamps (5%–95%) and up to two additional scene
 boundary timestamps. The hard maximum is ten images per Ollama request.
 
-Each successfully encoded JPEG retains the timestamp of its decoded frame.
+Each successfully encoded JPEG retains the timestamp of its decoded frame
+(frame index divided by FPS).
 When decoding or encoding fails, both the image and its paired timestamp are
 dropped. The ordered image and timestamp arrays are therefore always aligned.
 
@@ -224,11 +227,12 @@ implementation below it.
 `tests/test_vision_backend.py` covers:
 
 - local-only endpoint allow-list and settings bounds;
-- paired frame/timestamp removal on decode failure;
+- paired frame/timestamp removal on decode failure and its window-labelled error;
 - 120/60 window coverage for all 15–60-second candidates;
+- no more than two scene-boundary samples, even with a low regular frame count;
 - safe scene-boundary snapping;
 - short-source behavior;
-- exactly one malformed-output correction;
+- exactly one malformed-output correction and failure after a second malformed reply;
 - bounded 503 retry and immediate 401 failure;
 - all-or-nothing window behavior and attempted VLM unload;
 - overlap deduplication; and
@@ -246,6 +250,9 @@ docker compose exec backend python -m py_compile vision_backend.py main.py
 
 - The VLM sees samples, not every source frame; an event between samples can be
   missed.
+- Frame timestamps use frame index divided by reported FPS. That is a practical
+  approximation for ordinary constant-frame-rate MP4s; variable-frame-rate
+  sources can have a small timestamp offset.
 - Clip selection is editorial guidance, not a guarantee of perfect cuts;
   review clips before publishing.
 - A video with frequent lyrics or spoken words routes to the transcript picker

@@ -30,8 +30,8 @@ For the code architecture and test contract, see
 
 You need:
 
-- The `feature/local-ollama-vision` OpenShorts branch, including commit
-  `9f0d053`.
+- The `feature/local-ollama-vision` OpenShorts branch, including the local
+  Ollama vision implementation.
 - Docker Desktop running in Linux-container mode.
 - NVIDIA drivers and Docker GPU support working for OpenShorts.
 - Ollama installed on the Windows host, not inside Docker.
@@ -48,6 +48,34 @@ Expected branch:
 
 ```text
 feature/local-ollama-vision
+```
+
+### Required Docker GPU override
+
+Create `docker-compose.override.yml` beside `docker-compose.yml`, or merge this
+`backend` block into an existing override. This exposes the NVIDIA GPU to the
+OpenShorts backend container and installs its GPU dependencies during build:
+
+```yaml
+services:
+  backend:
+    build:
+      context: .
+      args:
+        GPU: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+```
+
+`video` is required for NVENC encoding. Confirm GPU access before continuing:
+
+```powershell
+docker run --rm --gpus all nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04 nvidia-smi
 ```
 
 ## 2. Install and configure Ollama
