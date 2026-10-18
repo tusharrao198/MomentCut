@@ -28,7 +28,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, elevenLabsKey, isManaged, postizConfigured, postizPostType, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
+export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, elevenLabsKey, isManaged, postizConfigured, postizPostType, clipAiThumbnailsEnabled, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
     // sentence in a popover that floats over the card instead of growing it.
@@ -178,13 +178,43 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
     const [postizResult, setPostizResult] = useState(null);
     const postizThumbnailInputRef = useRef(null);
     const [postizThumbnail, setPostizThumbnail] = useState(null);
+    const [showAiThumbnailModal, setShowAiThumbnailModal] = useState(false);
+    const [aiThumbnailInstructions, setAiThumbnailInstructions] = useState('');
+    const [aiThumbnailCount, setAiThumbnailCount] = useState(1);
+    const [aiThumbnailState, setAiThumbnailState] = useState(null);
+    const [aiThumbnailLoading, setAiThumbnailLoading] = useState(false);
+    const [aiThumbnailError, setAiThumbnailError] = useState(null);
     const [copied, setCopied] = useState(null);
 
     useEffect(() => {
         setPostizResult(null);
         setPostizThumbnail(null);
+        setAiThumbnailState(null);
+        setAiThumbnailError(null);
         if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
     }, [clip.video_url]);
+
+    const loadAiThumbnailState = async () => {
+        try {
+            const res = await apiFetch(`/api/clip-thumbnail/${jobId}/${index}`);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || 'Could not load AI thumbnail details.');
+            setAiThumbnailState(data);
+            setAiThumbnailError(null);
+            return data;
+        } catch (e) {
+            setAiThumbnailError(e.message || 'Could not load AI thumbnail details.');
+            return null;
+        }
+    };
+
+    useEffect(() => {
+        if (!clipAiThumbnailsEnabled || isManaged) return undefined;
+        void loadAiThumbnailState();
+        // The current rendered filename is part of the server-side thumbnail
+        // version key. Reload state after a subtitle/edit/reframe replacement.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [jobId, index, clip.video_url, clipAiThumbnailsEnabled, isManaged]);
 
     const handleCopy = async (field, text) => {
         try {
@@ -644,7 +674,11 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             const res = await apiFetch(path, options);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) throw new Error(data.detail || "Could not send this clip to Postiz.");
-            setPostizResult({ success: true, msg: data.message || "Sent to Postiz." });
+            setPostizResult({
+                success: true,
+                reused: data.reused,
+                msg: data.message || "Sent to Postiz."
+            });
         } catch (e) {
             setPostizResult({ success: false, msg: e.message || "Could not send this clip to Postiz." });
         } finally {
@@ -667,10 +701,65 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
         }
         setPostizResult(null);
         setPostizThumbnail(selected);
+        // A browser file wins for this send, but clear the persisted AI
+        // selection too so a later send cannot unexpectedly reuse it.
+        void selectAiThumbnail(null);
+    };
+
+    const selectAiThumbnail = async (candidateId) => {
+        try {
+            const res = await apiFetch(`/api/clip-thumbnail/${jobId}/${index}/select`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ candidate_id: candidateId }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || 'Could not select this AI thumbnail.');
+            setAiThumbnailState(data);
+            setAiThumbnailError(null);
+            if (candidateId) {
+                setPostizThumbnail(null);
+                if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
+            }
+        } catch (e) {
+            setAiThumbnailError(e.message || 'Could not select this AI thumbnail.');
+        }
+    };
+
+    const generateAiThumbnail = async () => {
+        setAiThumbnailLoading(true);
+        setAiThumbnailError(null);
+        try {
+            const apiKey = geminiApiKey || localStorage.getItem('gemini_key');
+            const headers = { 'Content-Type': 'application/json' };
+            if (apiKey) headers['X-Gemini-Key'] = apiKey;
+            const res = await apiFetch('/api/clip-thumbnail/generate', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    job_id: jobId,
+                    clip_index: index,
+                    instructions: aiThumbnailInstructions,
+                    count: aiThumbnailCount,
+                    request_id: crypto.randomUUID(),
+                }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || 'Could not generate an AI thumbnail.');
+            setAiThumbnailState(data);
+            setShowAiThumbnailModal(false);
+            setAiThumbnailInstructions('');
+        } catch (e) {
+            setAiThumbnailError(e.message || 'Could not generate an AI thumbnail.');
+        } finally {
+            setAiThumbnailLoading(false);
+        }
     };
 
     const isVideoChanging = isEditing || isSubtitling || isHooking || isTranslating
         || (bulkProgress?.running ?? false);
+    const aiThumbnailBusy = aiThumbnailLoading || aiThumbnailState?.hasRunningBatch === true;
+    const postizAlreadySent = !!postizResult?.success || aiThumbnailState?.postizLocked === true;
 
     // Browser-rendered previews (Remotion) live in a blob: URL that exists only
     // in this tab, so they always win over the durable copy.
@@ -839,6 +928,58 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     >
                         <FileText size={14} /> view descriptions
                     </button>
+
+                    {aiThumbnailState?.youtube && (
+                        <details className="bg-paper rounded-input px-3 py-2 border border-rule text-xs text-ink2">
+                            <summary className="cursor-pointer text-muted lowercase">youtube details</summary>
+                            <div className="mt-2 space-y-2">
+                                <p className="break-words"><span className="eyebrow mr-2">TITLE</span>{aiThumbnailState.youtube.title}</p>
+                                <p className="whitespace-pre-wrap break-words">{aiThumbnailState.youtube.description || 'No separate YouTube description was generated.'}</p>
+                                {aiThumbnailState.youtube.tags?.length > 0 && (
+                                    <p className="break-words text-muted">tags: {aiThumbnailState.youtube.tags.join(', ')}</p>
+                                )}
+                                {aiThumbnailState.youtube.truncated && (
+                                    <p className="text-warn">Description was shortened to YouTube’s size limit.</p>
+                                )}
+                                {aiThumbnailState.youtube.profileWarning && (
+                                    <p className="text-warn">{aiThumbnailState.youtube.profileWarning}</p>
+                                )}
+                            </div>
+                        </details>
+                    )}
+
+                    {aiThumbnailState?.message && (
+                        <p className={`text-xs rounded-input p-2 ${
+                            aiThumbnailState.batchState === 'unknown' || aiThumbnailState.batchState === 'failed'
+                                ? 'text-warn bg-[color-mix(in_oklab,var(--color-warn)_10%,transparent)]'
+                                : 'text-muted bg-paper'
+                        }`}>
+                            {aiThumbnailState.message}
+                        </p>
+                    )}
+
+                    {aiThumbnailState?.candidates?.length > 0 && (
+                        <div className="grid grid-cols-2 gap-2">
+                            {aiThumbnailState.candidates.map((candidate) => (
+                                <button
+                                    key={candidate.id}
+                                    onClick={() => void selectAiThumbnail(candidate.id)}
+                                    disabled={aiThumbnailBusy || postizAlreadySent}
+                                    title={candidate.selected ? 'Selected AI thumbnail' : 'Use this AI thumbnail for Send to Postiz'}
+                                    className={`rounded-input overflow-hidden border text-left transition-colors ${candidate.selected ? 'border-brass ring-1 ring-brass' : 'border-rule hover:border-rule2'} disabled:opacity-50`}
+                                >
+                                    <img
+                                        src={getApiUrl(candidate.url)}
+                                        alt="Generated AI thumbnail candidate"
+                                        className="w-full aspect-video object-cover bg-paper3"
+                                    />
+                                    <span className="block px-2 py-1 text-[10px] lowercase text-muted">
+                                        {candidate.selected ? 'AI thumbnail selected' : 'use this thumbnail'}
+                                    </span>
+                                </button>
+                            ))}
+                        </div>
+                    )}
                 </div>
 
                 {/* Error Message */}
@@ -922,7 +1063,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     />
                     <button
                         onClick={() => postizThumbnailInputRef.current?.click()}
-                        disabled={postizSending || isVideoChanging}
+                        disabled={postizSending || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
                         title={postizThumbnail
                             ? `Selected thumbnail: ${postizThumbnail.name}. Click to replace it.`
                             : 'Optional: select a JPEG or PNG YouTube thumbnail (maximum 2 MB)'}
@@ -931,13 +1072,28 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                         <ImagePlus size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
                         {postizThumbnail ? 'thumb ready' : 'add thumbnail'}
                     </button>
+                    {!isManaged && clipAiThumbnailsEnabled && (
+                        <button
+                            onClick={() => setShowAiThumbnailModal(true)}
+                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
+                            title={postizAlreadySent
+                                ? 'This clip was already sent to Postiz. Update its draft in Postiz.'
+                                : 'Create a Gemini AI thumbnail only for this clip'}
+                            className={QUIET_BTN}
+                        >
+                            {aiThumbnailBusy
+                                ? <Loader2 size={16} className="animate-spin text-brass shrink-0" />
+                                : <Wand2 size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
+                            {aiThumbnailBusy ? 'generating…' : 'generate AI thumb'}
+                        </button>
+                    )}
                     {postizThumbnail && (
                         <button
                             onClick={() => {
                                 setPostizThumbnail(null);
                                 if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
                             }}
-                            disabled={postizSending}
+                            disabled={postizSending || postizAlreadySent}
                             title="Remove the selected thumbnail before sending"
                             className={QUIET_BTN}
                         >
@@ -948,9 +1104,11 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
 
                     <button
                         onClick={handleSendToPostiz}
-                        disabled={postizSending || !postizConfigured || isVideoChanging}
+                        disabled={postizSending || !postizConfigured || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
                         title={isVideoChanging
                             ? 'Wait for the current video edit to finish before sending it to Postiz'
+                            : postizAlreadySent
+                            ? 'This clip was already sent to Postiz. Update its draft in Postiz.'
                             : postizConfigured
                             ? (postizPostType === 'now'
                                 ? 'Send this clip to Postiz for YouTube publishing'
@@ -985,6 +1143,80 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     </button>
                 </div>
             </div>
+
+            <Modal
+                isOpen={showAiThumbnailModal}
+                onClose={() => !aiThumbnailLoading && setShowAiThumbnailModal(false)}
+                eyebrow="ON-DEMAND AI"
+                title="generate clip thumbnail"
+                size="md"
+            >
+                <div className="space-y-4">
+                    <p className="text-sm text-muted leading-relaxed">
+                        This sends one locally extracted frame from this final clip, its
+                        clip-specific metadata, and your direction to Gemini. It does not
+                        upload the video file. Each candidate is a separate image request.
+                    </p>
+                    {aiThumbnailState?.thumbnailBrief && (
+                        <div className="bg-paper rounded-input p-3 border border-rule text-xs text-ink2 space-y-1">
+                            <p><span className="eyebrow mr-2">MOMENT</span>{aiThumbnailState.thumbnailBrief.moment || 'Use the selected clip context.'}</p>
+                            <p><span className="eyebrow mr-2">TEXT</span>{aiThumbnailState.thumbnailBrief.thumbnail_text || 'No fixed headline requested.'}</p>
+                        </div>
+                    )}
+                    {aiThumbnailState?.referenceUrl && (
+                        <img
+                            src={getApiUrl(aiThumbnailState.referenceUrl)}
+                            alt="Locally selected reference frame"
+                            className="w-full rounded-input border border-rule aspect-video object-cover bg-paper3"
+                        />
+                    )}
+                    <div>
+                        <label className="eyebrow block mb-1.5" htmlFor={`thumb-instructions-${jobId}-${index}`}>CREATIVE DIRECTION (OPTIONAL)</label>
+                        <textarea
+                            id={`thumb-instructions-${jobId}-${index}`}
+                            value={aiThumbnailInstructions}
+                            onChange={(event) => setAiThumbnailInstructions(event.target.value.slice(0, 600))}
+                            maxLength={600}
+                            rows={3}
+                            placeholder="Example: emphasize the boss reaction, cinematic lighting, no extra text."
+                            className="w-full bg-paper rounded-input border border-rule px-3 py-2 text-sm text-ink2 outline-none focus:border-brass resize-y"
+                        />
+                    </div>
+                    <div>
+                        <label className="eyebrow block mb-1.5">CANDIDATES</label>
+                        <select
+                            value={aiThumbnailCount}
+                            onChange={(event) => setAiThumbnailCount(Number(event.target.value))}
+                            className="bg-paper rounded-input border border-rule px-3 py-2 text-sm text-ink2 outline-none focus:border-brass"
+                        >
+                            <option value={1}>1 candidate</option>
+                            <option value={2}>2 candidates</option>
+                            <option value={3}>3 candidates</option>
+                        </select>
+                    </div>
+                    {aiThumbnailError && (
+                        <p className="text-xs text-danger bg-[color-mix(in_oklab,var(--color-danger)_10%,transparent)] rounded-input p-3">
+                            {aiThumbnailError}
+                        </p>
+                    )}
+                    <div className="flex justify-end gap-2">
+                        <button
+                            onClick={() => setShowAiThumbnailModal(false)}
+                            disabled={aiThumbnailLoading}
+                            className="btn-ghost px-3 py-2 text-xs"
+                        >
+                            cancel
+                        </button>
+                        <button
+                            onClick={() => void generateAiThumbnail()}
+                            disabled={aiThumbnailLoading}
+                            className="btn-primary px-3 py-2 text-xs"
+                        >
+                            {aiThumbnailLoading ? 'generating…' : 'generate'}
+                        </button>
+                    </div>
+                </div>
+            </Modal>
 
             {/* Descriptions Modal */}
             <Modal

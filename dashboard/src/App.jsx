@@ -269,7 +269,7 @@ const pollJob = async (jobId) => {
 
 function App() {
   // Cloud auth/billing session (inert when billing is disabled).
-  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm, postizConfigured, postizPostType } = useAuth();
+  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm, postizConfigured, postizPostType, clipAiThumbnailsEnabled } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   // Free plan: "want the watermark off?" once per job, when the clips land.
@@ -2313,6 +2313,7 @@ function App() {
                           isManaged={isManaged}
                           postizConfigured={postizConfigured}
                           postizPostType={postizPostType}
+                          clipAiThumbnailsEnabled={clipAiThumbnailsEnabled}
                           onPlay={(time) => handleClipPlay(time)}
                           onPause={handleClipPause}
                           onBulkSubtitle={handleBulkSubtitles}

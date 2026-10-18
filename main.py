@@ -24,6 +24,8 @@ from google import genai
 from google.genai import types as genai_types
 
 import frame_sampler
+import clip_packaging
+from gemini_feature_flags import clip_analysis_enabled
 import gpu_decode
 import gemini_worker
 import hook_grounding
@@ -1996,6 +1998,10 @@ def get_viral_clips(transcript_result, video_duration):
         model_name = llm_backend.model_name()
         print(f"\U0001f916  Analyzing with local LLM at {llm_backend.base_url()} (2-pass: score → detail)...")
     else:
+        if not clip_analysis_enabled():
+            print("❌ Gemini clip analysis is disabled. Configure LLM_BASE_URL and "
+                  "LLM_MODEL for local transcript clip selection.")
+            return None
         print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -2121,6 +2127,7 @@ def get_viral_clips(transcript_result, video_duration):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "
                   f"better-scored one.")
             shorts = deduped
+        shorts = [clip_packaging.normalise_clip_packaging_metadata(s) for s in shorts]
 
         # Aggregate cost across both passes.
         cost_analysis = None
@@ -2195,7 +2202,7 @@ def get_visual_clips(video_path, video_duration, language="en"):
         min_clips = _env_int("CLIP_TARGET_MIN", 3)
         max_clips = max(min_clips, _env_int("CLIP_TARGET_MAX", 15))
         min_secs, max_secs = clip_duration_bounds()
-        return vision_backend.select_clips(
+        result = vision_backend.select_clips(
             video_path=video_path,
             video_duration=video_duration,
             language=language,
@@ -2204,7 +2211,16 @@ def get_visual_clips(video_path, video_duration, language="en"):
             min_seconds=min_secs,
             max_seconds=max_secs,
         )
+        result["shorts"] = [
+            clip_packaging.normalise_clip_packaging_metadata(clip)
+            for clip in result.get("shorts") or []
+        ]
+        return result
 
+    if not clip_analysis_enabled():
+        print("❌ Gemini clip analysis is disabled. Configure VISION_PROVIDER=ollama "
+              "for local silent-video clip selection.")
+        return None
     print("🎥  Silent video — analyzing with Gemini vision (no transcript)...")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -2273,7 +2289,12 @@ def get_visual_clips(video_path, video_duration, language="en"):
         cost = gemini_worker._calculate_cost_analysis(response, model_name)
         if cost:
             print(f"💰 Vision cost ({model_name}): ${cost.get('total_cost', 0):.6f}")
-        result = {"shorts": clean}
+        result = {
+            "shorts": [
+                clip_packaging.normalise_clip_packaging_metadata(clip)
+                for clip in clean
+            ]
+        }
         if cost:
             result["cost_analysis"] = cost
         return result

@@ -17,6 +17,8 @@ from typing import Any, Dict, List
 
 import httpx
 
+from clip_packaging import normalise_tags
+
 
 EXPECTED_API_BASE_URL = "http://postiz:5000/api/public/v1"
 DEFAULT_TIMEOUT_SECONDS = 300.0
@@ -292,6 +294,8 @@ def create_youtube_post(
     title: str,
     description: str,
     thumbnail: dict | None = None,
+    *,
+    tags: List[str] | None = None,
 ) -> str:
     """Create one Postiz YouTube draft/now post.
 
@@ -308,6 +312,10 @@ def create_youtube_post(
         raise PostizError("Postiz returned an invalid YouTube integration id.")
     if not media_id or not media_path:
         raise PostizError("Saved Postiz media state is invalid.")
+    youtube_tags = [
+        {"label": label}
+        for label in normalise_tags(tags or [], maximum_items=20)
+    ]
 
     thumbnail_settings = {}
     if thumbnail is not None:
@@ -340,7 +348,7 @@ def create_youtube_post(
                 "title": title,
                 "type": config.privacy_status,
                 "selfDeclaredMadeForKids": "no",
-                "tags": [],
+                "tags": youtube_tags,
                 **thumbnail_settings,
             },
         }],

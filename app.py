@@ -1,4 +1,6 @@
 import os
+import clip_packaging
+import clip_thumbnail_image
 import llm_backend
 import postiz_client
 import re
@@ -38,6 +40,7 @@ import recut
 import layout_ranges
 import watermarked
 import media_auth
+from gemini_feature_flags import clip_ai_thumbnails_enabled
 
 load_dotenv()
 
@@ -319,7 +322,10 @@ def gemini_missing_error():
     if BILLING_ENABLED:
         return payment_required(
             "no_plan", "This action needs an active OpenShorts plan (or the user's own API key).")
-    return HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+    return HTTPException(
+        status_code=400,
+        detail="Missing Gemini API key. Set GEMINI_API_KEY in the backend or provide X-Gemini-Key.",
+    )
 
 
 # Probe rate limiter. In-memory, resets on restart by design — the hard monthly
@@ -2864,6 +2870,9 @@ async def get_config():
         # endpoint and integration id intentionally never leave the backend.
         "postizConfigured": False if BILLING_ENABLED else postiz_client.is_configured(),
         "postizPostType": None if BILLING_ENABLED else postiz_client.configured_post_type(),
+        # A non-secret feature capability. The dashboard never receives the
+        # Gemini key; self-hosted users may keep it only in the backend env.
+        "clipAiThumbnailsEnabled": False if BILLING_ENABLED else clip_ai_thumbnails_enabled(),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -5624,6 +5633,28 @@ _postiz_publish_locks: Dict[tuple[str, int], asyncio.Lock] = {}
 _postiz_publish_locks_guard = asyncio.Lock()
 POSTIZ_THUMBNAIL_CHUNK_BYTES = 64 * 1024
 POSTIZ_THUMBNAIL_MAX_PIXELS = 16_000_000
+CLIP_THUMBNAIL_STATE_FILE = ".clip_thumbnail_state.json"
+CLIP_THUMBNAIL_MAX_INSTRUCTIONS_BYTES = 600
+CLIP_THUMBNAIL_REQUEST_COUNTS = frozenset((1, 2, 3))
+_clip_thumbnail_locks: Dict[tuple[str, int], asyncio.Lock] = {}
+_clip_thumbnail_locks_guard = asyncio.Lock()
+# A local image-generation request consumes quota. Do not create a hidden
+# queue: a caller must see a 429 and explicitly choose when to retry.
+try:
+    CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS = int(
+        os.environ.get("CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS", "1")
+    )
+except ValueError:
+    CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS = 1
+# This first release is deliberately serialized even when a malformed/larger
+# value is supplied. The name remains an explicit config seam for a future
+# metered implementation, rather than silently introducing a paid-work queue.
+CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS = min(
+    max(CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS, 1), 1
+)
+_clip_thumbnail_generation_gate = asyncio.BoundedSemaphore(
+    CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS
+)
 
 
 class PostizStateError(RuntimeError):
@@ -5635,22 +5666,28 @@ class PostizPublishRequest(BaseModel):
     clip_index: int
 
 
-async def _read_postiz_thumbnail(upload: UploadFile) -> dict:
-    """Read a small, valid JPEG/PNG thumbnail without trusting browser metadata."""
-    chunks = []
-    total = 0
-    while True:
-        chunk = await upload.read(POSTIZ_THUMBNAIL_CHUNK_BYTES)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > postiz_client.MAX_THUMBNAIL_BYTES:
-            raise HTTPException(status_code=413, detail="Thumbnail image exceeds the 2 MB limit.")
-        chunks.append(chunk)
+class ClipThumbnailGenerateRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    instructions: str = ""
+    count: int = 1
+    request_id: str
 
-    content = b"".join(chunks)
+
+class ClipThumbnailSelectRequest(BaseModel):
+    candidate_id: Optional[str] = None
+
+
+class ClipThumbnailStateError(RuntimeError):
+    """A generated-thumbnail state error that must not affect the rendered clip."""
+
+
+def _validated_postiz_thumbnail_content(content: bytes) -> dict:
+    """Validate trusted candidate bytes or a browser upload identically."""
     if not content:
         raise HTTPException(status_code=400, detail="Thumbnail image is empty.")
+    if len(content) > postiz_client.MAX_THUMBNAIL_BYTES:
+        raise HTTPException(status_code=413, detail="Thumbnail image exceeds the 2 MB limit.")
     try:
         with Image.open(io.BytesIO(content)) as image:
             image_format = image.format
@@ -5672,7 +5709,6 @@ async def _read_postiz_thumbnail(upload: UploadFile) -> dict:
         raise HTTPException(status_code=400, detail="Thumbnail must be a JPEG or PNG image.")
     if width <= 0 or height <= 0 or width * height > POSTIZ_THUMBNAIL_MAX_PIXELS:
         raise HTTPException(status_code=400, detail="Thumbnail dimensions are too large.")
-
     digest = hashlib.sha256(content).hexdigest()
     return {
         "content": content,
@@ -5682,15 +5718,33 @@ async def _read_postiz_thumbnail(upload: UploadFile) -> dict:
     }
 
 
-def _require_postiz_dashboard_origin(request: Request) -> None:
-    """Allow the local dashboard, never arbitrary browser pages, to publish."""
+async def _read_postiz_thumbnail(upload: UploadFile) -> dict:
+    """Read a small, valid JPEG/PNG thumbnail without trusting browser metadata."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = await upload.read(POSTIZ_THUMBNAIL_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > postiz_client.MAX_THUMBNAIL_BYTES:
+            raise HTTPException(status_code=413, detail="Thumbnail image exceeds the 2 MB limit.")
+        chunks.append(chunk)
+
+    content = b"".join(chunks)
+    return _validated_postiz_thumbnail_content(content)
+
+
+def _require_local_dashboard_origin(request: Request) -> None:
+    """Allow local dashboard mutations, never arbitrary browser pages."""
     if BILLING_ENABLED:
-        raise HTTPException(status_code=403, detail="Postiz publishing is available only in self-host mode.")
+        raise HTTPException(status_code=403, detail="This action is available only in self-host mode.")
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
     if origin not in LOCAL_DASHBOARD_ORIGINS:
         raise HTTPException(
             status_code=403,
-            detail="Send to Postiz requests must come from the local OpenShorts dashboard.",
+            detail="This request must come from the local OpenShorts dashboard "
+            "(the local OpenShorts dashboard is required).",
         )
 
 
@@ -5756,6 +5810,342 @@ def _write_postiz_state(path: Path, state: dict) -> None:
             pass
 
 
+async def _clip_thumbnail_lock(job_id: str, clip_index: int) -> asyncio.Lock:
+    async with _clip_thumbnail_locks_guard:
+        return _clip_thumbnail_locks.setdefault((job_id, clip_index), asyncio.Lock())
+
+
+def _clip_thumbnail_state_path(job_id: str) -> Path:
+    return Path(OUTPUT_DIR) / job_id / CLIP_THUMBNAIL_STATE_FILE
+
+
+def _read_clip_thumbnail_state(path: Path) -> dict:
+    if not path.exists():
+        return {"versions": {}}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ClipThumbnailStateError(
+            "Existing AI thumbnail state is unreadable. Generate a new thumbnail batch."
+        ) from exc
+    if not isinstance(state, dict) or not isinstance(state.get("versions"), dict):
+        raise ClipThumbnailStateError(
+            "Existing AI thumbnail state is invalid. Generate a new thumbnail batch."
+        )
+    return state
+
+
+def _write_clip_thumbnail_state(path: Path, state: dict) -> None:
+    """Atomically persist generated candidates without touching clip metadata."""
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("x", encoding="utf-8") as fh:
+            json.dump(state, fh, separators=(",", ":"), sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        _fsync_parent_directory(path)
+    except OSError as exc:
+        raise ClipThumbnailStateError(
+            "Could not save AI thumbnail state; the clip itself is unchanged."
+        ) from exc
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _clip_thumbnail_root(job_id: str, clip_index: int, fingerprint: str) -> Path:
+    """Return a versioned directory fully contained in the current job folder."""
+    if not _JOB_ID_RE.fullmatch(job_id or "") or clip_index < 0:
+        raise ClipThumbnailStateError("Invalid OpenShorts clip reference.")
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint or ""):
+        raise ClipThumbnailStateError("Invalid rendered clip fingerprint.")
+    job_dir = (Path(OUTPUT_DIR) / job_id).resolve(strict=True)
+    root = (job_dir / "ai_thumbnails" / str(clip_index) / fingerprint).resolve()
+    try:
+        root.relative_to(job_dir)
+    except ValueError as exc:
+        raise ClipThumbnailStateError("AI thumbnail storage path is invalid.") from exc
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _write_thumbnail_file(path: Path, content: bytes) -> None:
+    """Atomically save a validated image under its server-owned job directory."""
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("xb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        _fsync_parent_directory(path)
+    except OSError as exc:
+        raise ClipThumbnailStateError("Could not save the generated thumbnail.") from exc
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _read_job_transcript(job_id: str) -> dict:
+    """Best-effort transcript lookup from server-owned job metadata only."""
+    job_dir = Path(OUTPUT_DIR) / job_id
+    for path in sorted(job_dir.glob("*_metadata.json")):
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(job_dir.resolve(strict=True))
+            data = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, RuntimeError, ValueError, UnicodeDecodeError):
+            continue
+        transcript = data.get("transcript") if isinstance(data, dict) else None
+        if isinstance(transcript, dict):
+            return transcript
+    return {}
+
+
+def _make_clip_reference_frame(
+    clip_path: Path, root: Path
+) -> tuple[bytes | None, str | None]:
+    """Select one sharp, readable final-clip frame; never makes a network call."""
+    reference_path = root / "reference.jpg"
+    if reference_path.exists():
+        try:
+            data = reference_path.read_bytes()
+            jpg = clip_thumbnail_image.normalise_thumbnail_jpeg(
+                data, ai_generated=False
+            )
+            _write_thumbnail_file(reference_path, jpg)
+            return jpg, "reference.jpg"
+        except (OSError, HTTPException, clip_thumbnail_image.ClipThumbnailImageError):
+            # Rebuild only this generated artifact; it never affects the MP4.
+            try:
+                reference_path.unlink()
+            except OSError:
+                pass
+    try:
+        import cv2
+        import numpy as np
+
+        capture = cv2.VideoCapture(str(clip_path))
+        if not capture.isOpened():
+            capture.release()
+            return None, None
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+            frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            duration = frames / fps if fps > 0 and frames > 0 else 0.0
+            if duration <= 0:
+                return None, None
+            lo, hi = (1.0, duration - 1.0) if duration > 2.0 else (0.0, duration)
+            sample_times = [
+                lo + (hi - lo) * position / 6
+                for position in range(7)
+            ]
+            chosen: tuple[float, Any] | None = None
+            for when in sample_times:
+                capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, when) * 1000)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                brightness = float(np.mean(gray))
+                exposure = max(0.15, 1.0 - abs(brightness - 128.0) / 128.0)
+                # The tiny midpoint preference avoids choosing a title card
+                # merely because its edges are unusually sharp.
+                midpoint = 1.0 - min(1.0, abs(when - duration / 2) / max(duration / 2, 0.001))
+                score = math.log1p(max(0.0, sharpness)) * exposure + midpoint * 0.15
+                if chosen is None or score > chosen[0]:
+                    chosen = (score, frame)
+        finally:
+            capture.release()
+        if chosen is None:
+            return None, None
+        frame = chosen[1]
+        height, width = frame.shape[:2]
+        if width > 1280:
+            scale = 1280 / width
+            frame = cv2.resize(frame, (1280, max(1, round(height * scale))))
+        encoded_ok, encoded = cv2.imencode(
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]
+        )
+        if not encoded_ok:
+            return None, None
+        jpg = clip_thumbnail_image.normalise_thumbnail_jpeg(
+            encoded.tobytes(), ai_generated=False
+        )
+        _write_thumbnail_file(reference_path, jpg)
+        return jpg, "reference.jpg"
+    except (ClipThumbnailStateError, clip_thumbnail_image.ClipThumbnailImageError):
+        raise
+    except Exception as exc:
+        print(f"⚠️ AI thumbnail reference frame unavailable ({type(exc).__name__}).")
+        return None, None
+
+
+def _thumbnail_version_key(filename: str, fingerprint: str) -> str:
+    return f"{filename}:{fingerprint}"
+
+
+def _thumbnail_url(job_id: str, clip_index: int, fingerprint: str, filename: str) -> str:
+    return f"/videos/{job_id}/ai_thumbnails/{clip_index}/{fingerprint}/{filename}"
+
+
+def _postiz_version_is_locked(job_id: str, filename: str, fingerprint: str) -> bool:
+    """True when an exact rendered version must not be changed after handoff."""
+    state = _read_postiz_state(_postiz_state_path(job_id))
+    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+    return isinstance(record, dict) and record.get("state") in {
+        "post_created",
+        "post_create_pending",
+        "post_create_unknown",
+    }
+
+
+def _thumbnail_record_view(
+    job_id: str,
+    clip_index: int,
+    filename: str,
+    fingerprint: str,
+    record: dict | None,
+    clip: dict,
+    transcript: dict,
+) -> dict:
+    """Return browser-safe state only: IDs and same-job protected media URLs."""
+    description, tags, truncated, profile_warning = clip_packaging.compose_youtube_metadata(clip)
+    payload = {
+        "version": {"filename": filename, "fingerprint": fingerprint},
+        "selectedCandidateId": None,
+        "referenceUrl": None,
+        "candidates": [],
+        "batchState": None,
+        "hasRunningBatch": False,
+        "postizLocked": False,
+        "youtube": {
+            "title": _postiz_metadata(clip)[0],
+            "description": description,
+            "tags": tags,
+            "truncated": truncated,
+            "profileWarning": profile_warning,
+        },
+        "thumbnailBrief": clip_packaging.conservative_thumbnail_brief(
+            clip, clip_packaging.clip_transcript_excerpt(
+                transcript, clip.get("start"), clip.get("end")
+            )
+        ),
+    }
+    try:
+        payload["postizLocked"] = _postiz_version_is_locked(
+            job_id, filename, fingerprint
+        )
+    except PostizStateError:
+        # The state is not required to render a completed clip. Publishing
+        # itself still fails closed if its state cannot be read.
+        payload["postizLocked"] = False
+    if not isinstance(record, dict):
+        return payload
+    payload["selectedCandidateId"] = (
+        record.get("selected_candidate_id")
+        if isinstance(record.get("selected_candidate_id"), str)
+        else None
+    )
+    reference = record.get("reference")
+    if isinstance(reference, dict) and reference.get("filename") == "reference.jpg":
+        payload["referenceUrl"] = _thumbnail_url(
+            job_id, clip_index, fingerprint, "reference.jpg"
+        )
+    batches = record.get("batches")
+    if not isinstance(batches, dict):
+        return payload
+    latest = None
+    for batch in batches.values():
+        if not isinstance(batch, dict):
+            continue
+        if batch.get("state") == "running":
+            payload["hasRunningBatch"] = True
+        if latest is None or str(batch.get("started_at") or "") > str(latest.get("started_at") or ""):
+            latest = batch
+        for candidate in batch.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_id = candidate.get("id")
+            candidate_name = candidate.get("filename")
+            if (
+                isinstance(candidate_id, str)
+                and re.fullmatch(r"[0-9a-f]{32}", candidate_id)
+                and isinstance(candidate_name, str)
+                and re.fullmatch(r"candidate-[0-9a-f]{32}\.jpg", candidate_name)
+            ):
+                payload["candidates"].append({
+                    "id": candidate_id,
+                    "url": _thumbnail_url(job_id, clip_index, fingerprint, candidate_name),
+                    "selected": candidate_id == payload["selectedCandidateId"],
+                })
+    if isinstance(latest, dict):
+        payload["batchState"] = latest.get("state") if isinstance(latest.get("state"), str) else None
+        if isinstance(latest.get("message"), str):
+            payload["message"] = latest["message"]
+    return payload
+
+
+def _selected_ai_thumbnail(
+    job_id: str, clip_index: int, filename: str, fingerprint: str
+) -> Optional[dict]:
+    """Return the current selected candidate as a Postiz-safe thumbnail dict."""
+    state = _read_clip_thumbnail_state(_clip_thumbnail_state_path(job_id))
+    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+    if not isinstance(record, dict):
+        return None
+    batches = record.get("batches")
+    if isinstance(batches, dict) and any(
+        isinstance(batch, dict) and batch.get("state") == "running"
+        for batch in batches.values()
+    ):
+        raise ClipThumbnailStateError(
+            "AI thumbnail generation is still running. Wait before sending this clip to Postiz."
+        )
+    selected = record.get("selected_candidate_id")
+    if not isinstance(selected, str) or not re.fullmatch(r"[0-9a-f]{32}", selected):
+        return None
+    candidate_filename = None
+    if isinstance(batches, dict):
+        for batch in batches.values():
+            if not isinstance(batch, dict):
+                continue
+            for candidate in batch.get("candidates") or []:
+                if isinstance(candidate, dict) and candidate.get("id") == selected:
+                    candidate_filename = candidate.get("filename")
+                    break
+            if candidate_filename:
+                break
+    if not isinstance(candidate_filename, str) or not re.fullmatch(
+        r"candidate-[0-9a-f]{32}\.jpg", candidate_filename
+    ):
+        raise ClipThumbnailStateError("Selected AI thumbnail state is invalid.")
+    root = _clip_thumbnail_root(job_id, clip_index, fingerprint)
+    try:
+        candidate_path = (root / candidate_filename).resolve(strict=True)
+        candidate_path.relative_to(root)
+        content = candidate_path.read_bytes()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ClipThumbnailStateError("Selected AI thumbnail file is unavailable.") from exc
+    try:
+        result = _validated_postiz_thumbnail_content(content)
+    except HTTPException as exc:
+        raise ClipThumbnailStateError("Selected AI thumbnail file is invalid.") from exc
+    result["filename"] = f"openshorts-ai-thumbnail-{result['sha256'][:16]}.jpg"
+    return result
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -5810,18 +6200,25 @@ def _resolve_postiz_clip(job_id: str, clips: list, clip_index: int) -> tuple[Pat
     return resolved_file, filename, fingerprint
 
 
-def _postiz_metadata(clip: dict) -> tuple[str, str]:
+def _postiz_metadata(clip: dict) -> tuple[str, str, list[str], bool, Optional[str]]:
+    """Return title plus safely composed YouTube description and tags."""
     title_value = clip.get("video_title_for_youtube_short") or clip.get("title")
     title = title_value.strip() if isinstance(title_value, str) else ""
     title = title[:100].strip()
     if len(title) < 2:
         title = "OpenShorts clip"
-    description_value = (
-        clip.get("video_description_for_instagram")
-        or clip.get("video_description_for_tiktok")
-    )
-    description = description_value.strip() if isinstance(description_value, str) else ""
-    return title, description
+    description, tags, truncated, profile_warning = clip_packaging.compose_youtube_metadata(clip)
+    if not description:
+        description_value = (
+            clip.get("video_description_for_instagram")
+            or clip.get("video_description_for_tiktok")
+        )
+        description = (
+            description_value.strip()
+            if isinstance(description_value, str)
+            else ""
+        )
+    return title, description, tags, truncated, profile_warning
 
 
 def _postiz_http_error(error: postiz_client.PostizError) -> HTTPException:
@@ -5843,7 +6240,7 @@ async def _post_to_postiz(
     thumbnail: Optional[dict] = None,
 ):
     """Send the selected current MP4 and optional thumbnail to local Postiz."""
-    _require_postiz_dashboard_origin(request)
+    _require_local_dashboard_origin(request)
     try:
         config = postiz_client.configuration()
     except postiz_client.PostizError as exc:
@@ -5951,6 +6348,19 @@ async def _post_to_postiz(
 
         thumbnail_media = None
         stored_thumbnail = record.get("thumbnail")
+        if thumbnail is None:
+            thumbnail_lock = await _clip_thumbnail_lock(req.job_id, req.clip_index)
+            async with thumbnail_lock:
+                try:
+                    thumbnail = await asyncio.to_thread(
+                        _selected_ai_thumbnail,
+                        req.job_id,
+                        req.clip_index,
+                        filename,
+                        fingerprint,
+                    )
+                except ClipThumbnailStateError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
         if thumbnail is not None:
             thumbnail_fingerprint = thumbnail.get("sha256")
             thumbnail_content = thumbnail.get("content")
@@ -6019,9 +6429,13 @@ async def _post_to_postiz(
         except PostizStateError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        title, description = _postiz_metadata(clip_snapshot)
+        title, description, tags, metadata_truncated, profile_warning = _postiz_metadata(clip_snapshot)
+        if metadata_truncated:
+            print("⚠️ YouTube description was truncated to its 5,000-byte limit.")
+        if profile_warning:
+            print(f"⚠️ {profile_warning}")
         try:
-            if thumbnail_media is None:
+            if thumbnail_media is None and not tags:
                 post_id = await asyncio.to_thread(
                     postiz_client.create_youtube_post,
                     config,
@@ -6029,6 +6443,26 @@ async def _post_to_postiz(
                     media,
                     title,
                     description,
+                )
+            elif thumbnail_media is None:
+                post_id = await asyncio.to_thread(
+                    postiz_client.create_youtube_post,
+                    config,
+                    str(integration.get("id") or ""),
+                    media,
+                    title,
+                    description,
+                    tags=tags,
+                )
+            elif not tags:
+                post_id = await asyncio.to_thread(
+                    postiz_client.create_youtube_post,
+                    config,
+                    str(integration.get("id") or ""),
+                    media,
+                    title,
+                    description,
+                    thumbnail_media,
                 )
             else:
                 post_id = await asyncio.to_thread(
@@ -6039,6 +6473,7 @@ async def _post_to_postiz(
                     title,
                     description,
                     thumbnail_media,
+                    tags=tags,
                 )
         except postiz_client.PostizOutcomeUnknown as exc:
             record["state"] = "post_create_unknown"
@@ -6098,7 +6533,7 @@ async def post_to_postiz_with_thumbnail(
     thumbnail: UploadFile = File(...),
 ):
     """Send the selected current MP4 and a custom thumbnail to local Postiz."""
-    _require_postiz_dashboard_origin(request)
+    _require_local_dashboard_origin(request)
     try:
         selected_thumbnail = await _read_postiz_thumbnail(thumbnail)
         return await _post_to_postiz(
@@ -6108,6 +6543,434 @@ async def post_to_postiz_with_thumbnail(
         )
     finally:
         await thumbnail.close()
+
+
+async def _clip_thumbnail_context(
+    job_id: str, clip_index: int, request: Request
+) -> tuple[dict, dict, Path, str, str, dict]:
+    """Resolve the one current server-owned rendered clip for thumbnail work."""
+    if not _JOB_ID_RE.fullmatch(job_id or ""):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not await _ensure_job_files(job_id, request) or job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+    clips = (job.get("result") or {}).get("clips") or []
+    if clip_index < 0 or clip_index >= len(clips) or not isinstance(clips[clip_index], dict):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip_snapshot = dict(clips[clip_index])
+    try:
+        file_path, filename, fingerprint = await asyncio.to_thread(
+            _resolve_postiz_clip, job_id, [clip_snapshot], 0
+        )
+    except PostizStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    transcript = await asyncio.to_thread(_read_job_transcript, job_id)
+    return job, clip_snapshot, file_path, filename, fingerprint, transcript
+
+
+def _set_thumbnail_batch_error(
+    job_id: str,
+    filename: str,
+    fingerprint: str,
+    request_id: str,
+    state_name: str,
+    message: str,
+) -> None:
+    """Record a safe terminal state after an image request or local failure."""
+    state_path = _clip_thumbnail_state_path(job_id)
+    state = _read_clip_thumbnail_state(state_path)
+    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+    if not isinstance(record, dict) or not isinstance(record.get("batches"), dict):
+        return
+    batch = record["batches"].get(request_id)
+    if not isinstance(batch, dict):
+        return
+    batch["state"] = state_name
+    batch["message"] = message
+    batch["completed_at"] = datetime.now(timezone.utc).isoformat()
+    _write_clip_thumbnail_state(state_path, state)
+
+
+@app.get("/api/clip-thumbnail/{job_id}/{clip_index}")
+async def get_clip_thumbnail_state(job_id: str, clip_index: int, request: Request):
+    """Read non-secret candidate state and composed YouTube metadata for one clip."""
+    _require_local_dashboard_origin(request)
+    _job, clip, _file_path, filename, fingerprint, transcript = await _clip_thumbnail_context(
+        job_id, clip_index, request
+    )
+    try:
+        state = await asyncio.to_thread(_read_clip_thumbnail_state, _clip_thumbnail_state_path(job_id))
+    except ClipThumbnailStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+    return _thumbnail_record_view(
+        job_id, clip_index, filename, fingerprint, record, clip, transcript
+    )
+
+
+@app.post("/api/clip-thumbnail/generate")
+async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Request):
+    """Create explicitly requested Nano Banana candidates for the current clip only."""
+    _require_local_dashboard_origin(request)
+    if not clip_ai_thumbnails_enabled():
+        raise HTTPException(
+            status_code=409,
+            detail="AI thumbnail generation is disabled by CLIP_AI_THUMBNAILS_ENABLED.",
+        )
+    try:
+        request_uuid = uuid.UUID(req.request_id)
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="request_id must be a UUID.") from exc
+    if str(request_uuid) != req.request_id.lower():
+        raise HTTPException(status_code=400, detail="request_id must be a canonical UUID.")
+    if req.count not in CLIP_THUMBNAIL_REQUEST_COUNTS:
+        raise HTTPException(status_code=400, detail="count must be 1, 2, or 3.")
+    if not isinstance(req.instructions, str):
+        raise HTTPException(status_code=400, detail="instructions must be text.")
+    if len(req.instructions.encode("utf-8", errors="ignore")) > CLIP_THUMBNAIL_MAX_INSTRUCTIONS_BYTES:
+        raise HTTPException(status_code=400, detail="instructions must be at most 600 UTF-8 bytes.")
+    api_key = await resolve_gemini(request)
+    if not api_key:
+        raise gemini_missing_error()
+
+    job, clip, file_path, filename, fingerprint, transcript = await _clip_thumbnail_context(
+        req.job_id, req.clip_index, request
+    )
+    del job
+    version_key = _thumbnail_version_key(filename, fingerprint)
+    lock = await _clip_thumbnail_lock(req.job_id, req.clip_index)
+    async with lock:
+        try:
+            state_path = _clip_thumbnail_state_path(req.job_id)
+            state = await asyncio.to_thread(_read_clip_thumbnail_state, state_path)
+            if await asyncio.to_thread(
+                _postiz_version_is_locked, req.job_id, filename, fingerprint
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This exact clip was already sent to Postiz. Update its draft in Postiz.",
+                )
+            record = state["versions"].setdefault(version_key, {
+                "filename": filename,
+                "sha256": fingerprint,
+                "batches": {},
+                "selected_candidate_id": None,
+            })
+            if not isinstance(record, dict) or not isinstance(record.get("batches"), dict):
+                raise ClipThumbnailStateError(
+                    "Existing AI thumbnail state is invalid. Generate a new thumbnail batch."
+                )
+            duplicate = record["batches"].get(req.request_id)
+            if isinstance(duplicate, dict):
+                return _thumbnail_record_view(
+                    req.job_id, req.clip_index, filename, fingerprint, record, clip, transcript
+                )
+            if _clip_thumbnail_generation_gate.locked():
+                raise HTTPException(
+                    status_code=429,
+                    detail="Another AI thumbnail is generating. Wait for it to finish before starting another.",
+                )
+            record["batches"][req.request_id] = {
+                "state": "running",
+                "requested_count": req.count,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "candidates": [],
+            }
+            await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
+        except (ClipThumbnailStateError, PostizStateError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # Acquire without queueing a second paid operation. The preliminary
+    # locked() check is followed by an immediate acquire in this coroutine,
+    # so a competing request sees it locked rather than entering a queue.
+    if _clip_thumbnail_generation_gate.locked():
+        await asyncio.to_thread(
+            _set_thumbnail_batch_error,
+            req.job_id, filename, fingerprint, req.request_id, "failed",
+            "Another AI thumbnail generation started first. Start a new batch when it finishes.",
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Another AI thumbnail is generating. Start a new batch when it finishes.",
+        )
+    await _clip_thumbnail_generation_gate.acquire()
+    try:
+        root = await asyncio.to_thread(
+            _clip_thumbnail_root, req.job_id, req.clip_index, fingerprint
+        )
+        try:
+            reference_jpeg, reference_name = await asyncio.to_thread(
+                _make_clip_reference_frame, file_path, root
+            )
+        except ClipThumbnailStateError as exc:
+            await asyncio.to_thread(
+                _set_thumbnail_batch_error,
+                req.job_id, filename, fingerprint, req.request_id, "failed", str(exc),
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if reference_name:
+            async with lock:
+                try:
+                    state = await asyncio.to_thread(
+                        _read_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id)
+                    )
+                    record = state["versions"].get(version_key)
+                    if isinstance(record, dict):
+                        record["reference"] = {
+                            "filename": reference_name,
+                            "sha256": hashlib.sha256(reference_jpeg or b"").hexdigest(),
+                        }
+                        await asyncio.to_thread(
+                            _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
+                        )
+                except ClipThumbnailStateError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        excerpt = clip_packaging.clip_transcript_excerpt(
+            transcript, clip.get("start"), clip.get("end")
+        )
+        brief = clip_packaging.conservative_thumbnail_brief(clip, excerpt)
+        prompt = clip_thumbnail_image.build_prompt(
+            title=_postiz_metadata(clip)[0],
+            transcript_excerpt=excerpt,
+            brief=brief,
+            instructions=req.instructions,
+        )
+        input_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "prompt": prompt,
+                    "reference_sha256": (
+                        hashlib.sha256(reference_jpeg).hexdigest()
+                        if reference_jpeg else None
+                    ),
+                    "model": clip_thumbnail_image.model_name(),
+                    "image_size": clip_thumbnail_image.image_size(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        async with lock:
+            try:
+                state = await asyncio.to_thread(
+                    _read_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id)
+                )
+                record = state["versions"].get(version_key)
+                batch = record.get("batches", {}).get(req.request_id) if isinstance(record, dict) else None
+                if not isinstance(batch, dict) or batch.get("state") != "running":
+                    raise ClipThumbnailStateError(
+                        "AI thumbnail state changed before image generation."
+                    )
+                batch["input_sha256"] = input_sha256
+                await asyncio.to_thread(
+                    _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
+                )
+            except (ClipThumbnailStateError, clip_thumbnail_image.ClipThumbnailImageError) as exc:
+                await asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id, filename, fingerprint, req.request_id, "failed", str(exc),
+                )
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        for number in range(req.count):
+            # Each iteration is intentional: candidate count is a quota/cost
+            # choice, never an automatic retry of an uncertain request.
+            candidate_id = uuid.uuid4().hex
+            try:
+                content = await asyncio.to_thread(
+                    clip_thumbnail_image.generate_clip_thumbnail,
+                    api_key,
+                    f"{prompt}\n\nCreate a distinct, polished variation #{number + 1}.",
+                    reference_jpeg,
+                    thumbnail_text=brief.get("thumbnail_text", ""),
+                )
+            except clip_thumbnail_image.ClipThumbnailRequestUnknown as exc:
+                await asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id, filename, fingerprint, req.request_id, "unknown",
+                    "Gemini did not confirm the image request. Check your quota before starting a new batch.",
+                )
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            except clip_thumbnail_image.ClipThumbnailImageError as exc:
+                await asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id, filename, fingerprint, req.request_id, "failed", str(exc),
+                )
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            try:
+                generated_image = _validated_postiz_thumbnail_content(content)
+                if generated_image["content_type"] != "image/jpeg":
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Gemini returned a thumbnail in an unsupported final format.",
+                    )
+            except HTTPException as exc:
+                await asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id, filename, fingerprint, req.request_id, "failed",
+                    "Gemini returned an invalid thumbnail image.",
+                )
+                raise HTTPException(
+                    status_code=502, detail="Gemini returned an invalid thumbnail image."
+                ) from exc
+
+            # A re-edit may have replaced the selected clip while the model
+            # was working. Do not attach an old result to the new render.
+            current_clips = (jobs.get(req.job_id, {}).get("result") or {}).get("clips") or []
+            try:
+                _current_path, current_filename, current_fingerprint = await asyncio.to_thread(
+                    _resolve_postiz_clip, req.job_id, current_clips, req.clip_index
+                )
+            except PostizStateError:
+                current_filename, current_fingerprint = "", ""
+            if (current_filename, current_fingerprint) != (filename, fingerprint):
+                await asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id, filename, fingerprint, req.request_id, "failed",
+                    "The clip changed while the image was generating. Generate a new thumbnail for the current clip.",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="The clip changed while the image was generating. Generate a new thumbnail.",
+                )
+            try:
+                postiz_locked = await asyncio.to_thread(
+                    _postiz_version_is_locked, req.job_id, filename, fingerprint
+                )
+            except PostizStateError:
+                postiz_locked = True
+            if postiz_locked:
+                await asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id, filename, fingerprint, req.request_id, "failed",
+                    "This clip was sent to Postiz while the image was generating.",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="This clip was sent to Postiz while the image was generating. Update its draft in Postiz.",
+                )
+            candidate_filename = f"candidate-{candidate_id}.jpg"
+            try:
+                await asyncio.to_thread(
+                    _write_thumbnail_file, root / candidate_filename, content
+                )
+                async with lock:
+                    state = await asyncio.to_thread(
+                        _read_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id)
+                    )
+                    record = state["versions"].get(version_key)
+                    batch = (
+                        record.get("batches", {}).get(req.request_id)
+                        if isinstance(record, dict)
+                        else None
+                    )
+                    if not isinstance(batch, dict) or batch.get("state") != "running":
+                        raise ClipThumbnailStateError(
+                            "AI thumbnail state changed while generating; candidate was not selected."
+                        )
+                    batch["candidates"].append({
+                        "id": candidate_id,
+                        "filename": candidate_filename,
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    })
+                    await asyncio.to_thread(
+                        _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
+                    )
+            except ClipThumbnailStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        async with lock:
+            try:
+                state = await asyncio.to_thread(
+                    _read_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id)
+                )
+                record = state["versions"].get(version_key)
+                batch = record.get("batches", {}).get(req.request_id) if isinstance(record, dict) else None
+                if not isinstance(batch, dict):
+                    raise ClipThumbnailStateError("AI thumbnail state was lost before completion.")
+                batch["state"] = "completed"
+                batch["completed_at"] = datetime.now(timezone.utc).isoformat()
+                await asyncio.to_thread(
+                    _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
+                )
+            except ClipThumbnailStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _thumbnail_record_view(
+            req.job_id, req.clip_index, filename, fingerprint, record, clip, transcript
+        )
+    finally:
+        _clip_thumbnail_generation_gate.release()
+
+
+@app.post("/api/clip-thumbnail/{job_id}/{clip_index}/select")
+async def select_clip_thumbnail(
+    job_id: str,
+    clip_index: int,
+    req: ClipThumbnailSelectRequest,
+    request: Request,
+):
+    """Select an existing same-version AI candidate, or clear the selection."""
+    _require_local_dashboard_origin(request)
+    _job, clip, _file_path, filename, fingerprint, transcript = await _clip_thumbnail_context(
+        job_id, clip_index, request
+    )
+    candidate_id = req.candidate_id
+    if candidate_id is not None and (
+        not isinstance(candidate_id, str) or not re.fullmatch(r"[0-9a-f]{32}", candidate_id)
+    ):
+        raise HTTPException(status_code=400, detail="candidate_id is invalid.")
+    lock = await _clip_thumbnail_lock(job_id, clip_index)
+    async with lock:
+        try:
+            state_path = _clip_thumbnail_state_path(job_id)
+            state = await asyncio.to_thread(_read_clip_thumbnail_state, state_path)
+            record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+            if not isinstance(record, dict) or not isinstance(record.get("batches"), dict):
+                if candidate_id is None:
+                    return _thumbnail_record_view(
+                        job_id, clip_index, filename, fingerprint, None, clip, transcript
+                    )
+                raise HTTPException(status_code=404, detail="AI thumbnail candidate not found.")
+            if any(
+                isinstance(batch, dict) and batch.get("state") == "running"
+                for batch in record["batches"].values()
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="AI thumbnail generation is still running. Wait before selecting a candidate.",
+                )
+            if candidate_id is not None:
+                candidate_filename = next((
+                    candidate.get("filename")
+                    for batch in record["batches"].values() if isinstance(batch, dict)
+                    for candidate in (batch.get("candidates") or [])
+                    if isinstance(candidate, dict) and candidate.get("id") == candidate_id
+                ), None)
+                if not isinstance(candidate_filename, str) or not re.fullmatch(
+                    r"candidate-[0-9a-f]{32}\.jpg", candidate_filename
+                ):
+                    raise HTTPException(status_code=404, detail="AI thumbnail candidate not found.")
+                try:
+                    root = _clip_thumbnail_root(job_id, clip_index, fingerprint)
+                    candidate_path = (root / candidate_filename).resolve(strict=True)
+                    candidate_path.relative_to(root)
+                    _validated_postiz_thumbnail_content(candidate_path.read_bytes())
+                except HTTPException as exc:
+                    raise HTTPException(
+                        status_code=409, detail="AI thumbnail candidate is invalid."
+                    ) from exc
+                except (ClipThumbnailStateError, OSError, RuntimeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=409, detail="AI thumbnail candidate is unavailable."
+                    ) from exc
+            record["selected_candidate_id"] = candidate_id
+            await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
+        except ClipThumbnailStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _thumbnail_record_view(
+        job_id, clip_index, filename, fingerprint, record, clip, transcript
+    )
 
 
 class SocialPostRequest(BaseModel):

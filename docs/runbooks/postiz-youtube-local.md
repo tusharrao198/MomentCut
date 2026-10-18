@@ -183,18 +183,25 @@ integration ID in `POSTIZ_YOUTUBE_INTEGRATION_ID` and recreate the backend.
 ## Use it
 
 1. Generate clips in OpenShorts.
-2. Optional: click **add thumbnail** on that clip and choose a JPEG or PNG
-   image up to 2 MB. You can click it again to replace the selection, or
-   **clear thumb** to send the clip without one.
+2. Optional thumbnail:
+   - click **add thumbnail** and choose your own JPEG/PNG up to 2 MB; or
+   - if configured, click **generate AI thumb**, review its Gemini-generated
+     candidate(s), then select one.
+
+   The AI option sends Gemini only one locally extracted JPG reference frame
+   plus clip metadata; it never sends the short MP4. Choosing a manual image
+   clears the selected AI candidate. You can click either option again to
+   replace it, or **clear thumb** to send without a thumbnail.
 3. Click **send to postiz**.
 4. With `draft`, find the new draft in Postiz and review/schedule it.
 5. With `now`, Postiz uploads it to YouTube using its connected account.
 
 OpenShorts sends the current edited version of the MP4. A subtitle, hook,
 reframe, or edit changes the file fingerprint, so the updated clip may be
-sent once as its own version. The optional thumbnail travels from the dashboard
-to OpenShorts, then through the same private Docker network to Postiz. The
-Postiz API key never reaches the dashboard or browser storage.
+sent once as its own version. An AI candidate is read directly from the
+versioned OpenShorts output folder; a manual thumbnail travels from the
+dashboard to OpenShorts. Both use the same private Docker network to Postiz.
+The Postiz API key never reaches the dashboard or browser storage.
 
 ## Safety and recovery
 

@@ -235,6 +235,29 @@ def test_create_post_includes_optional_youtube_thumbnail(monkeypatch):
     }
 
 
+def test_create_post_serializes_youtube_tags_as_label_objects(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(201, json=[{"postId": "post-123"}])
+
+    _install_transport(monkeypatch, handler)
+    pc.create_youtube_post(
+        pc.configuration(),
+        "yt-1",
+        {"id": "media-1", "path": "/uploads/clip.mp4"},
+        "A valid title",
+        "Description",
+        tags=["gameplay", "Boss Fight", "", 42],
+    )
+
+    assert seen["body"]["posts"][0]["settings"]["tags"] == [
+        {"label": "gameplay"},
+        {"label": "Boss Fight"},
+    ]
+
+
 @pytest.mark.parametrize("response", [
     httpx.Response(500, text="temporary"),
     httpx.Response(201, json=[]),

@@ -158,6 +158,7 @@ export function AuthProvider({ children }) {
     localLlm: config.localLlm || null,
     postizConfigured: !!config.postizConfigured,
     postizPostType: config.postizPostType || null,
+    clipAiThumbnailsEnabled: !!config.clipAiThumbnailsEnabled,
     googleAuthEnabled: config.googleAuthEnabled,
     jobRetentionSeconds: config.jobRetentionSeconds || null,
     loading,

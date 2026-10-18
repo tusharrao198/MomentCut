@@ -1,5 +1,14 @@
 # On-demand AI thumbnails for generated clips
 
+> **Implementation status — implemented on `feature/openshorts-postiz-youtube`;
+> pending a real Windows Docker/Postiz draft-mode smoke test.**
+>
+> This design was checked against the current OpenShorts and Postiz code on
+> October 18, 2026. It deliberately reuses the existing `google-genai==1.75.0`
+> dependency, Pillow, `/videos` protected media route, atomic Postiz-state
+> writer, and private Postiz Docker network. It does not require a new service,
+> volume, Docker port, or Postiz change.
+
 This document specifies the planned feature that creates **AI-generated
 YouTube thumbnails only for clips the user chooses**. It belongs to the
 OpenShorts architecture because it changes the clip-result data contract,
@@ -21,6 +30,54 @@ For the existing direct Postiz publishing and manual-thumbnail workflow, see
 The user must explicitly request generation for each clip. OpenShorts must
 never spend Gemini image-generation quota to create thumbnails for every
 candidate automatically.
+
+## Independent AI switches
+
+The three roles are deliberately independent. Enabling Gemini for an AI
+thumbnail must **not** re-enable Gemini for transcript-based clip selection or
+any other automatic Gemini video-analysis helper.
+
+> **Required implementation guard:** today, `LLM_BASE_URL` replaces Gemini for
+> the transcript score/detail passes, but optional layout picking, on-screen
+> content detection, and hook grounding can still use Gemini frames when a
+> `GEMINI_API_KEY` is present. This feature must add and honour
+> `GEMINI_CLIP_ANALYSIS_ENABLED` before it claims “Gemini only for
+> thumbnails.”
+
+| Role | Default model/provider | When it runs | Disable it without affecting the others |
+|---|---|---|---|
+| Spoken-video clip selection and packaging JSON | Local Ollama `qwen2.5:7b` | Once during normal audio-video clip analysis, after local Whisper transcription | Keep `LLM_BASE_URL` set and set `GEMINI_CLIP_ANALYSIS_ENABLED=0`. |
+| Silent/speech-sparse visual clip selection | Local Ollama `qwen2.5vl:3b` | Once during silent-video analysis | Keep `VISION_PROVIDER=ollama` and set `GEMINI_CLIP_ANALYSIS_ENABLED=0`. |
+| Optional layout/on-screen/hook frame enhancement | Gemini today, but not wanted in this setup | Only when the related layout/hook option is enabled | Set `GEMINI_CLIP_ANALYSIS_ENABLED=0`; the helpers must skip without a Gemini request. |
+| On-demand per-clip AI thumbnail image | Gemini Nano Banana, `gemini-3.1-flash-image` | Only after the user clicks **Generate AI thumbnail** for that individual clip | Set `CLIP_AI_THUMBNAILS_ENABLED=0`, remove the Gemini key, or do not use the button. Clip generation and Postiz publishing continue without it. |
+
+For the intended private/local configuration, use all three settings below:
+
+```env
+# Transcript -> structured clip JSON. Local only; no Gemini request.
+LLM_BASE_URL=http://host.docker.internal:11434/v1
+LLM_MODEL=qwen2.5:7b
+
+# Silent video -> visual clip JSON. Local only; no Gemini request.
+VISION_PROVIDER=ollama
+VISION_BASE_URL=http://host.docker.internal:11434
+VISION_MODEL=qwen2.5vl:3b
+
+# No Gemini call while selecting, reframing, or enriching clips.
+GEMINI_CLIP_ANALYSIS_ENABLED=0
+
+# Only the explicit "Generate AI thumbnail" action can call Gemini.
+CLIP_AI_THUMBNAILS_ENABLED=1
+GEMINI_API_KEY=<your-Google-AI-Studio-key>
+CLIP_THUMBNAIL_IMAGE_MODEL=gemini-3.1-flash-image
+```
+
+With this configuration, a normal video with audio follows
+`Whisper -> qwen2.5:7b -> clips`; it does not call Gemini for transcript
+analysis, structured JSON, layout detection, on-screen detection, or hook
+grounding. A silent video follows `qwen2.5vl:3b -> clips`; it also does not
+call Gemini. Gemini is used only for the separate, user-triggered thumbnail
+image request.
 
 ```text
 Long video
@@ -112,20 +169,13 @@ the UI says that no visual reference was attached.
 ## Clip metadata contract
 
 The detail schema in `gemini_worker.py` currently provides a YouTube title,
-TikTok/Instagram captions, an on-screen hook, and a reason. Extend both
-`DetailClipModel` and `VisualClipModel` with optional/defaulted fields so
-older saved jobs remain readable.
+TikTok/Instagram captions, an on-screen hook, and a reason. Define this
+nested validated model **before** both `DetailClipModel` and `VisualClipModel`
+(and import `Field` alongside `BaseModel`):
 
 ```python
-youtube_description_intro: str = ""
-youtube_tags: list[str] = Field(default_factory=list)
-youtube_hashtags: list[str] = Field(default_factory=list)
-thumbnail_brief: ThumbnailBrief | None = None
-```
+from pydantic import BaseModel, Field
 
-Use a nested validated model rather than free-form JSON:
-
-```python
 class ThumbnailBrief(BaseModel):
     subject: str = ""
     moment: str = ""
@@ -136,6 +186,22 @@ class ThumbnailBrief(BaseModel):
     must_include: list[str] = Field(default_factory=list)
     avoid: list[str] = Field(default_factory=list)
 ```
+
+Then add these defaulted fields to both clip schemas. Add `why: str = ""` to
+`VisualClipModel` as well, so the audio and visual routes have the same
+downstream metadata shape:
+
+```python
+youtube_description_intro: str = ""
+youtube_tags: list[str] = Field(default_factory=list)
+youtube_hashtags: list[str] = Field(default_factory=list)
+thumbnail_brief: ThumbnailBrief = Field(default_factory=ThumbnailBrief)
+why: str = ""
+```
+
+The existing clip-selection fields remain required. The new fields default so
+old completed jobs, and a small local model that omits optional packaging
+details, continue to load.
 
 `thumbnail_text` is short text intended for the finished image, ideally two to
 four words. It is not the full YouTube title.
@@ -154,19 +220,41 @@ these extra fields for every selected clip:
 
 All fields must use the transcript language. The prompt must say:
 
-- Use only facts present in the clip transcript, source title, configured
-  channel profile, or attached visual evidence.
+- Use only facts present in the candidate-window transcript. For the visual
+  route, use only facts visible in the sampled frames.
 - Do not invent a game title, movie name, episode, sequel, outcome, playlist,
   hardware specification, or external link.
 - Name the actual action, object, reaction, result, or conflict in the clip.
 - Write tags as a JSON array, not a comma-separated string.
 - Do not place hashtags inside `youtube_description_intro`.
 
+The Ollama `vision_backend._visual_prompt()` must request the same fields for
+silent/speech-sparse clips, while retaining its rule that only visible-frame
+evidence may be used. This is still one detail response per selected
+clip/window: adding the fields must **not** make another Qwen or Qwen-VL call.
+
+After either response is parsed, run one shared
+`normalise_clip_packaging_metadata()` function before job metadata is saved or
+returned to the dashboard:
+
+| Field | Normalisation contract |
+|---|---|
+| `youtube_description_intro` | Remove NUL/control characters, preserve newlines, trim to 1,200 UTF-8 bytes. |
+| `youtube_tags` | Keep 5–15 distinct non-empty strings; trim each to 60 UTF-8 bytes; strip leading `#`; deduplicate case-insensitively. |
+| `youtube_hashtags` | Keep 3–5 distinct tags; remove whitespace/control characters; ensure exactly one leading `#`; deduplicate case-insensitively. |
+| `ThumbnailBrief` strings | Remove controls and bound each descriptive string to 240 UTF-8 bytes; `thumbnail_text` to 40 characters. |
+| `must_include` / `avoid` | Keep at most six non-empty entries each, 90 UTF-8 bytes per entry. |
+
+The normaliser must be defensive: malformed optional values become empty
+strings/lists, not an exception that discards an otherwise usable clip. When
+the brief is empty, thumbnail generation builds a conservative fallback from
+the title, hook, and transcript excerpt.
+
 Example:
 
 ```json
 {
-  "youtube_title": "Joel's Axe Finish Changes Everything",
+  "video_title_for_youtube_short": "Joel's Axe Finish Changes Everything",
   "youtube_description_intro": "Joel and Ellie are trapped in a dark corridor when an axe becomes the only way out.",
   "youtube_tags": ["the last of us part 1", "joel and ellie", "axe fight", "gaming short"],
   "youtube_hashtags": ["#thelastofus", "#gaming", "#shorts"],
@@ -219,7 +307,7 @@ Suggested shape:
 }
 ```
 
-`compose_youtube_description(clip, profile)` must join only non-empty
+`compose_youtube_metadata(clip)` must join only non-empty
 sections in this order:
 
 ```text
@@ -230,12 +318,43 @@ clip-specific hashtags
 profile description sections
 ```
 
-The function must trim the final description to the platform's currently
-supported limit without cutting UTF-8 characters, preserve paragraph breaks,
-and warn in the UI/server log if it had to truncate. Tags must be separately
-normalised, deduplicated case-insensitively, stripped of `#`, and capped by
-the current YouTube/Postiz constraints. They must not be added solely as a
-keyword-spam block in the description.
+`youtube_tags` precede `profile.default_tags`, and `youtube_hashtags` precede
+`profile.default_hashtags`; then the shared normaliser removes duplicates and
+applies the YouTube size constraints. Only the final hashtag list is included
+in the description.
+
+The function must remove `<` and `>` from model/profile text, preserve
+paragraph breaks, and trim the final description to **5,000 UTF-8 bytes**
+without splitting a UTF-8 code point. It returns a non-secret `truncated`
+flag, shown in the card and logged when truncation occurred.
+
+Tags are separate YouTube metadata, not a keyword-spam block in the
+description. Deduplicate them case-insensitively, strip leading `#`, and fit
+their encoded YouTube tag-list representation within **500 characters**,
+including comma separators and quotes around tags containing spaces.
+
+### Channel-profile loading and validation
+
+The profile is optional. A missing profile means “dynamic clip metadata only,”
+not an error that blocks thumbnail generation or Postiz publishing.
+
+`load_youtube_channel_profile()` has these fixed rules:
+
+1. Its default is `config/youtube-channel-profile.json`, relative to the
+   OpenShorts repository directory.
+2. `YOUTUBE_CHANNEL_PROFILE_PATH` may point only within that same `config/`
+   directory after `resolve()`. Reject a path outside it rather than reading
+   an arbitrary host file.
+3. Read at most 64 KiB and accept a JSON object containing only
+   `default_tags`, `default_hashtags`, and `description_sections` list values.
+4. Apply the same string limits and sanitisation as model metadata. Invalid or
+   unreadable content yields an empty profile plus a non-secret warning; it
+   must never crash a completed clip job.
+5. Add `config/youtube-channel-profile.example.json` to Git and add only
+   `config/youtube-channel-profile.json` to `.gitignore`.
+
+No profile field is fetched as a URL. Playlist links and other static content
+are output text only; they cannot create a server-side network request.
 
 ## Reference-frame selection
 
@@ -244,10 +363,10 @@ Gemini or the VLM.
 
 1. Read the final, current clip file—not the original long-video file.
 2. Sample a small bounded set of timestamps, excluding the first/last second.
-3. Score local candidates by usable face/person detection, image sharpness,
-   brightness, and scene difference.
-4. Prefer a sharp relevant face/action frame; otherwise choose the best
-   sharp midpoint-like frame.
+3. Score local candidates by image sharpness and usable brightness, with a
+   slight midpoint preference to avoid title cards.
+4. Choose the highest-scoring readable frame; a later face/person detector can
+   be added as a local-only scoring signal without changing the API contract.
 5. Save one JPEG at a bounded resolution and size.
 
 Use a clip-version directory, keyed by the final MP4's existing SHA-256
@@ -255,7 +374,7 @@ fingerprint:
 
 ```text
 output/<job-id>/ai_thumbnails/<clip-index>/<mp4-sha256>/reference.jpg
-output/<job-id>/ai_thumbnails/<clip-index>/<mp4-sha256>/candidate-01.jpg
+output/<job-id>/ai_thumbnails/<clip-index>/<mp4-sha256>/candidate-<opaque-id>.jpg
 ```
 
 This keeps every candidate under the normal job directory, so existing job
@@ -263,17 +382,41 @@ retention/cleanup removes it with the related video. Do not store generated
 per-clip thumbnails under `output/thumbnails/`: that shared legacy directory
 is intentionally excluded from normal job cleanup.
 
-The reference image and every model result must be decoded and re-encoded as
-JPEG before persistent storage. Enforce an image-pixel ceiling and 2 MB
-output ceiling. Never trust a filename, browser MIME type, or model-provided
-path.
+Use seven evenly spaced sample times for normal clips, excluding the first and
+last second. If frame decoding fails, choose the sharpest readable sample; if
+every sample fails, continue with text-only generation. The reference image
+and every model result must be
+decoded and re-encoded as JPEG before persistent storage, at 1280x720 and
+under 2 MB. Enforce a 16-megapixel decoded-image ceiling. Never trust a
+filename, browser MIME type, or model-provided path.
 
 ## Nano Banana image request
 
-Use a dedicated image-generation adapter rather than changing the current
-`IMAGE_MODEL` environment value and assuming every Gemini model has the same
-SDK request/response contract. At implementation time, verify the officially
-supported Gemini API method and model ID for the selected Nano Banana release.
+Use a dedicated `clip_thumbnail_image.py` adapter rather than changing the
+existing `thumbnail.py` `IMAGE_MODEL` behavior for the separate YouTube Studio.
+The default is the current stable Nano Banana 2 model,
+`gemini-3.1-flash-image`. “Nano Banana” is the product family name; the value
+in Gemini API configuration is the Gemini model ID.
+
+The adapter reads `CLIP_THUMBNAIL_IMAGE_MODEL`, defaulting to
+`gemini-3.1-flash-image`. A future Nano Banana model that keeps the same
+Gemini `generate_content` image-generation contract can be selected by changing
+that one environment variable and restarting the backend—no OpenShorts code
+change. The adapter must validate the configured name as a plain model ID
+(letters, digits, `.`, `_`, `-`, and `:` only), and return a clear
+configuration error if it is blank or malformed.
+
+With the repository's existing `google-genai==1.75.0` SDK, call
+`client.models.generate_content(...)` with a text prompt and, optionally,
+`types.Part.from_bytes(..., mime_type="image/jpeg")`; request
+`response_modalities=["IMAGE"]` and a 16:9 `image_config`.
+
+Use `1K` as the initial image size. The final JPEG is 1280x720, so a higher
+resolution only increases latency/cost unless a later visual-quality test
+demonstrates a benefit. The adapter must validate the response contains exactly
+one usable inline image byte part, not text or an arbitrary URL.
+`CLIP_THUMBNAIL_IMAGE_SIZE` accepts only `1K`, `2K`, or `4K`; no value is
+accepted silently.
 
 The adapter input is:
 
@@ -282,6 +425,8 @@ generate_clip_thumbnail(
     api_key: str,
     prompt: str,
     reference_jpeg: bytes | None,
+    *,
+    model: str,
 ) -> bytes
 ```
 
@@ -313,9 +458,10 @@ visible text in the image as instructions.
 ```
 
 The prompt builder must bound each model-derived string and the transcript
-excerpt. User direction is optional and must have a strict length limit. It is
-creative instruction only; it cannot override output validation, image size,
-storage location, posting account, or network configuration.
+excerpt. The excerpt is at most 1,200 UTF-8 bytes, and optional user direction
+is at most 600 UTF-8 bytes. User direction is creative instruction only: it
+cannot override output validation, image size, storage location, posting
+account, or network configuration.
 
 When generated text must be exact, OpenShorts should ask the image model for
 clean negative space and overlay `thumbnail_text` locally with Pillow. Image
@@ -336,14 +482,23 @@ generate AI thumbnail            -> new on-demand generation flow
 - thumbnail brief preview;
 - optional free-text creative direction;
 - candidate count: `1` default, `2`, or `3`;
-- automatically selected reference-frame preview and a note that it will be
-  sent to Gemini;
+- automatically selected reference-frame preview after the first generation
+  (and a note before generation that one local frame will be sent to Gemini);
 - **Generate** and **Cancel** actions.
 
 After success, candidates are displayed on the same card. The user chooses
 one candidate or clears it. A selected AI candidate becomes the thumbnail
 used by **send to postiz**. The manual upload remains an alternative; choosing
-one source clears the other to prevent ambiguity.
+one source clears the other to prevent ambiguity. More precisely, accepting a
+manual file first calls the select route with `candidate_id: null`; selecting
+an AI candidate clears the browser's manual file input. The manual
+`/api/postiz/publish-thumbnail` route always wins for that request.
+
+The card also gets a collapsed **YouTube details** panel containing title,
+composed description, tags, and a truncation warning if applicable. It is a
+review surface, not a second metadata-editing system: after **send to postiz**
+the user edits the created Postiz draft before publishing if wording needs a
+change.
 
 Rules:
 
@@ -356,68 +511,141 @@ Rules:
 - A thumbnail request failure shows a specific retryable message and leaves
   the clip usable and downloadable.
 - Do not start a Gemini image request until the user presses **Generate**.
+- Once Postiz has created a draft/post for this exact MP4 fingerprint,
+  OpenShorts disables both thumbnail actions and says to update the draft in
+  Postiz. This preserves the existing idempotent “never create a duplicate”
+  publish guarantee.
 
 ## Backend routes and state
 
-Keep the API server-side: Gemini keys and Postiz keys must never be exposed
-to browser JavaScript or local storage.
+Initial scope is self-hosted OpenShorts only (`BILLING_ENABLED=false`). The
+routes reject hosted/managed mode with `403` until managed billing and account
+isolation are designed separately.
+
+The Postiz API key remains backend-only. For Gemini authentication use the
+existing `resolve_gemini(request)` behavior:
+
+- preferred self-host setup: `GEMINI_API_KEY` exists only in the backend
+  container environment, and the browser sends no key;
+- existing BYOK setup: the dashboard sends `X-Gemini-Key`, which wins over the
+  environment value.
+
+The feature must not add a new key field, local-storage key, query parameter,
+JSON field, log entry, or persisted state field. This is transparent about the
+existing BYOK dashboard behavior while keeping the new feature from widening
+key exposure.
 
 ### Generate candidates
 
 ```text
 POST /api/clip-thumbnail/generate
-JSON: { job_id, clip_index, instructions, count }
+JSON: { job_id, clip_index, instructions, count, request_id }
 ```
 
 The backend must:
 
-1. enforce the local dashboard origin and job owner;
-2. validate `job_id`, non-negative `clip_index`, request length, and
-   candidate count;
-3. resolve the current final MP4 with the same containment and fingerprint
+1. enforce the same explicit loopback dashboard origin used by Postiz
+   publishing (rename `_require_postiz_dashboard_origin()` to the general
+   `_require_local_dashboard_origin()` and use it for all mutation routes);
+2. enforce job ownership when cloud mode is later enabled;
+3. validate a UUID `request_id`, `job_id`, non-negative `clip_index`,
+   instructions of at most 600 UTF-8 bytes, and candidate count `1`, `2`, or
+   `3`;
+4. resolve the current final MP4 with the same containment and fingerprint
    logic as Postiz publishing;
-4. read only that current clip version;
-5. build/save the local reference image;
-6. resolve a Gemini key server-side/BYOK as the existing thumbnail endpoints
+5. read only that current clip version;
+6. build/save the local reference image;
+7. resolve a Gemini key with `resolve_gemini(request)` as the existing thumbnail endpoints
    do;
-7. call Nano Banana once per requested candidate with bounded retries;
-8. validate/re-encode/save returned JPEGs inside the versioned job directory;
-9. atomically persist metadata; and
-10. return opaque candidate IDs and safe local URLs.
+8. call Nano Banana **once per requested candidate, sequentially, with no
+   automatic retry after an outbound request begins**;
+9. validate/re-encode/save returned JPEGs inside the versioned job directory;
+10. atomically persist metadata; and
+11. return opaque candidate IDs and safe local URLs.
 
 Do not accept a browser-supplied filesystem path, thumbnail URL, or Postiz
 media ID.
 
+The API returns `409` when the clip changes during the request or candidate
+state is invalid. It returns `429` when another thumbnail-generation is
+running globally, rather than queueing unbounded paid work.
+`CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS` defaults to `1` and is clamped to
+`1` for this first release.
+
+The backend writes the `running` record before each model request. If the
+connection is interrupted after a request could have reached Gemini, mark that
+candidate/batch `unknown` and do **not** retry automatically. The UI must say
+“the result may have been charged; start a new batch only if you accept that
+risk.” A clear provider response with no image is a normal failed batch and
+can be retried by a new explicit user click.
+
+Add two supporting routes:
+
+```text
+GET  /api/clip-thumbnail/{job_id}/{clip_index}
+POST /api/clip-thumbnail/{job_id}/{clip_index}/select
+JSON: { candidate_id: "<opaque id>" | null }
+```
+
+The GET route enables refresh/restart hydration and returns only the current
+MP4 fingerprint’s reference/candidate IDs, safe `/videos/...` URLs, selection,
+and non-secret status. The select route uses the same local-origin/job checks,
+revalidates the candidate under the current fingerprint, persists the
+selection atomically, and never accepts a path or URL.
+
 ### Persisted record
 
-Store the generated set in the current clip metadata or an adjacent,
-atomically written job-owned JSON file:
+Store all generated state in an adjacent hidden, atomically written,
+job-owned file:
+
+```text
+output/<job-id>/.clip_thumbnail_state.json
+```
+
+Do not mix it into the model-generated source metadata or
+`.postiz_publish_state.json`. Use the existing temp-write + `fsync` +
+`os.replace` pattern. The hidden filename also remains unreachable through the
+existing `/videos` allowlist.
 
 ```json
 {
-  "clip_fingerprint": "<sha256 of current final MP4>",
-  "reference": {"filename": "reference.jpg", "sha256": "..."},
-  "candidates": [
-    {
-      "id": "opaque-random-id",
-      "filename": "candidate-01.jpg",
-      "sha256": "...",
-      "brief": {"...": "..."}
+  "versions": {
+    "<filename>:<sha256>": {
+      "clip_fingerprint": "<sha256 of current final MP4>",
+      "reference": {"filename": "reference.jpg", "sha256": "..."},
+      "batches": {
+        "<request UUID>": {
+          "state": "running | completed | failed | unknown",
+          "input_sha256": "<fingerprint of bounded prompt inputs>",
+          "candidates": [
+            {
+              "id": "opaque-random-id",
+              "filename": "candidate-<opaque-random-id>.jpg",
+              "sha256": "..."
+            }
+          ]
+        }
+      },
+      "selected_candidate_id": "opaque-random-id"
     }
-  ],
-  "selected_candidate_id": "opaque-random-id"
+  }
 }
 ```
 
 Use the MP4 fingerprint as part of the identity. A subtitle/reframe/hook edit
 changes the output file; its previous thumbnail must not be applied to the
-new version.
+new version. For a duplicate `request_id`, return the persisted running,
+completed, failed, or unknown result instead of making another model request.
+Keep successful candidates from an earlier batch until normal job cleanup, but
+only the selected current-fingerprint candidate can be handed to Postiz.
 
 ### Send to Postiz
 
-Extend `PostizPublishRequest` with optional `thumbnail_candidate_id`. The
-existing multipart `/api/postiz/publish-thumbnail` endpoint remains the
-manual-image route.
+Keep `PostizPublishRequest` unchanged. The existing multipart
+`/api/postiz/publish-thumbnail` endpoint remains the manual-image route. The
+ordinary `/api/postiz/publish` route looks up the persisted selected candidate,
+if any, for the current MP4 fingerprint; the browser does not send a candidate
+path or ID in the publish request.
 
 For an AI candidate:
 
@@ -433,14 +661,47 @@ Do not download a local candidate through HTTP or re-upload it through the
 browser. The backend already has a confined file path, and Postiz remains on
 the private `openshorts-postiz` Docker network.
 
-Extend `postiz_client.create_youtube_post()` to receive the normalised tags
-and place them in the existing YouTube `settings.tags` list. Update
-`_postiz_metadata()` to use the composed long YouTube description instead of
-the current Instagram/TikTok caption fallback.
+Extend `postiz_client.create_youtube_post()` with keyword-only
+`tags: list[str] | None = None`, normalise them before constructing the
+payload, and send each as `{"label": "<tag>"}` in YouTube `settings.tags`.
+Postiz's YouTube provider reads `settings.tags[*].label`. Update
+`_postiz_metadata()` to return title, composed long YouTube description,
+normalised tags, and the `truncated` flag instead of falling back to the
+Instagram/TikTok caption.
 
 The existing Postiz local-MP4 and local-thumbnail patches remain required:
 Postiz stores both assets under its own `/uploads` volume and must read them
 there without bypassing SSRF protection for arbitrary URLs.
+
+## Concrete implementation map
+
+| File | Exact responsibility |
+|---|---|
+| New `gemini_feature_flags.py` | Provide one strict boolean reader for `GEMINI_CLIP_ANALYSIS_ENABLED` (default `true` for backwards compatibility) and `CLIP_AI_THUMBNAILS_ENABLED` (default `true` once this feature ships). No caller may infer permission to call Gemini merely from a key being present. |
+| `gemini_worker.py` | Import `Field`; add `ThumbnailBrief`; extend `DetailClipModel` and `VisualClipModel`; extend `DETAIL_PROMPT_TEMPLATE` with the four packaging fields. |
+| `main.py` | Call the packaging normaliser after successful local/Gemini detail results and before clip metadata is written. Before either Gemini score/detail fallback or Gemini silent-video fallback, reject with a clear local-model configuration error when `GEMINI_CLIP_ANALYSIS_ENABLED=0`. No new model call is added. |
+| `vision_backend.py` | Extend `_visual_prompt()` and `_normalise_window_shorts()` with the compatible packaging metadata. It must never send an MP4 to an external provider. |
+| `layout_picker.py`, `screencast_layout.py`, `hook_grounding.py` | Check `GEMINI_CLIP_ANALYSIS_ENABLED` before constructing a Gemini client or sampling/sending frames. When false, retain each module's current safe local fallback (`none`, no content answer, or original Qwen-written hook). |
+| New `clip_packaging.py` | Hold `normalise_clip_packaging_metadata()`, profile loading/validation, `compose_youtube_metadata()`, tag-size accounting, and transcript-excerpt extraction. This keeps `app.py` from becoming a second packaging implementation. |
+| New `clip_thumbnail_image.py` | Hold only Nano Banana model configuration, bounded prompt construction, `generate_content` image call, inline-image extraction, Pillow decode/re-encode, 1280x720 finalisation, and AI provenance marking. It refuses work when `CLIP_AI_THUMBNAILS_ENABLED=0`. |
+| `app.py` | Hold request/response Pydantic models, local-origin guard rename, per-clip state locks, global generation gate, safe frame extraction, durable thumbnail state, generate/get/select endpoints, selected-candidate resolution, and the Postiz metadata handoff. It returns a clear disabled-feature response before resolving a Gemini key. |
+| `postiz_client.py` | Accept keyword-only normalised tags and serialize them as `settings.tags: [{"label": tag}]`; preserve current MP4/thumbnail retry and unknown-outcome logic. |
+| `dashboard/src/components/ResultCard.jsx` | Add modal, request UUID handling, loading/error state, candidate hydration/selection, metadata disclosure, and mutually exclusive manual/AI thumbnail UI. Reuse the existing `geminiApiKey` prop only to create the existing `X-Gemini-Key` header when BYOK is used. |
+| `.env.example`, `config/youtube-channel-profile.example.json`, `.gitignore` | Document the new image/profile settings, provide a non-secret profile template, and ignore only the personal profile. |
+| `tests/test_clip_thumbnail.py` plus existing Postiz tests | Cover request idempotency, state recovery, input/path/image limits, profile safety, prompt bounds, tag payload, candidate selection, stale MP4s, and publish retry behavior. |
+
+No Postiz source change, Postiz Docker Compose change, new Docker volume, new
+network, or new exposed port is needed. The existing OpenShorts output mount
+and existing `openshorts-postiz` private network are sufficient.
+
+### Transcript context for the image prompt
+
+For an audio clip, extract only the source-transcript words/segments that
+overlap the current clip's `start`/`end` range, preserve their order, and then
+apply the 1,200-byte bound. Do not pass the full long-video transcript. For a
+silent clip, use the literal context `No spoken transcript; use only the
+thumbnail brief and attached reference image.` This makes the exact data sent
+to Gemini deterministic and honours the privacy boundary above.
 
 ## Configuration
 
@@ -457,21 +718,44 @@ The image feature needs a Gemini key because Nano Banana is cloud image
 generation:
 
 ```env
+# Preferred: kept only in the backend Docker container environment.
 GEMINI_API_KEY=<your-Google-AI-Studio-key>
-GEMINI_IMAGE_MODEL=<verified-Nano-Banana-model-id>
+
+# Per-clip AI thumbnails only. Does not change the existing YouTube Studio.
+CLIP_AI_THUMBNAILS_ENABLED=1
+CLIP_THUMBNAIL_IMAGE_MODEL=gemini-3.1-flash-image
+CLIP_THUMBNAIL_IMAGE_SIZE=1K
+CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS=1
+
+# Optional. Must resolve inside /app/config when running in Docker.
 YOUTUBE_CHANNEL_PROFILE_PATH=/app/config/youtube-channel-profile.json
 ```
 
-`GEMINI_IMAGE_MODEL` must be optional until the adapter supports the selected
-model. An invalid/missing image configuration disables only **generate AI
-thumbnail**, with a useful UI message; it must not block clip generation,
-manual thumbnail upload, download, or Postiz publishing without a thumbnail.
+`CLIP_THUMBNAIL_IMAGE_MODEL` is independent from the existing
+`GEMINI_IMAGE_MODEL` used by the separate YouTube Studio. Switching to a
+future Nano Banana model is a configuration-only change if it supports the
+same `generate_content` text-plus-image input and inline-image output
+contract. A model with a different Google API contract requires an adapter
+change and a test first; do not point the setting at a general text model.
+
+An invalid/missing Gemini key or image configuration disables only
+**generate AI thumbnail**, with a useful UI message. It must not block clip
+generation, manual thumbnail upload, download, or Postiz publishing without a
+thumbnail.
+
+The two feature flags have different jobs:
+
+- `GEMINI_CLIP_ANALYSIS_ENABLED=0` prevents automatic Gemini calls made while
+  OpenShorts is analyzing or rendering clips. It does not disable Nano Banana.
+- `CLIP_AI_THUMBNAILS_ENABLED=0` disables only the new explicit per-clip image
+  generator. It does not affect local Qwen/Qwen-VL clip analysis or Postiz.
 
 ## Error handling and privacy guarantees
 
 | Situation | Required behavior |
 |---|---|
-| Gemini key/model unavailable, quota exhausted, or network timeout | Show a retryable thumbnail error; preserve the clip and selected prior candidate. |
+| Gemini key/model unavailable or quota exhausted | Show a retryable thumbnail error; preserve the clip and selected prior candidate. |
+| Network interruption after an image request begins | Mark the batch `unknown`; never auto-retry because Gemini may have received/charged the request. Let the user explicitly start a new batch. |
 | No usable reference frame | Offer text-only image generation; clearly state that no frame will be sent. |
 | Qwen/VLM omitted thumbnail fields | Build a conservative brief from current title/hook/transcript; tags may be empty. |
 | User edits/rerenders the clip | Mark old candidate selection stale by fingerprint; do not send it. |
@@ -479,6 +763,7 @@ manual thumbnail upload, download, or Postiz publishing without a thumbnail.
 | Postiz thumbnail upload fails | Preserve the local selected candidate; allow retry without a new Gemini call. |
 | Postiz post creation has unknown outcome | Keep existing fail-closed state; tell the user to inspect Postiz before retrying. |
 | Existing manual thumbnail is selected | Do not generate/upload an AI candidate unless the user explicitly replaces it. |
+| Another generation is active | Reject immediately with a clear `429`; do not queue or spend another image request. |
 
 Privacy boundary:
 
@@ -489,7 +774,8 @@ Privacy boundary:
   and optional user direction go to Gemini only after the explicit Generate
   click.
 - The Postiz API key remains backend-only. The Gemini API key follows existing
-  self-host/BYOK handling and must not be persisted by this feature.
+  self-host/BYOK handling and must not be persisted, logged, or added to
+  browser storage by this feature.
 
 ## Implementation order
 
@@ -498,14 +784,17 @@ Privacy boundary:
 2. Add channel-profile loading, validation, description composition, and tag
    sanitisation.
 3. Add local final-clip frame selection and versioned candidate storage.
-4. Add a Nano Banana adapter with a narrow input/output contract and
-   server-side key handling.
-5. Add the backend generate/select routes and durable metadata writes.
-6. Add ResultCard candidate UI, manual-vs-AI selection behavior, and error
-   messages.
-7. Extend the existing Postiz handoff to consume the chosen generated
-   candidate, long description, and tags.
-8. Test locally with Postiz in `draft` mode before using `now` or public
+4. Add the Nano Banana adapter with a narrow input/output contract, dedicated
+   configuration, and existing Gemini-key handling.
+5. Add a per-clip generation gate, durable state file, generate/get/select
+   routes, and safe candidate URLs.
+6. Add ResultCard candidate UI, hydration, manual-vs-AI selection behavior,
+   metadata preview, and precise error messages.
+7. Extend the existing Postiz handoff to use the selected generated candidate,
+   long description, and tags.
+8. Add unit tests for the adapter, state/idempotency, path containment,
+   profile validation, metadata limits, and Postiz tag payload.
+9. Test locally with Postiz in `draft` mode before using `now` or public
    visibility.
 
 ## Acceptance tests
@@ -520,6 +809,10 @@ Privacy boundary:
 - One requested candidate produces one image request; two produces two.
 - A valid selected candidate is saved under the matching job/clip/fingerprint
   directory and is displayed in the card.
+- Refreshing the dashboard or restarting the backend hydrates the current
+  candidate state without a new Gemini call.
+- Repeating one `request_id` returns the existing batch rather than spending
+  another request; concurrent requests for a clip are rejected.
 - Editing the clip makes the previous AI candidate unavailable for publishing.
 - Manual upload continues to work unchanged.
 - Postiz receives the final MP4, selected thumbnail, YouTube title, composed
@@ -529,5 +822,6 @@ Privacy boundary:
 - A Gemini/image failure leaves the generated clip intact and publishable
   without a thumbnail.
 - Tests cover path traversal, symlinks, malformed images, stale candidate
-  IDs, size limits, malformed model JSON, duplicate clicks, and uncertain
-  Postiz create outcomes.
+  IDs, size limits, malformed model JSON, duplicate clicks/request IDs,
+  unknown model-request outcomes, profile escape/oversize/malformed JSON,
+  description/tag limits, and uncertain Postiz create outcomes.

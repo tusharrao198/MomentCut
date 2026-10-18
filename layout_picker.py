@@ -197,7 +197,8 @@ def pick(video_path, video_duration):
     Never raises: a missing answer has to degrade to today's routing rather
     than break the job.
     """
-    if not ENABLED:
+    from gemini_feature_flags import clip_analysis_enabled
+    if not ENABLED or not clip_analysis_enabled():
         return "none"
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
