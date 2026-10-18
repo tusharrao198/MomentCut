@@ -80,23 +80,29 @@ these limits regardless of `.env` values:
 |---|---:|---:|
 | `VISION_TIMEOUT_SECONDS` | 10–600 seconds | 180 |
 | `VISION_RETRY_ATTEMPTS` | 1–3 | 3 |
-| `VISION_WINDOW_SECONDS` | 60–120 seconds | 120 |
-| `VISION_WINDOW_OVERLAP_SECONDS` | `ceil(CLIP_MAX_SECONDS)` through `window - 1` | 60 |
-| `VISION_FRAMES_PER_WINDOW` | 4–10 | 8 |
-| `VISION_MAX_FRAME_WIDTH` | 480–768 pixels | 640 |
-| `VISION_NUM_CTX` | 2048–8192 tokens | 4096 |
+| `VISION_WINDOW_SECONDS` | `max(60, ceil(CLIP_MAX_SECONDS) + 15)`–120 seconds | 120 |
+| `VISION_WINDOW_OVERLAP_SECONDS` | `ceil(CLIP_MAX_SECONDS)` through `window - 15` | 60 |
+| `VISION_FRAMES_PER_WINDOW` | 4–10 | 4 |
+| `VISION_MAX_FRAME_WIDTH` | 480–768 pixels, applied to the JPEG's longest edge | 480 |
+| `VISION_NUM_CTX` | 2048–8192 tokens | 8192 |
 | `VISION_CANDIDATES_PER_WINDOW` | 1–3 | 2 |
 | `VISION_SCENE_SNAP_SECONDS` | 0–3 seconds | 2 |
 
-Missing or non-numeric settings use their defaults. Numeric values outside the
-range are clamped. A missing or blank `VISION_MODEL` intentionally uses the
-approved `qwen2.5vl:3b` default; a supplied model name containing control
-characters fails closed. Invalid endpoints always fail closed.
+Missing or blank settings use their defaults. Non-geometry performance settings
+that are malformed or outside range log a visible warning and use a safe default
+or clamp. `VISION_WINDOW_SECONDS` and `VISION_WINDOW_OVERLAP_SECONDS` instead
+fail clearly when invalid: silently correcting either could break candidate
+coverage or create an excessive number of VLM calls. A missing or blank
+`VISION_MODEL` intentionally uses the approved `qwen2.5vl:3b` default; a
+supplied model name containing control characters fails closed. Invalid
+endpoints always fail closed.
 
 The local visual path accepts `CLIP_MAX_SECONDS` through 60 seconds. It rejects
-a larger duration and rejects a window that is not strictly larger than
-`ceil(CLIP_MAX_SECONDS)`. This guarantees every allowed candidate is completely
-visible in at least one window.
+a larger duration and requires a window at least 15 seconds longer than the
+maximum clip. This guarantees every allowed candidate is completely visible in
+at least one window while limiting the minimum analysis-window advance to 15
+seconds. It also rejects a source longer than 120 minutes or a combination that
+would require more than 120 visual-analysis windows.
 
 ## `vision_backend.py` contract
 
@@ -135,13 +141,17 @@ validate settings and local endpoint
      decode JPEG samples in memory
      call Ollama /api/chat with a JSON schema
      validate and normalize candidates
+     skip only a frame-decode or twice-malformed structured-response window
 -> deduplicate by score, cap, then order by timeline
 -> call Ollama /api/generate with keep_alive=0
 ```
 
 Windows are 120 seconds with a 60-second overlap by default. Each window
-samples eight evenly spaced timestamps (5%–95%) and up to two additional scene
+samples four evenly spaced timestamps (5%–95%) and up to two additional scene
 boundary timestamps. The hard maximum is ten images per Ollama request.
+`VISION_MAX_FRAME_WIDTH` is a compatibility name: it caps **the longest edge**
+of each JPEG, so portrait frames cannot exceed the same image budget as
+landscape frames.
 
 Each successfully encoded JPEG retains the timestamp of its decoded frame
 (frame index divided by FPS).
@@ -159,7 +169,7 @@ endpoint, so it can provide an ordered `images` list:
     "stream": False,
     "format": gemini_worker.VisualResponse.model_json_schema(),
     "keep_alive": "10m",
-    "options": {"temperature": 0, "num_ctx": 4096},
+    "options": {"temperature": 0, "num_ctx": 8192},
     "messages": [{
         "role": "user",
         "content": prompt,
@@ -190,8 +200,15 @@ instructions.
 - HTTP 400, 401, 403, and 404 fail immediately as local Ollama configuration
   errors.
 - One malformed JSON/schema response gets one corrective retry.
-- Any failed analysis window fails the entire job, naming that window; partial
-  coverage is never silently returned.
+- Frame-decoding failure and a response that remains malformed after its one
+  corrective retry skip only that named window and are recorded in the backend
+  log. Later windows still run.
+- Ollama transport, model, context/configuration, rate-limit, and server
+  failures remain fail-fast after their bounded retry policy; they do not
+  silently return a partial result.
+- If every window is empty, invalid, or skipped, the final error includes the
+  number of windows and up to three window diagnostics. If at least one window
+  yields a valid candidate, partial coverage is returned with warnings.
 - `finally` always attempts to unload the selected VLM with
   `POST /api/generate` and `{"keep_alive": 0}`. An unload failure never hides
   the real selection failure.
@@ -227,14 +244,18 @@ implementation below it.
 `tests/test_vision_backend.py` covers:
 
 - local-only endpoint allow-list and settings bounds;
-- paired frame/timestamp removal on decode failure and its window-labelled error;
+- visible warnings for safe config correction, and hard rejection for unsafe
+  window geometry;
+- paired frame/timestamp removal on decode failure and longest-edge image caps;
 - 120/60 window coverage for all 15–60-second candidates;
+- 15-second minimum window step, 120-window cap, and 120-minute source cap;
 - no more than two scene-boundary samples, even with a low regular frame count;
 - safe scene-boundary snapping;
 - short-source behavior;
 - exactly one malformed-output correction and failure after a second malformed reply;
 - bounded 503 retry and immediate 401 failure;
-- all-or-nothing window behavior and attempted VLM unload;
+- recoverable decode/malformed-response windows, aggregate diagnostics when all
+  windows fail, fail-fast Ollama transport failure, and attempted VLM unload;
 - overlap deduplication; and
 - `main.py` routing precedence.
 
@@ -250,6 +271,9 @@ docker compose exec backend python -m py_compile vision_backend.py main.py
 
 - The VLM sees samples, not every source frame; an event between samples can be
   missed.
+- Local visual selection is intentionally bounded to 120 minutes and 120
+  analysis windows. Split longer wordless footage, reduce overlap, or use
+  Gemini vision.
 - Frame timestamps use frame index divided by reported FPS. That is a practical
   approximation for ordinary constant-frame-rate MP4s; variable-frame-rate
   sources can have a small timestamp offset.

@@ -45,6 +45,12 @@ _ALLOWED_HOSTS = {
 }
 _MAX_SUPPORTED_CLIP_SECONDS = 60.0
 _MAX_IMAGES_PER_WINDOW = 10
+# Keep a deliberately aggressive overlap from turning one silent source into
+# thousands of expensive VLM calls.  A candidate can still be fully covered:
+# _config() requires an overlap at least as long as the maximum clip.
+_MIN_WINDOW_STEP_SECONDS = 15
+_MAX_ANALYSIS_WINDOWS = 120
+_MAX_VISION_SOURCE_SECONDS = 2 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -67,26 +73,64 @@ def active() -> bool:
     return (os.environ.get("VISION_PROVIDER") or "").strip().lower() == "ollama"
 
 
-def _read_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    """Read an integer setting, using a safe default or clamped value."""
+def _warn_config(message: str) -> None:
+    """Make a corrected non-fatal local-vision setting visible in job logs."""
+    print(f"   ⚠️ Local vision configuration: {message}")
+
+
+def _read_int(name: str, default: int, minimum: int, maximum: int, *,
+              reject_out_of_range: bool = False) -> int:
+    """Read a bounded integer, warning on safe corrections and rejecting geometry."""
     raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        value = default
-    return min(max(value, minimum), maximum)
+        if reject_out_of_range:
+            raise LocalVisionError(
+                f"{name} must be a whole number between {minimum} and {maximum}."
+            )
+        _warn_config(
+            f"{name}={raw[:80]!r} is not a whole number; using {default}."
+        )
+        return default
+    if minimum <= value <= maximum:
+        return value
+    if reject_out_of_range:
+        raise LocalVisionError(
+            f"{name}={value} is outside the allowed range {minimum}–{maximum}."
+        )
+    corrected = min(max(value, minimum), maximum)
+    _warn_config(
+        f"{name}={value} is outside {minimum}–{maximum}; using {corrected}."
+    )
+    return corrected
 
 
 def _read_float(name: str, default: float, minimum: float, maximum: float) -> float:
-    """Read a float setting, using a safe default or clamped value."""
+    """Read a float setting, warning when a safe default/clamp is applied."""
     raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        value = default
+        _warn_config(
+            f"{name}={raw[:80]!r} is not a number; using {default:g}."
+        )
+        return default
     if not math.isfinite(value):
-        value = default
-    return min(max(value, minimum), maximum)
+        _warn_config(f"{name} must be finite; using {default:g}.")
+        return default
+    if minimum <= value <= maximum:
+        return value
+    corrected = min(max(value, minimum), maximum)
+    _warn_config(
+        f"{name}={value:g} is outside {minimum:g}–{maximum:g}; "
+        f"using {corrected:g}."
+    )
+    return corrected
 
 
 def _base_url() -> str:
@@ -137,17 +181,26 @@ def _config(max_seconds: float) -> VisionConfig:
     if not model or any(ord(char) < 32 for char in model):
         raise LocalVisionError("VISION_MODEL must be a non-empty Ollama model name.")
 
-    window_seconds = _read_int("VISION_WINDOW_SECONDS", 120, 60, 120)
-    # Every candidate must fit in at least one overlapping window. A 60-second
-    # window cannot safely support a 60-second candidate with any overlap.
-    if window_seconds <= math.ceil(max_seconds):
+    window_seconds = _read_int(
+        "VISION_WINDOW_SECONDS", 120, 60, 120, reject_out_of_range=True
+    )
+    # Every candidate must fit in at least one overlapping window, and every
+    # window must advance far enough to cap the total number of VLM calls.
+    min_window_seconds = max(
+        60, int(math.ceil(max_seconds)) + _MIN_WINDOW_STEP_SECONDS
+    )
+    if window_seconds < min_window_seconds:
         raise LocalVisionError(
-            "VISION_WINDOW_SECONDS must be greater than CLIP_MAX_SECONDS so "
-            "every candidate is fully visible in at least one window."
+            f"VISION_WINDOW_SECONDS must be at least {min_window_seconds} for "
+            f"CLIP_MAX_SECONDS={max_seconds:g}; this preserves a minimum "
+            f"{_MIN_WINDOW_STEP_SECONDS}-second analysis-window step."
         )
     min_overlap = int(math.ceil(max_seconds))
+    max_overlap = window_seconds - _MIN_WINDOW_STEP_SECONDS
     overlap_seconds = _read_int(
-        "VISION_WINDOW_OVERLAP_SECONDS", 60, min_overlap, window_seconds - 1
+        "VISION_WINDOW_OVERLAP_SECONDS", min(60, max_overlap),
+        min_overlap, max_overlap,
+        reject_out_of_range=True,
     )
 
     return VisionConfig(
@@ -228,12 +281,33 @@ def _preflight_model(client: httpx.Client, config: VisionConfig) -> None:
 def _analysis_windows(duration: float, window_seconds: int,
                       overlap_seconds: int) -> list[tuple[float, float]]:
     """Return complete, ordered overlapping windows covering ``duration``."""
+    if duration > _MAX_VISION_SOURCE_SECONDS:
+        raise LocalVisionError(
+            "Local Ollama vision supports source videos up to "
+            f"{_MAX_VISION_SOURCE_SECONDS // 60} minutes. Split this video, "
+            "reduce it to a shorter visual segment, or use Gemini vision."
+        )
+    step = float(window_seconds - overlap_seconds)
+    if step < _MIN_WINDOW_STEP_SECONDS:
+        raise LocalVisionError(
+            "VISION_WINDOW_OVERLAP_SECONDS leaves a "
+            f"{step:g}-second analysis-window step; at least "
+            f"{_MIN_WINDOW_STEP_SECONDS} seconds is required."
+        )
     if duration <= window_seconds:
         return [(0.0, duration)]
 
+    count = int(math.ceil((duration - window_seconds) / step)) + 1
+    if count > _MAX_ANALYSIS_WINDOWS:
+        raise LocalVisionError(
+            "Local Ollama vision would require "
+            f"{count} analysis windows (limit {_MAX_ANALYSIS_WINDOWS}). "
+            "Reduce VISION_WINDOW_OVERLAP_SECONDS, split the source video, "
+            "or use Gemini vision."
+        )
+
     windows: list[tuple[float, float]] = []
     start = 0.0
-    step = float(window_seconds - overlap_seconds)
     while True:
         end = min(duration, start + window_seconds)
         windows.append((round(start, 3), round(end, 3)))
@@ -318,16 +392,27 @@ def _sample_times(window_start: float, window_end: float,
 
 
 def _jpeg_base64(frame, max_width: int) -> str | None:
-    """Resize and JPEG-encode a BGR frame without writing it to disk."""
+    """Cap the longest image edge, then JPEG-encode a BGR frame in memory.
+
+    ``VISION_MAX_FRAME_WIDTH`` is retained as the public setting name for
+    compatibility, but it is a longest-edge cap.  This prevents a narrow,
+    portrait source from retaining an unexpectedly tall image and exceeding
+    the intended image/context budget.
+    """
     if frame is None or getattr(frame, "size", 0) == 0:
         return None
     try:
         height, width = frame.shape[:2]
         if width <= 0 or height <= 0:
             return None
-        if width > max_width:
-            new_height = max(1, int(round(height * max_width / width)))
-            frame = cv2.resize(frame, (max_width, new_height), interpolation=cv2.INTER_AREA)
+        longest_edge = max(height, width)
+        if longest_edge > max_width:
+            scale = max_width / longest_edge
+            new_width = max(1, int(round(width * scale)))
+            new_height = max(1, int(round(height * scale)))
+            frame = cv2.resize(
+                frame, (new_width, new_height), interpolation=cv2.INTER_AREA
+            )
         ok, encoded = cv2.imencode(
             ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         if not ok:
