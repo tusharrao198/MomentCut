@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from io import BytesIO
 import os
 from pathlib import Path
+import re
 from typing import Any, Dict, List
+from urllib.parse import quote
 
 import httpx
 
@@ -389,6 +391,48 @@ def create_youtube_post(
             "Postiz did not confirm post creation. Check Postiz before trying again."
         )
     return post_id
+
+
+def update_youtube_thumbnail(
+    config: PostizConfig,
+    post_id: str,
+    thumbnail: dict,
+) -> None:
+    """Update the thumbnail on one existing unpublished Postiz YouTube post.
+
+    This is deliberately separate from ``create_youtube_post``: updating
+    settings is idempotent, whereas retrying post creation can duplicate a
+    YouTube upload.
+    """
+    post_id = post_id.strip() if isinstance(post_id, str) else ""
+    if not post_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", post_id):
+        raise PostizError("Saved Postiz draft id is invalid.")
+    thumbnail_id = thumbnail.get("id") if isinstance(thumbnail, dict) else None
+    thumbnail_path = thumbnail.get("path") if isinstance(thumbnail, dict) else None
+    thumbnail_id = thumbnail_id.strip() if isinstance(thumbnail_id, str) else ""
+    thumbnail_path = thumbnail_path.strip() if isinstance(thumbnail_path, str) else ""
+    if not thumbnail_id or not thumbnail_path:
+        raise PostizError("Saved Postiz thumbnail state is invalid.")
+
+    try:
+        with _client(config) as client:
+            response = client.put(
+                _endpoint(config, f"posts/{quote(post_id, safe='')}/settings"),
+                headers=_headers(config),
+                json={
+                    "settings": {
+                        "thumbnail": {"id": thumbnail_id, "path": thumbnail_path},
+                    },
+                },
+            )
+    except httpx.RequestError as exc:
+        # This exact settings update is safe to retry. It cannot create a
+        # second post or a second YouTube upload.
+        raise PostizError(
+            "Postiz did not confirm the thumbnail update. Try updating the draft again."
+        ) from exc
+    if response.status_code >= 400 or response.is_redirect:
+        _raise_definite_http_error(response, "thumbnail update")
 
 
 def preflight() -> dict:

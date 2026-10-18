@@ -83,9 +83,10 @@ image request.
 Long video
   -> OpenShorts selects and renders clips
   -> user chooses a clip worth publishing
-  -> Generate AI thumbnail  [one explicit click]
-  -> review/select a candidate
   -> Send to Postiz
+  -> Generate AI thumbnail  [one explicit click, before or after draft creation]
+  -> review/select a candidate
+  -> Update Postiz draft thumbnail  [only when the original handoff created a draft]
   -> Postiz -> YouTube
 ```
 
@@ -526,11 +527,18 @@ Rules:
 - A changed final-MP4 fingerprint invalidates the selected candidate and asks
   the user to generate/select again.
 - A thumbnail request failure shows a specific retryable message and leaves
-  the clip usable and downloadable.
+  the clip usable and downloadable. If a 2/3-candidate batch fails only after
+  one or more successful requests, retain and display those completed
+  candidates, stop the remaining requests, and clearly say `Generated N of
+  requested M`; do not discard paid successful work or silently retry.
 - Do not start a Gemini image request until the user presses **Generate**.
-- Once Postiz has created a draft/post for this exact MP4 fingerprint,
-  OpenShorts disables both thumbnail actions and says to update the draft in
-  Postiz. This preserves the existing idempotent “never create a duplicate”
+- Once Postiz has created a draft for this exact MP4 fingerprint, OpenShorts
+  still permits AI thumbnail generation/selection. A separate explicit
+  **update draft thumb** action uploads the selected JPEG and calls Postiz's
+  settings-update API for that server-recorded draft ID only. It never invokes
+  post creation. For immediate (`now`), scheduled, uncertain, or published
+  handoffs, thumbnail actions remain disabled and the user updates the post
+  in Postiz. This preserves the existing idempotent “never create a duplicate”
   publish guarantee.
 
 ## Backend routes and state
@@ -691,6 +699,36 @@ The existing Postiz local-MP4 and local-thumbnail patches remain required:
 Postiz stores both assets under its own `/uploads` volume and must read them
 there without bypassing SSRF protection for arbitrary URLs.
 
+### Update an existing Postiz draft thumbnail
+
+After a successful `POSTIZ_DEFAULT_POST_TYPE=draft` handoff, the same
+current-MP4 record contains the server-returned Postiz `post_id`. OpenShorts
+may permit **Generate AI thumb** and candidate selection for that draft. It
+must then use a separate endpoint:
+
+```text
+POST /api/postiz/update-thumbnail
+JSON: { job_id, clip_index }
+```
+
+The endpoint must require the local dashboard origin and job ownership, resolve
+the current MP4 fingerprint again, load the matching server-owned Postiz state,
+and require all of the following before it makes a Postiz request:
+
+1. state is `post_created`;
+2. original action was `draft`;
+3. the record has a non-empty server-saved `post_id`; and
+4. a selected valid AI JPEG exists for the same MP4 fingerprint.
+
+It uploads the selected JPEG only if it is not already represented by the
+same saved SHA-256/media record, then calls Postiz
+`PUT /posts/{post-id}/settings` with only
+`{"settings":{"thumbnail":{"id":"...","path":"..."}}}`. This settings update
+is idempotent and can be retried if its response is uncertain; it must never
+call `create_youtube_post()` again. Do not accept a post ID, file path, media
+ID, or thumbnail bytes from the browser. Manual-thumbnail updates after draft
+creation are not included in this scope.
+
 ## Concrete implementation map
 
 | File | Exact responsibility |
@@ -702,8 +740,8 @@ there without bypassing SSRF protection for arbitrary URLs.
 | `layout_picker.py`, `screencast_layout.py`, `hook_grounding.py` | Check `GEMINI_CLIP_ANALYSIS_ENABLED` before constructing a Gemini client or sampling/sending frames. When false, retain each module's current safe local fallback (`none`, no content answer, or original Qwen-written hook). |
 | New `clip_packaging.py` | Hold `normalise_clip_packaging_metadata()`, profile loading/validation, `compose_youtube_metadata()`, tag-size accounting, and transcript-excerpt extraction. This keeps `app.py` from becoming a second packaging implementation. |
 | New `clip_thumbnail_image.py` | Hold only Nano Banana model configuration, bounded prompt construction, `generate_content` image call, safe provider-error classification, inline-image extraction, Pillow decode/re-encode, 1280x720 finalisation, and AI provenance marking. It refuses work when `CLIP_AI_THUMBNAILS_ENABLED=0`. |
-| `app.py` | Hold request/response Pydantic models, local-origin guard rename, per-clip state locks, global generation gate, safe frame extraction, durable thumbnail state, generate/get/select endpoints, selected-candidate resolution, and the Postiz metadata handoff. It returns a clear disabled-feature response before resolving a Gemini key. |
-| `postiz_client.py` | Accept keyword-only normalised tags and serialize them as `settings.tags: [{"label": tag, "value": tag}]`; preserve current MP4/thumbnail retry and unknown-outcome logic. |
+| `app.py` | Hold request/response Pydantic models, local-origin guard rename, per-clip state locks, global generation gate, safe frame extraction, durable thumbnail state, generate/get/select endpoints, selected-candidate resolution, and the Postiz metadata handoff. `POST /api/postiz/update-thumbnail` accepts no browser post ID: it updates only the server-recorded draft for this exact MP4 fingerprint. It returns a clear disabled-feature response before resolving a Gemini key. |
+| `postiz_client.py` | Accept keyword-only normalised tags and serialize them as `settings.tags: [{"label": tag, "value": tag}]`; preserve current MP4/thumbnail retry and unknown-outcome logic. It separately calls Postiz `PUT /posts/{post-id}/settings` for the idempotent draft-thumbnail update. |
 | `dashboard/src/components/ResultCard.jsx` | Add modal, request UUID handling, loading/error state, candidate hydration/selection, metadata disclosure, and mutually exclusive manual/AI thumbnail UI. Reuse the existing `geminiApiKey` prop only to create the existing `X-Gemini-Key` header when BYOK is used. |
 | `.env.example`, `config/youtube-channel-profile.example.json`, `.gitignore` | Document the new image/profile settings, provide a non-secret profile template, and ignore only the personal profile. |
 | `tests/test_clip_thumbnail.py` plus existing Postiz tests | Cover request idempotency, state recovery, input/path/image limits, profile safety, prompt bounds, tag payload, candidate selection, stale MP4s, and publish retry behavior. |

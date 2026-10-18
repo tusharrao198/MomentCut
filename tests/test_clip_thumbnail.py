@@ -187,6 +187,43 @@ def test_known_gemini_quota_rejection_is_retryable(thumbnail_job, monkeypatch):
     assert "batchState" not in retry.json()
 
 
+def test_requested_candidate_count_makes_one_call_per_candidate(thumbnail_job, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        clip_thumbnail_image,
+        "generate_clip_thumbnail",
+        lambda *_args, **_kwargs: calls.append(True) or _jpeg_bytes(),
+    )
+
+    response = _generate(count=3)
+
+    assert response.status_code == 200
+    assert len(calls) == 3
+    assert len(response.json()["candidates"]) == 3
+
+
+def test_partial_candidate_batch_keeps_completed_candidates(thumbnail_job, monkeypatch):
+    calls = []
+
+    def generate(*_args, **_kwargs):
+        calls.append(True)
+        if len(calls) == 2:
+            raise clip_thumbnail_image.ClipThumbnailImageError("Gemini quota is exhausted.")
+        return _jpeg_bytes()
+
+    monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
+    monkeypatch.setattr(clip_thumbnail_image, "generate_clip_thumbnail", generate)
+
+    response = _generate(count=3)
+
+    assert response.status_code == 200
+    assert len(calls) == 2
+    assert len(response.json()["candidates"]) == 1
+    assert response.json()["batchState"] == "failed"
+    assert "Generated 1 of 3 candidates" in response.json()["message"]
+
+
 def test_orphaned_running_batch_is_marked_unknown_before_a_new_request(
     thumbnail_job, monkeypatch
 ):
