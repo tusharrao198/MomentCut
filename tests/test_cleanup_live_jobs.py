@@ -143,6 +143,26 @@ class TestJobDirSweep:
         assert not any(key[0] == "thumbnail-state"
                        for key in app_module._clip_thumbnail_locks)
 
+    def test_thumbnail_state_recovery_is_pinned_before_it_takes_its_lock(
+        self, disk, monkeypatch
+    ):
+        """A sweep cannot win the brief gap before the handler's clip lock."""
+        seen = {}
+
+        async def fake_state_read(job_id, clip_index, request):
+            seen["active"] = app_module._job_is_active(job_id)
+            return {"success": True}
+
+        monkeypatch.setattr(app_module, "_get_clip_thumbnail_state", fake_state_read)
+        result = asyncio.run(
+            app_module.get_clip_thumbnail_state("state-read", 0, object())
+        )
+
+        assert result == {"success": True}
+        assert seen["active"] is True
+        assert app_module._job_is_active("state-read") is False
+
+
 class TestUploadSweep:
     def test_source_of_queued_job_survives(self, disk):
         _, up = disk
