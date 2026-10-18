@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import uuid
@@ -298,6 +299,119 @@ def test_selection_rejects_a_candidate_whose_saved_hash_no_longer_matches(
     )
 
     assert selected.status_code == 409
+
+
+def _seed_selected_ai_and_postiz_thumbnail(job_dir):
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    candidate_id = "b" * 32
+    content = _jpeg_bytes()
+    root = app_module._clip_thumbnail_root(JOB_ID, 0, fingerprint)
+    candidate_filename = f"candidate-{candidate_id}.jpg"
+    (root / candidate_filename).write_bytes(content)
+    app_module._write_clip_thumbnail_state(
+        job_dir / app_module.CLIP_THUMBNAIL_STATE_FILE,
+        {
+            "versions": {
+                f"{filename}:{fingerprint}": {
+                    "filename": filename,
+                    "sha256": fingerprint,
+                    "selected_candidate_id": candidate_id,
+                    "batches": {
+                        str(uuid.uuid4()): {
+                            "state": "completed",
+                            "candidates": [{
+                                "id": candidate_id,
+                                "filename": candidate_filename,
+                                "sha256": hashlib.sha256(content).hexdigest(),
+                            }],
+                        },
+                    },
+                },
+            },
+        },
+    )
+    app_module._write_postiz_state(
+        job_dir / app_module.POSTIZ_PUBLISH_STATE_FILE,
+        {
+            "versions": {
+                f"{filename}:{fingerprint}": {
+                    "state": "post_created",
+                    "filename": filename,
+                    "sha256": fingerprint,
+                    "post_id": "post-1",
+                    "action": "draft",
+                    "media": {"id": "media-1", "path": "/uploads/clip.mp4"},
+                    "thumbnail": {
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "media": {"id": "thumbnail-1", "path": "/uploads/thumb.jpg"},
+                    },
+                },
+            },
+        },
+    )
+    return filename, fingerprint, candidate_id
+
+
+def test_clear_thumbnail_choice_clears_ai_and_postiz_state_together(thumbnail_job):
+    filename, fingerprint, _candidate_id = _seed_selected_ai_and_postiz_thumbnail(
+        thumbnail_job
+    )
+
+    response = _request(
+        "post",
+        "/api/postiz/clear-thumbnail",
+        headers={"Origin": ORIGIN},
+        json={"job_id": JOB_ID, "clip_index": 0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cleared"] is True
+    assert response.json()["selectedCandidateId"] is None
+    assert response.json()["postizThumbnailSaved"] is False
+    ai_state = app_module._read_clip_thumbnail_state(
+        thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    )
+    postiz_state = app_module._read_postiz_state(
+        thumbnail_job / app_module.POSTIZ_PUBLISH_STATE_FILE
+    )
+    key = f"{filename}:{fingerprint}"
+    assert ai_state["versions"][key]["selected_candidate_id"] is None
+    assert "thumbnail" not in postiz_state["versions"][key]
+
+
+def test_clear_thumbnail_choice_rolls_back_postiz_when_ai_write_fails(
+    thumbnail_job, monkeypatch
+):
+    filename, fingerprint, candidate_id = _seed_selected_ai_and_postiz_thumbnail(
+        thumbnail_job
+    )
+    original_write = app_module._write_clip_thumbnail_state
+
+    def fail_ai_write(path, state):
+        raise app_module.ClipThumbnailStateError(
+            "simulated thumbnail state write failure"
+        )
+
+    monkeypatch.setattr(app_module, "_write_clip_thumbnail_state", fail_ai_write)
+    response = _request(
+        "post",
+        "/api/postiz/clear-thumbnail",
+        headers={"Origin": ORIGIN},
+        json={"job_id": JOB_ID, "clip_index": 0},
+    )
+    monkeypatch.setattr(app_module, "_write_clip_thumbnail_state", original_write)
+
+    assert response.status_code == 409
+    ai_state = app_module._read_clip_thumbnail_state(
+        thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    )
+    postiz_state = app_module._read_postiz_state(
+        thumbnail_job / app_module.POSTIZ_PUBLISH_STATE_FILE
+    )
+    key = f"{filename}:{fingerprint}"
+    assert ai_state["versions"][key]["selected_candidate_id"] == candidate_id
+    assert "thumbnail" in postiz_state["versions"][key]
 
 
 def test_reference_failure_marks_reserved_batch_terminal(thumbnail_job, monkeypatch):
