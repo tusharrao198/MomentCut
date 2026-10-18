@@ -35,7 +35,7 @@ import llm_backend
 import vision_backend
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
-                            score_batches, shortlist_target,
+                            reconcile_scored_windows, score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
@@ -2096,9 +2096,17 @@ def get_viral_clips(transcript_result, video_duration):
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
         for batch in score_batches(windows, SCORE_BATCH):
-            scored.extend(_run_stage_split(
+            raw_scores = _run_stage_split(
                 client, model_name, batch, _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
+                gemini_worker.ScoreResponse, "windows", costs, "score")
+            reconciled = reconcile_scored_windows(raw_scores, batch)
+            missing = len(batch) - len({
+                entry.get("id") for entry in raw_scores
+                if isinstance(entry, dict) and entry.get("id") in {w["id"] for w in batch}
+            })
+            if missing:
+                print(f"   ⚠️ score: retained {missing} unscored window(s) with fallback scores.")
+            scored.extend(reconciled)
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
