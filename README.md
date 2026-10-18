@@ -313,8 +313,9 @@ code architecture. Three things to know:
   (~2-3k tokens) and the detail call up to ten (~5k on a long podcast).
   Ollama defaults to a 4096-token context and truncates silently, so run it
   with `OLLAMA_CONTEXT_LENGTH=8192` (or set `num_ctx` in a Modelfile); raise
-  `LLM_SCORE_BATCH` above 3 only if your context allows it. 7-8B models
-  return valid JSON reliably, 3B ones do not.
+  `LLM_SCORE_BATCH` above 3 only if your context allows it; local values above
+  8 are capped so malformed-output recovery cannot explode into hundreds of
+  calls. 7-8B models return valid JSON reliably, 3B ones do not.
 - **Silent footage.** Without `VISION_PROVIDER=ollama`, silent videos retain
   the original Gemini vision path and need a Gemini key. The local VLM path
   supports a maximum clip length of 60 seconds.
@@ -477,7 +478,7 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `LLM_BASE_URL` | OpenAI-compatible server for the moment picker (Ollama, vLLM, LM Studio...). Set it and the Gemini key becomes optional |
 | `LLM_MODEL` | Model name on that server (default `llama3.1:8b`) |
 | `LLM_API_KEY` | Bearer token for that server, if it checks one |
-| `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini) |
+| `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini; local maximum 8) |
 | `VISION_PROVIDER` | Set to `ollama` to enable local visual selection for silent / wordless videos |
 | `VISION_BASE_URL` | Allow-listed local native Ollama endpoint (default `http://host.docker.internal:11434`) |
 | `VISION_MODEL` | Local visual model (default `qwen2.5vl:3b`) |
