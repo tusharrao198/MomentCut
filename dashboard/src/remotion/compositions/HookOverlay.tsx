@@ -78,7 +78,7 @@ const splitImpactWord = (text: string) => {
 };
 
 const balanceAccentLines = (text: string) => {
-  const targetCharacters = 21;
+  const targetCharacters = 18;
   const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
   if (words.length < 2) return [words.join(" ") || " "];
   const whole = words.join(" ");
@@ -190,7 +190,7 @@ const HookBox: React.FC<HookBoxProps> = ({ config, displayFrames }) => {
   if (look.accent) {
     const lines = balanceAccentLines(config.text);
     const longestLine = Math.max(...lines.map((line) => line.length), 1);
-    const fitScale = Math.min(1, 21 / longestLine);
+    const fitScale = Math.min(1, 18 / longestLine);
     const accentFontSize = Math.max(12, Math.round(fontSize * fitScale));
     const accentOutline = Math.max(2, Math.round(outlinePx * fitScale));
     const stroke = `${accentOutline}px #000000`;
@@ -219,7 +219,7 @@ const HookBox: React.FC<HookBoxProps> = ({ config, displayFrames }) => {
             opacity: animOpacity,
             transform: `scale(${animScale}) translateY(${animTranslateY}px)`,
             width: "fit-content",
-            maxWidth: "82%",
+            maxWidth: "74%",
             padding: `${Math.round(accentFontSize * 0.28)}px ${Math.round(accentFontSize * 0.38)}px`,
             borderRadius: Math.round(accentFontSize * 0.28),
             background: look.box ?? "transparent",

@@ -383,8 +383,7 @@ def _draw_accent_hook(text, target_width, font_path, font_size,
         current_y += line_h + line_gap
 
     # ``target_width`` is the complete 9:16 safe-area budget, including the
-    # transparent shadow margin—not merely the charcoal panel. This guarantees
-    # the composited overlay stays inside 82% of the vertical frame width.
+    # transparent shadow margin—not merely the charcoal panel.
     max_canvas_w = int(target_width)
     if canvas_w > max_canvas_w:
         ratio = max_canvas_w / float(canvas_w)
@@ -468,9 +467,9 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
 
     if look.get("accent"):
         # add_hook_to_video gives styles a 90%-of-frame budget. The modern
-        # default deliberately uses an 82% panel so it reads as a title rather
-        # than another full-width subtitle band.
-        accent_width = max(1, int(target_width * (82 / 90)))
+        # default uses only 74% of the complete frame, leaving generous side
+        # space so it reads as a centred title rather than a subtitle band.
+        accent_width = max(1, int(target_width * (74 / 90)))
         return _draw_accent_hook(
             text, accent_width, font_path, font_size, output_image_path, look)
 

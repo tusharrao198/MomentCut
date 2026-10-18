@@ -161,8 +161,8 @@ def test_default_hook_uses_one_translucent_panel_and_gold_impact_word(tmp_path):
     img = Image.open(path).convert("RGBA")
     assert (img.width, img.height) == (w, h)
     # create_hook_image receives the ordinary 90%-of-frame style budget; the
-    # modern default further confines its complete canvas to 82/90 of that.
-    assert w <= int(600 * (82 / 90))
+    # modern default further confines its complete canvas to 74/90 of that.
+    assert w <= int(600 * (74 / 90))
     # At 9:16 this leaves ample vertical room above captions and platform UI.
     video_width = 600 / 0.9
     video_height = video_width * (16 / 9)
