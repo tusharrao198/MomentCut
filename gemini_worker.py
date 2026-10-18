@@ -8,7 +8,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from clip_selection import (clip_count_targets, clip_duration_bounds,
                             lookup_model_prices)
@@ -31,6 +31,18 @@ class ScoreResponse(BaseModel):
     windows: List[ScoredWindowModel]
 
 
+class ThumbnailBrief(BaseModel):
+    """Optional per-clip creative facts usable by thumbnail generation."""
+    subject: str = ""
+    moment: str = ""
+    emotion: str = ""
+    visual_style: str = ""
+    composition: str = ""
+    thumbnail_text: str = ""
+    must_include: list[str] = Field(default_factory=list)
+    avoid: list[str] = Field(default_factory=list)
+
+
 class DetailClipModel(BaseModel):
     start: float
     end: float
@@ -44,6 +56,10 @@ class DetailClipModel(BaseModel):
     # the dashboard. Defaulted so a small local model that skips it does not
     # fail schema validation and lose the clip.
     why: str = ""
+    youtube_description_intro: str = ""
+    youtube_tags: list[str] = Field(default_factory=list)
+    youtube_hashtags: list[str] = Field(default_factory=list)
+    thumbnail_brief: ThumbnailBrief = Field(default_factory=ThumbnailBrief)
 
 
 class DetailResponse(BaseModel):
@@ -61,6 +77,11 @@ class VisualClipModel(BaseModel):
     video_description_for_instagram: str
     video_title_for_youtube_short: str
     viral_hook_text: str
+    why: str = ""
+    youtube_description_intro: str = ""
+    youtube_tags: list[str] = Field(default_factory=list)
+    youtube_hashtags: list[str] = Field(default_factory=list)
+    thumbnail_brief: ThumbnailBrief = Field(default_factory=ThumbnailBrief)
 
 
 class VisualResponse(BaseModel):
@@ -340,6 +361,18 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
 - `predicted_score`: honest 0-100 estimate of viral potential.
 - `why`: one sentence, max 20 words, naming what makes THIS moment worth a
   clip — the specific hook, claim, number or payoff, not the topic.
+- `youtube_description_intro`: a truthful, clip-specific opening paragraph.
+  Do not include hashtags, links, channel calls to action, playlists, music
+  credits, or facts outside the candidate-window transcript.
+- `youtube_tags`: 5-15 distinct specific plain tags without `#`, as a JSON
+  array. They must be grounded in this clip's transcript, not generic spam.
+- `youtube_hashtags`: 3-5 relevant hashtag strings as a JSON array; include
+  `#shorts` when appropriate. Do not duplicate these in the intro.
+- `thumbnail_brief`: an object that describes the exact selected moment:
+  `subject`, `moment`, `emotion`, `visual_style`, `composition`,
+  `thumbnail_text` (two to four short words), `must_include` (array), and
+  `avoid` (array). Never invent a game, movie, person, episode, result, or
+  other fact that is not stated in this candidate-window transcript.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -358,7 +391,20 @@ Return only:
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
       "viral_hook_text": "<short overlay max 10 words>",
-      "why": "<one sentence, max 20 words>"
+      "why": "<one sentence, max 20 words>",
+      "youtube_description_intro": "<truthful clip-specific opening paragraph>",
+      "youtube_tags": ["<specific plain tag>", "..."],
+      "youtube_hashtags": ["#shorts", "..."],
+      "thumbnail_brief": {
+        "subject": "<concrete subject>",
+        "moment": "<exact moment>",
+        "emotion": "<emotion>",
+        "visual_style": "<visual style>",
+        "composition": "<composition>",
+        "thumbnail_text": "<2-4 word overlay>",
+        "must_include": ["<visual fact>"],
+        "avoid": ["<unrelated visual>"]
+      }
     }}
   ]
 }}

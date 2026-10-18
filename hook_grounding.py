@@ -145,6 +145,9 @@ def reground(clip_path, clip, transcript, start, end) -> Optional[dict]:
     """Rewrite ``clip['viral_hook_text']`` / ``video_title_for_youtube_short``
     in place from the clip's frames. Returns what changed (also stored under
     ``clip['hook_grounding']``), or None when skipped or failed."""
+    from gemini_feature_flags import clip_analysis_enabled
+    if not clip_analysis_enabled():
+        return None
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("   🪝 Hook grounding skipped: needs a Gemini key (frames), "

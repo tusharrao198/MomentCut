@@ -29,6 +29,7 @@ output/
 
 # Generated metadata
 *_metadata.json
+config/youtube-channel-profile.json
 
 # Cache dirs
 .cache/

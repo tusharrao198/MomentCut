@@ -321,8 +321,11 @@ def detect_content_ranges(video_path, scenes, fps):
     differently from []: the user asked for this layout, so a failed check must
     not quietly hand the clip back to the face classifier (see fallback_ranges).
     """
+    from gemini_feature_flags import clip_analysis_enabled
     if not ENABLED:
         return []
+    if not clip_analysis_enabled():
+        return None
     if not scenes:
         return None
     api_key = os.getenv("GEMINI_API_KEY")

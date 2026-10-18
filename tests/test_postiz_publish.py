@@ -2,9 +2,11 @@ import asyncio
 import base64
 import json
 import os
+import uuid
 
 import httpx
 import pytest
+from PIL import Image
 
 import postiz_client
 
@@ -182,6 +184,71 @@ def test_postiz_publish_thumbnail_uploads_and_attaches_it(postiz_job, monkeypatc
     )
     record = next(iter(state["versions"].values()))
     assert record["thumbnail"]["media"] == captured["thumbnail_media"]
+
+
+def test_postiz_publish_uses_selected_ai_thumbnail(postiz_job, monkeypatch):
+    job_dir, _config = postiz_job
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    candidate_id = "a" * 32
+    root = app_module._clip_thumbnail_root(JOB_ID, 0, fingerprint)
+    image = Image.new("RGB", (8, 8), color=(1, 2, 3))
+    image.save(root / f"candidate-{candidate_id}.jpg", "JPEG")
+    app_module._write_clip_thumbnail_state(
+        job_dir / app_module.CLIP_THUMBNAIL_STATE_FILE,
+        {
+            "versions": {
+                f"{filename}:{fingerprint}": {
+                    "filename": filename,
+                    "sha256": fingerprint,
+                    "selected_candidate_id": candidate_id,
+                    "batches": {
+                        str(uuid.uuid4()): {
+                            "state": "completed",
+                            "candidates": [{
+                                "id": candidate_id,
+                                "filename": f"candidate-{candidate_id}.jpg",
+                            }],
+                        },
+                    },
+                },
+            },
+        },
+    )
+    captured = {}
+    monkeypatch.setattr(
+        postiz_client,
+        "resolve_youtube_integration",
+        lambda _config: {"id": "yt-1", "identifier": "youtube"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_file",
+        lambda *_args: {"id": "media-1", "path": "/uploads/clip.mp4"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_thumbnail",
+        lambda _config, content, filename, content_type:
+        captured.update(content=content, filename=filename, content_type=content_type)
+        or {"id": "thumbnail-1", "path": "/uploads/thumbnail.jpg"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "create_youtube_post",
+        lambda _config, _integration_id, _media, _title, _description, thumbnail=None:
+        captured.update(thumbnail=thumbnail) or "post-1",
+    )
+
+    response = _publish()
+
+    assert response.status_code == 200
+    assert captured["content_type"] == "image/jpeg"
+    assert captured["filename"].endswith(".jpg")
+    assert captured["thumbnail"] == {
+        "id": "thumbnail-1",
+        "path": "/uploads/thumbnail.jpg",
+    }
 
 
 def test_postiz_publish_thumbnail_rejects_invalid_image_before_upload(postiz_job, monkeypatch):

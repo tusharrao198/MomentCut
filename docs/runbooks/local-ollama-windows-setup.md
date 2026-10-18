@@ -19,9 +19,10 @@ No-audio or sparse-speech video
 ```
 
 No source video or clip-selection frame sample is sent to Gemini when local
-visual selection is enabled. Other optional OpenShorts features, such as
-automatic layout selection, remain independently Gemini-backed when a Gemini
-key is configured.
+visual selection is enabled. Set `GEMINI_CLIP_ANALYSIS_ENABLED=0` below to
+also prevent optional Gemini layout, on-screen, and hook helpers from making
+frame requests. That setting is independent of the explicit per-clip AI
+thumbnail action.
 
 For the code architecture and test contract, see
 [`../architecture/local-ollama-vision.md`](../architecture/local-ollama-vision.md).
@@ -154,6 +155,18 @@ VISION_SCENE_SNAP_SECONDS=2
 # A 12 GB laptop GPU should process one OpenShorts job at a time.
 MAX_CONCURRENT_JOBS=1
 ASR_GPU_CONCURRENCY=1
+
+# Keep Gemini out of every automatic clip-analysis/helper step. This does not
+# disable the separate, user-triggered per-clip AI thumbnail action.
+GEMINI_CLIP_ANALYSIS_ENABLED=0
+
+# Optional: enable only if you want the per-clip "generate AI thumb" button.
+# Gemini receives one locally extracted JPG reference frame, not the MP4.
+CLIP_AI_THUMBNAILS_ENABLED=1
+GEMINI_API_KEY=your_google_ai_studio_key
+CLIP_THUMBNAIL_IMAGE_MODEL=gemini-3.1-flash-image
+CLIP_THUMBNAIL_IMAGE_SIZE=1K
+CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS=1
 ```
 
 Use plain values, one per line. Do not paste smart quotes or hidden characters.
@@ -291,22 +304,24 @@ shutdown.
 
 No code rollback is needed.
 
-To switch **silent-video selection only** back to Gemini, remove this line from
-`.env`:
+To switch **silent-video selection only** back to Gemini, remove
+`VISION_PROVIDER=ollama` and set:
 
 ```env
-VISION_PROVIDER=ollama
+GEMINI_CLIP_ANALYSIS_ENABLED=1
 ```
 
-To also switch **talking-video transcript selection** back to Gemini, either
-remove `LLM_BASE_URL` or add:
+To also switch **talking-video transcript selection** back to Gemini, use:
 
 ```env
 LLM_PROVIDER=gemini
+GEMINI_CLIP_ANALYSIS_ENABLED=1
 ```
 
-Ensure a Gemini key is configured in OpenShorts Settings, then recreate the
-backend:
+Leave `CLIP_AI_THUMBNAILS_ENABLED=1` unchanged if you still want the
+on-demand Nano Banana thumbnail button. Ensure `GEMINI_API_KEY` is set in the
+backend `.env` (or provide the existing dashboard BYOK key), then recreate
+the backend:
 
 ```powershell
 docker compose up -d --force-recreate backend

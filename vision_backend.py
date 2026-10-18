@@ -25,6 +25,7 @@ import cv2
 import httpx
 
 import frame_sampler
+import clip_packaging
 import gemini_worker
 from clip_selection import dedupe_overlapping
 
@@ -420,7 +421,16 @@ TIME CONTRACT — STRICT:
   full-source clip from 0 to SOURCE_DURATION_SECONDS.
 
 Write all metadata in {language}. `video_title_for_youtube_short` is at most
-100 characters. Return only JSON matching the supplied schema, with no prose.
+100 characters. For every selected clip also return:
+- `why`: one short factual reason this exact visual moment is compelling.
+- `youtube_description_intro`: a truthful clip-specific opening paragraph.
+- `youtube_tags`: 5-15 specific plain tags without `#`, as a JSON array.
+- `youtube_hashtags`: 3-5 relevant hashtags (include #shorts when appropriate).
+- `thumbnail_brief`: an object with subject, moment, emotion, visual_style,
+  composition, thumbnail_text, must_include, and avoid. Keep it grounded in
+  visible frames; do not invent game, movie, people, or event names.
+Do not put hashtags inside youtube_description_intro. Return only JSON matching
+the supplied schema, with no prose.
 """.strip()
 
 
@@ -544,7 +554,7 @@ def _normalise_window_shorts(raw_shorts: Sequence[dict], *, window_start: float,
         hook = _text(raw.get("viral_hook_text"), 160)
         if not all((title, tiktok, instagram, hook)):
             continue
-        clean.append({
+        clean.append(clip_packaging.normalise_clip_packaging_metadata({
             "start": round(start, 3),
             "end": round(end, 3),
             "predicted_score": min(100, max(0, score)),
@@ -552,7 +562,12 @@ def _normalise_window_shorts(raw_shorts: Sequence[dict], *, window_start: float,
             "video_description_for_instagram": instagram,
             "video_title_for_youtube_short": title,
             "viral_hook_text": hook,
-        })
+            "why": _text(raw.get("why"), 320),
+            "youtube_description_intro": raw.get("youtube_description_intro"),
+            "youtube_tags": raw.get("youtube_tags"),
+            "youtube_hashtags": raw.get("youtube_hashtags"),
+            "thumbnail_brief": raw.get("thumbnail_brief"),
+        }))
     return clean
 
 
