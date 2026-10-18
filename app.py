@@ -6916,19 +6916,30 @@ def _set_thumbnail_batch_error(
     state_name: str,
     message: str,
 ) -> None:
-    """Record a safe terminal state after an image request or local failure."""
-    state_path = _clip_thumbnail_state_path(job_id)
-    state = _read_clip_thumbnail_state(state_path)
-    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
-    if not isinstance(record, dict) or not isinstance(record.get("batches"), dict):
-        return
-    batch = record["batches"].get(request_id)
-    if not isinstance(batch, dict):
-        return
-    batch["state"] = state_name
-    batch["message"] = message
-    batch["completed_at"] = datetime.now(timezone.utc).isoformat()
-    _write_clip_thumbnail_state(state_path, state)
+    """Best-effort terminal transition for a reserved image request.
+
+    This deliberately never replaces an already-terminal result.  A storage
+    failure while recording the original error must not hide that original
+    error; the state GET route will recover a persisted ``running`` batch
+    once storage is available again.
+    """
+    try:
+        state_path = _clip_thumbnail_state_path(job_id)
+        state = _read_clip_thumbnail_state(state_path)
+        record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+        if not isinstance(record, dict) or not isinstance(record.get("batches"), dict):
+            return
+        batch = record["batches"].get(request_id)
+        if not isinstance(batch, dict) or batch.get("state") != "running":
+            return
+        batch["state"] = state_name
+        batch["message"] = message
+        batch["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _write_clip_thumbnail_state(state_path, state)
+    except Exception as exc:
+        # The original running record is recovered to ``unknown`` by the next
+        # state read (without issuing another Gemini request).
+        print(f"⚠️ Could not persist AI thumbnail terminal state ({type(exc).__name__}).")
 
 
 def _mark_orphaned_thumbnail_batches_unknown(record: dict) -> bool:
@@ -6958,29 +6969,58 @@ def _mark_orphaned_thumbnail_batches_unknown(record: dict) -> bool:
     return changed
 
 
-@app.get("/api/clip-thumbnail/{job_id}/{clip_index}")
-async def get_clip_thumbnail_state(job_id: str, clip_index: int, request: Request):
-    """Read non-secret candidate state and composed YouTube metadata for one clip."""
+async def _get_clip_thumbnail_state(
+    job_id: str, clip_index: int, request: Request
+):
+    """Read non-secret candidate state and recover orphaned batches safely."""
     # A same-origin GET sent to the Vite dashboard proxy commonly has no
-    # Origin header. Unlike generation, selection, and Postiz publishing, this
-    # endpoint makes no state change and exposes no credential; job ownership
-    # remains enforced by _clip_thumbnail_context in hosted mode. Keep the
-    # local-origin gate on every mutating thumbnail/Postiz endpoint.
+    # Origin header. Job ownership remains enforced by
+    # _clip_thumbnail_context in hosted mode. A stale ``running`` batch is a
+    # safe exception to the read-only rule: recovery only changes it to
+    # ``unknown`` and never makes a Gemini request.
     _job, clip, _file_path, filename, fingerprint, transcript = await _clip_thumbnail_context(
         job_id, clip_index, request
     )
+    lock = await _clip_thumbnail_lock(job_id, clip_index)
     try:
-        state = await asyncio.to_thread(_read_clip_thumbnail_state, _clip_thumbnail_state_path(job_id))
+        async with lock:
+            state_path = _clip_thumbnail_state_path(job_id)
+            state = await asyncio.to_thread(_read_clip_thumbnail_state, state_path)
+            record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+            # An active request holds the one global generation slot. If it is
+            # unlocked, a persisted running record belongs to an interrupted
+            # request from an earlier process and can be surfaced immediately
+            # as recoverable without charging for another image request.
+            if (
+                isinstance(record, dict)
+                and not _clip_thumbnail_generation_gate.locked()
+                and _mark_orphaned_thumbnail_batches_unknown(record)
+            ):
+                try:
+                    await asyncio.to_thread(
+                        _write_clip_thumbnail_state, state_path, state
+                    )
+                except Exception:
+                    # Keep the recovered in-memory view. A later state GET or
+                    # explicit Generate will retry persistence before it can
+                    # spend quota, so a transient disk failure cannot strand
+                    # the UI on a permanently disabled running state.
+                    pass
     except ClipThumbnailStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
     return _thumbnail_record_view(
         job_id, clip_index, filename, fingerprint, record, clip, transcript
     )
 
 
-@app.post("/api/clip-thumbnail/generate")
-async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Request):
+@app.get("/api/clip-thumbnail/{job_id}/{clip_index}")
+async def get_clip_thumbnail_state(job_id: str, clip_index: int, request: Request):
+    """Pin the clip while its thumbnail state is being recovered or read."""
+    async with _job_activity_lease(job_id):
+        return await _get_clip_thumbnail_state(job_id, clip_index, request)
+
+
+async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Request):
     """Create explicitly requested Nano Banana candidates for the current clip only."""
     _require_local_dashboard_origin(request)
     if not clip_ai_thumbnails_enabled():
@@ -7008,6 +7048,8 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
     version_key = _thumbnail_version_key(filename, fingerprint)
     lock = await _clip_thumbnail_lock(req.job_id, req.clip_index)
     generation_slot_reserved = False
+    batch_terminal = False
+    provider_request_started = False
     async with lock:
         try:
             state_path = _clip_thumbnail_state_path(req.job_id)
@@ -7170,6 +7212,7 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
             # choice, never an automatic retry of an uncertain request.
             candidate_id = uuid.uuid4().hex
             try:
+                provider_request_started = True
                 content = await asyncio.to_thread(
                     clip_thumbnail_image.generate_clip_thumbnail,
                     api_key,
@@ -7212,14 +7255,20 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                         detail="Gemini returned a thumbnail in an unsupported final format.",
                     )
             except HTTPException as exc:
+                invalid_message = "Gemini returned an invalid thumbnail image."
+                if completed_candidates:
+                    partial_batch_state = "failed"
+                    partial_batch_message = (
+                        f"Generated {completed_candidates} of {req.count} candidates. "
+                        f"{invalid_message} No further candidate requests were made."
+                    )
+                    break
                 await asyncio.to_thread(
                     _set_thumbnail_batch_error,
                     req.job_id, filename, fingerprint, req.request_id, "failed",
-                    "Gemini returned an invalid thumbnail image.",
+                    invalid_message,
                 )
-                raise HTTPException(
-                    status_code=502, detail="Gemini returned an invalid thumbnail image."
-                ) from exc
+                raise HTTPException(status_code=502, detail=invalid_message) from exc
 
             # A re-edit may have replaced the selected clip while the model
             # was working. Do not attach an old result to the new render.
@@ -7282,11 +7331,27 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                         "filename": candidate_filename,
                         "sha256": hashlib.sha256(content).hexdigest(),
                     })
-                    completed_candidates += 1
                     await asyncio.to_thread(
                         _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
                     )
+                    completed_candidates += 1
             except ClipThumbnailStateError as exc:
+                # A completed candidate that cannot be saved must not discard
+                # prior persisted candidates from this paid batch. The outer
+                # failure guard also ensures a write failure cannot strand the
+                # batch as ``running``.
+                if completed_candidates:
+                    partial_batch_state = "failed"
+                    partial_batch_message = (
+                        f"Generated {completed_candidates} of {req.count} candidates. "
+                        f"{exc} No further candidate requests were made."
+                    )
+                    break
+                await asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id, filename, fingerprint, req.request_id, "failed",
+                    str(exc),
+                )
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         async with lock:
@@ -7305,18 +7370,60 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                 await asyncio.to_thread(
                     _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
                 )
+                batch_terminal = True
             except ClipThumbnailStateError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _thumbnail_record_view(
             req.job_id, req.clip_index, filename, fingerprint, record, clip, transcript
         )
+    except BaseException:
+        # Once ``running`` is persisted, every exit path must attempt a
+        # terminal state. This includes reference-frame, candidate-file, and
+        # final-state persistence failures. If storage itself is unavailable,
+        # the state GET path later recovers the remaining running marker to
+        # ``unknown`` without contacting Gemini.
+        if generation_slot_reserved and not batch_terminal:
+            if provider_request_started:
+                terminal_state = "unknown"
+                terminal_message = (
+                    "AI thumbnail generation stopped before its result could be "
+                    "safely saved. It may have reached Gemini and consumed quota; "
+                    "review this warning before retrying."
+                )
+            else:
+                terminal_state = "failed"
+                terminal_message = (
+                    "AI thumbnail generation stopped before Gemini was contacted. "
+                    "No image-generation request was made."
+                )
+            try:
+                await asyncio.shield(asyncio.to_thread(
+                    _set_thumbnail_batch_error,
+                    req.job_id,
+                    filename,
+                    fingerprint,
+                    req.request_id,
+                    terminal_state,
+                    terminal_message,
+                ))
+            except BaseException:
+                # `_set_thumbnail_batch_error` is already best effort. Keep
+                # the original failure/cancellation semantics unchanged.
+                pass
+        raise
     finally:
         if generation_slot_reserved:
             _clip_thumbnail_generation_gate.release()
 
 
-@app.post("/api/clip-thumbnail/{job_id}/{clip_index}/select")
-async def select_clip_thumbnail(
+@app.post("/api/clip-thumbnail/generate")
+async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Request):
+    """Pin the current job while its explicit AI thumbnail request runs."""
+    async with _job_activity_lease(req.job_id):
+        return await _generate_clip_thumbnail(req, request)
+
+
+async def _select_clip_thumbnail(
     job_id: str,
     clip_index: int,
     req: ClipThumbnailSelectRequest,
@@ -7402,6 +7509,18 @@ async def select_clip_thumbnail(
     return _thumbnail_record_view(
         job_id, clip_index, filename, fingerprint, record, clip, transcript
     )
+
+
+@app.post("/api/clip-thumbnail/{job_id}/{clip_index}/select")
+async def select_clip_thumbnail(
+    job_id: str,
+    clip_index: int,
+    req: ClipThumbnailSelectRequest,
+    request: Request,
+):
+    """Pin the clip while an existing AI thumbnail candidate is selected."""
+    async with _job_activity_lease(job_id):
+        return await _select_clip_thumbnail(job_id, clip_index, req, request)
 
 
 class SocialPostRequest(BaseModel):

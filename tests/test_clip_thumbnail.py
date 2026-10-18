@@ -224,14 +224,15 @@ def test_partial_candidate_batch_keeps_completed_candidates(thumbnail_job, monke
     assert "Generated 1 of 3 candidates" in response.json()["message"]
 
 
-def test_orphaned_running_batch_is_marked_unknown_before_a_new_request(
+def test_orphaned_running_batch_is_recovered_by_state_read_before_a_new_request(
     thumbnail_job, monkeypatch
 ):
+    calls = []
     monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
     monkeypatch.setattr(
         clip_thumbnail_image,
         "generate_clip_thumbnail",
-        lambda *_args, **_kwargs: _jpeg_bytes(),
+        lambda *_args, **_kwargs: calls.append(True) or _jpeg_bytes(),
     )
     clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
     _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
@@ -254,13 +255,21 @@ def test_orphaned_running_batch_is_marked_unknown_before_a_new_request(
         },
     }), encoding="utf-8")
 
-    response = _generate()
-
-    assert response.status_code == 409
+    recovered = _request("get", f"/api/clip-thumbnail/{JOB_ID}/0")
+    assert recovered.status_code == 200
+    assert recovered.json()["batchState"] == "unknown"
+    assert recovered.json()["hasRunningBatch"] is False
+    assert calls == []
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     batch = next(iter(persisted["versions"][f"{filename}:{fingerprint}"]["batches"].values()))
     assert batch["state"] == "unknown"
     assert "may have reached Gemini" in batch["message"]
+
+    # Recovery never sends a replacement Gemini request by itself. A later
+    # explicit Generate click uses a new request id and is allowed.
+    response = _generate()
+    assert response.status_code == 200
+    assert calls == [True]
 
 
 def test_selection_rejects_a_candidate_whose_saved_hash_no_longer_matches(
@@ -289,3 +298,126 @@ def test_selection_rejects_a_candidate_whose_saved_hash_no_longer_matches(
     )
 
     assert selected.status_code == 409
+
+
+def test_reference_failure_marks_reserved_batch_terminal(thumbnail_job, monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "_make_clip_reference_frame",
+        lambda *_args: (_ for _ in ()).throw(
+            app_module.ClipThumbnailStateError("reference frame failed")
+        ),
+    )
+
+    response = _generate()
+
+    assert response.status_code == 500
+    state = app_module._read_clip_thumbnail_state(
+        thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    )
+    batch = next(iter(next(iter(state["versions"].values()))["batches"].values()))
+    assert batch["state"] == "failed"
+
+
+def test_reference_state_failure_before_gemini_is_definite_and_uses_no_quota(
+    thumbnail_job, monkeypatch
+):
+    original_write = app_module._write_clip_thumbnail_state
+    failed = {"value": False}
+    provider_calls = []
+    monkeypatch.setattr(
+        app_module,
+        "_make_clip_reference_frame",
+        lambda *_args: (_jpeg_bytes(), "reference.jpg"),
+    )
+    monkeypatch.setattr(
+        clip_thumbnail_image,
+        "generate_clip_thumbnail",
+        lambda *_args, **_kwargs: provider_calls.append(True) or _jpeg_bytes(),
+    )
+
+    def fail_reference_metadata_once(path, state):
+        record = next(iter(state.get("versions", {}).values()), {})
+        if not failed["value"] and "reference" in record:
+            failed["value"] = True
+            raise app_module.ClipThumbnailStateError(
+                "reference metadata write failed"
+            )
+        return original_write(path, state)
+
+    monkeypatch.setattr(
+        app_module, "_write_clip_thumbnail_state", fail_reference_metadata_once
+    )
+    response = _generate()
+
+    assert response.status_code == 409
+    assert provider_calls == []
+    state = app_module._read_clip_thumbnail_state(
+        thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    )
+    batch = next(iter(next(iter(state["versions"].values()))["batches"].values()))
+    assert batch["state"] == "failed"
+    assert "No image-generation request was made" in batch["message"]
+
+
+def test_candidate_file_failure_keeps_prior_candidates_and_finishes_batch(
+    thumbnail_job, monkeypatch
+):
+    writes = []
+    original_write = app_module._write_thumbnail_file
+    monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        clip_thumbnail_image,
+        "generate_clip_thumbnail",
+        lambda *_args, **_kwargs: _jpeg_bytes(),
+    )
+
+    def fail_second_candidate(path, content):
+        writes.append(path)
+        if len(writes) == 2:
+            raise app_module.ClipThumbnailStateError("candidate disk write failed")
+        return original_write(path, content)
+
+    monkeypatch.setattr(app_module, "_write_thumbnail_file", fail_second_candidate)
+    response = _generate(count=3)
+
+    assert response.status_code == 200
+    assert len(response.json()["candidates"]) == 1
+    assert response.json()["batchState"] == "failed"
+    assert "Generated 1 of 3 candidates" in response.json()["message"]
+
+
+def test_final_state_write_failure_recovers_reserved_batch_to_terminal_unknown(
+    thumbnail_job, monkeypatch
+):
+    original_write = app_module._write_clip_thumbnail_state
+    fail_once = {"value": True}
+    monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        clip_thumbnail_image,
+        "generate_clip_thumbnail",
+        lambda *_args, **_kwargs: _jpeg_bytes(),
+    )
+
+    def fail_completed_write(path, state):
+        batches = next(iter(state.get("versions", {}).values()), {}).get("batches", {})
+        if (
+            fail_once["value"]
+            and any(
+                isinstance(batch, dict) and batch.get("state") == "completed"
+                for batch in batches.values()
+            )
+        ):
+            fail_once["value"] = False
+            raise app_module.ClipThumbnailStateError("final state write failed")
+        return original_write(path, state)
+
+    monkeypatch.setattr(app_module, "_write_clip_thumbnail_state", fail_completed_write)
+    response = _generate()
+
+    assert response.status_code == 409
+    state = app_module._read_clip_thumbnail_state(
+        thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    )
+    batch = next(iter(next(iter(state["versions"].values()))["batches"].values()))
+    assert batch["state"] == "unknown"
