@@ -1101,6 +1101,17 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                             clear thumb
                         </button>
                     )}
+                    {aiThumbnailState?.selectedCandidateId && (
+                        <button
+                            onClick={() => void selectAiThumbnail(null)}
+                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
+                            title="Do not send an AI thumbnail with this clip"
+                            className={QUIET_BTN}
+                        >
+                            <X size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                            clear AI thumb
+                        </button>
+                    )}
 
                     <button
                         onClick={handleSendToPostiz}
