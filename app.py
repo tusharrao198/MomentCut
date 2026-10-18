@@ -7196,11 +7196,6 @@ async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: R
                 raise ClipThumbnailStateError(
                     "Existing AI thumbnail state is invalid. Generate a new thumbnail batch."
                 )
-            duplicate = record["batches"].get(req.request_id)
-            if isinstance(duplicate, dict):
-                return _thumbnail_record_view(
-                    req.job_id, req.clip_index, filename, fingerprint, record, clip, transcript
-                )
             async with _clip_thumbnail_generation_gate_guard:
                 active = _clip_thumbnail_active_request
                 active_request_id = (
@@ -7222,6 +7217,17 @@ async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: R
                             "consumed quota. Review the warning, then click Generate again "
                             "only if you want a new image request."
                         ),
+                    )
+                duplicate = record["batches"].get(req.request_id)
+                if isinstance(duplicate, dict):
+                    return _thumbnail_record_view(
+                        req.job_id,
+                        req.clip_index,
+                        filename,
+                        fingerprint,
+                        record,
+                        clip,
+                        transcript,
                     )
                 if _clip_thumbnail_generation_gate.locked():
                     raise HTTPException(
