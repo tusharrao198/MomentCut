@@ -140,15 +140,17 @@ LLM_TIMEOUT=600
 VISION_PROVIDER=ollama
 VISION_BASE_URL=http://host.docker.internal:11434
 VISION_MODEL=qwen2.5vl:3b
-VISION_TIMEOUT_SECONDS=180
+VISION_TIMEOUT_SECONDS=300
 VISION_RETRY_ATTEMPTS=3
 
 # Local visual-analysis windows. The maximum supported local clip length is 60s.
 VISION_WINDOW_SECONDS=120
 VISION_WINDOW_OVERLAP_SECONDS=60
-VISION_FRAMES_PER_WINDOW=8
-VISION_MAX_FRAME_WIDTH=640
-VISION_NUM_CTX=4096
+# Conservative qwen2.5vl:3b profile for a 12 GB laptop GPU.
+# Scene sampling may add up to two extra images to this request.
+VISION_FRAMES_PER_WINDOW=4
+VISION_MAX_FRAME_WIDTH=480
+VISION_NUM_CTX=8192
 VISION_CANDIDATES_PER_WINDOW=2
 VISION_SCENE_SNAP_SECONDS=2
 
@@ -303,7 +305,9 @@ shutdown.
 | `HTTP 404` from `/api/show` | Run `ollama pull qwen2.5vl:3b`; the vision model is missing. |
 | `CLIP_MAX_SECONDS up to 60` error | Set `CLIP_MAX_SECONDS=60` or remove it if it was overridden. |
 | GPU out-of-memory | Keep `MAX_CONCURRENT_JOBS=1`, `ASR_GPU_CONCURRENCY=1`, `OLLAMA_NUM_PARALLEL=1`, and `OLLAMA_MAX_LOADED_MODELS=1`. Close other GPU-heavy apps. |
+| `request ... exceeds the available context size` | Use the conservative profile above: 4 frames, 480 max frame width, and `VISION_NUM_CTX=8192`; recreate the OpenShorts backend after changing `.env`. |
 | Silent job fails after retry attempts | Inspect the named time window in the backend log. It identifies the exact failed 120-second analysis window. |
+| `Local Ollama vision returned no usable clip candidates` | OpenShorts now skips an empty individual window and tries the remaining windows. This final error means every window produced no valid 15–60 second visual candidate; try footage with clearer scene progression. |
 | Docker daemon error | Start Docker Desktop, wait until it reports that the engine is running, then rerun `docker compose up -d`. |
 | Changes in `.env` appear ignored | Recreate the backend: `docker compose up -d --force-recreate backend`. |
 

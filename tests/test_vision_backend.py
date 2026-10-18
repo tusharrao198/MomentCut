@@ -66,6 +66,11 @@ def test_accepts_docker_host_endpoint(local_vision):
     assert local_vision.base_url == "http://host.docker.internal:11434"
 
 
+def test_default_frame_request_uses_the_conservative_12gb_profile(local_vision):
+    assert (local_vision.frames_per_window, local_vision.max_frame_width,
+            local_vision.num_ctx) == (4, 480, 8192)
+
+
 def test_blank_model_uses_the_approved_default(monkeypatch):
     monkeypatch.setenv("VISION_PROVIDER", "ollama")
     monkeypatch.setenv("VISION_BASE_URL", "http://localhost:11434")
@@ -257,6 +262,95 @@ def test_one_failed_window_fails_the_job_and_attempts_unload(local_vision, monke
         vision.select_clips(
             "source.mp4", 180, "en", 1, 3, 15, 60
         )
+    assert unloaded == [True]
+
+
+def test_empty_window_is_skipped_when_a_later_window_has_candidates(
+        local_vision, monkeypatch):
+    class Capture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(vision.cv2, "VideoCapture", Capture)
+    monkeypatch.setattr(vision, "_client", lambda **_kwargs: Client())
+    monkeypatch.setattr(vision, "_preflight_model", lambda *_args: None)
+    monkeypatch.setattr(vision, "_scene_boundaries", lambda *_args: [])
+    monkeypatch.setattr(
+        vision, "_decode_samples",
+        lambda *_args: ([10.0], ["image"]),
+    )
+    responses = iter(({"shorts": []}, _clip(70, 100)))
+    monkeypatch.setattr(
+        vision, "_window_response",
+        lambda *_args: next(responses),
+    )
+    unloaded = []
+    monkeypatch.setattr(vision, "_unload", lambda *_args: unloaded.append(True))
+
+    result = vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
+
+    assert [(clip["start"], clip["end"]) for clip in result["shorts"]] == [
+        (70.0, 100.0)
+    ]
+    assert unloaded == [True]
+
+
+def test_all_empty_windows_fail_after_every_window_is_examined(
+        local_vision, monkeypatch):
+    class Capture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(vision.cv2, "VideoCapture", Capture)
+    monkeypatch.setattr(vision, "_client", lambda **_kwargs: Client())
+    monkeypatch.setattr(vision, "_preflight_model", lambda *_args: None)
+    monkeypatch.setattr(vision, "_scene_boundaries", lambda *_args: [])
+    monkeypatch.setattr(
+        vision, "_decode_samples",
+        lambda *_args: ([10.0], ["image"]),
+    )
+    calls = {"count": 0}
+
+    def empty_response(*_args):
+        calls["count"] += 1
+        return {"shorts": []}
+
+    monkeypatch.setattr(vision, "_window_response", empty_response)
+    unloaded = []
+    monkeypatch.setattr(vision, "_unload", lambda *_args: unloaded.append(True))
+
+    with pytest.raises(
+            vision.LocalVisionError,
+            match="Local Ollama vision returned no usable clip candidates"):
+        vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
+
+    assert calls["count"] == 2
     assert unloaded == [True]
 
 
