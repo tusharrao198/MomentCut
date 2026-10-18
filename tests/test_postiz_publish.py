@@ -309,6 +309,47 @@ def test_force_resend_keeps_old_record_when_youtube_preflight_fails(postiz_job, 
     assert app_module._read_postiz_state(state_path) == initial
 
 
+def test_force_resend_restores_old_record_when_create_is_definitely_rejected(
+    postiz_job, monkeypatch
+):
+    monkeypatch.setattr(
+        postiz_client,
+        "resolve_youtube_integration",
+        lambda _config: {"id": "yt-1", "identifier": "youtube"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_file",
+        lambda *_args: {"id": "media-1", "path": "/uploads/clip.mp4"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "create_youtube_post",
+        lambda *_args, **_kwargs: "post-existing",
+    )
+    assert _publish().status_code == 200
+
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, digest = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    state_path = app_module._postiz_state_path(JOB_ID)
+    before = app_module._read_postiz_state(state_path)
+
+    def reject_create(*_args, **_kwargs):
+        raise postiz_client.PostizError("Rejected settings.", status_code=400)
+
+    monkeypatch.setattr(postiz_client, "create_youtube_post", reject_create)
+    response = _publish(force_resend=True)
+
+    assert response.status_code == 400
+    assert app_module._read_postiz_state(state_path) == before
+    record = before["versions"][f"{filename}:{digest}"]
+    assert record["state"] == "post_created"
+    assert record["post_id"] == "post-existing"
+    assert app_module._postiz_draft_thumbnail_is_editable(
+        JOB_ID, filename, digest
+    ) is True
+
+
 def test_clear_thumbnail_prevents_its_reuse_on_force_resend(postiz_job, monkeypatch):
     created_thumbnails = []
     monkeypatch.setattr(
@@ -333,7 +374,11 @@ def test_clear_thumbnail_prevents_its_reuse_on_force_resend(postiz_job, monkeypa
 
     monkeypatch.setattr(postiz_client, "create_youtube_post", create_post)
     assert _publish_with_thumbnail().status_code == 200
-    assert _clear_stored_thumbnail().json() == {"success": True, "cleared": True}
+    cleared = _clear_stored_thumbnail()
+    assert cleared.status_code == 200
+    assert cleared.json()["success"] is True
+    assert cleared.json()["cleared"] is True
+    assert cleared.json()["postizThumbnailSaved"] is False
     assert _publish(force_resend=True).status_code == 200
     assert created_thumbnails[0] == {"id": "thumbnail-1", "path": "/uploads/thumbnail.png"}
     assert created_thumbnails[1] is None
