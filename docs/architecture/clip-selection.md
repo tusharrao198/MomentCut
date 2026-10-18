@@ -16,10 +16,13 @@ Two invariants keep that chain from leaking:
   target and starves every source under ~30 min. Batches are near-equal
   (`score_batches`): a trailing batch of one window would return that window
   whatever its score.
-- **The clip floor is enforced in code, not just in the prompt.** When the detail
-  pass comes back under `min_clips`, the shortlist windows that produced nothing
-  get one more call for the difference. An empty answer is accepted: padding is
-  worse than a short list.
+- **The clip floor is enforced in code, not just in the prompt.** Gemini keeps
+  its multi-window detail call and retries unused shortlist windows when it
+  comes back short. A local text model instead receives one shortlisted window
+  per detail call and returns zero-or-one clip. Every non-null result is
+  validated immediately; an invalid timestamp receives one correction request.
+  If the non-overlapping candidates are still below the floor, lower-ranked
+  windows are checked individually up to `LLM_DETAIL_FALLBACK_WINDOWS`.
 
 `target_clips` on `/api/process` (dashboard: advanced options) pins both ends via
 `CLIP_TARGET_MIN` / `CLIP_TARGET_MAX` when the user wants an exact number.
@@ -60,12 +63,16 @@ behaviour changes, change `dashboard/seo/pages.js` too.
 
 ## Local LLM for the moment picker (`llm_backend.py`)
 
-`LLM_BASE_URL` (+ `LLM_MODEL`, `LLM_API_KEY`) routes the two transcript passes of
+`LLM_BASE_URL` (+ `LLM_MODEL`, `LLM_API_KEY`) routes the transcript-selection pipeline of
 `get_viral_clips` to any OpenAI-compatible `/chat/completions` instead of Gemini;
 the response is validated with the same pydantic schemas Gemini enforces
 server-side, so `main.py` sees one shape. `main.score_batch_size` drops to 3
-windows per call there (local contexts are 4-8k; a truncated prompt scores garbage
-silently). Self-host `/api/process` then accepts a request without
+windows per call there. The local detail path then evaluates each shortlisted
+window separately, injects the canonical source-window id, validates its
+boundaries, and makes one compact global-ranking call over the survivors.
+Ranking failure falls back to independent scores without deleting valid cuts.
+Overlaps are removed after global scores are applied so the stronger duplicate
+survives. Self-host `/api/process` then accepts a request without
 `X-Gemini-Key` and `/api/config.localLlm` tells the dashboard not to demand one.
 Frame-based stages (`layout_picker`, `screencast_layout`) stay on Gemini.
 `get_visual_clips` stays on Gemini unless `VISION_PROVIDER=ollama` activates

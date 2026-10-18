@@ -6,6 +6,7 @@ asked for 6-12 and delivered 3-4. The windows the detail pass skipped get
 one more call before the job settles for less.
 """
 import json
+import re
 
 import pytest
 
@@ -39,6 +40,37 @@ def _run(monkeypatch, detail_responses, stage_cost=None, return_result=False):
     calls = []
 
     def fake_stage(client, model, prompt, schema):
+        if schema is main.gemini_worker.LocalWindowDetailResponse:
+            match = re.search(r"^WINDOW_ID: (window_\d+)$", prompt, re.M)
+            window_id = match.group(1)
+            calls.append(("detail-window", [window_id]))
+            available = detail_responses[0] if detail_responses else []
+            clip = next(
+                (
+                    item for item in available
+                    if item.get("source_window_id") == window_id
+                ),
+                None,
+            )
+            return {"clip": clip}, stage_cost
+        if schema is main.gemini_worker.LocalClipRankResponse:
+            payload = json.loads(
+                prompt.split("CANDIDATES_JSON:")[-1].split("Return only:")[0]
+            )
+            calls.append((
+                "global-rank",
+                [item["candidate_id"] for item in payload],
+            ))
+            return {
+                "candidates": [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "score": item.get("preliminary_score") or 0,
+                        "reason": "same order",
+                    }
+                    for item in payload
+                ]
+            }, stage_cost
         payload = json.loads(prompt.split("WINDOWS_JSON:")[-1].split("Return only:")[0]
                              if "WINDOWS_JSON:" in prompt else "[]")
         if schema is main.gemini_worker.ScoreResponse:

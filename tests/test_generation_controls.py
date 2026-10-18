@@ -66,6 +66,8 @@ class TestPromptTemplates:
             min_secs=10.0, max_secs=20.0, windows_json="[]")
         assert "10 to 20 seconds" in text
         assert "return 2 to 4 clips" in text
+        assert "2-4 complete sentences, roughly 45-90 words" in text
+        assert "hardware, resolution, frame rate" in text
 
     def test_visual_template_carries_band_and_count(self):
         text = _templates()["VISUAL_PROMPT_TEMPLATE"].format(
@@ -73,6 +75,8 @@ class TestPromptTemplates:
             min_secs=10.0, max_secs=20.0)
         assert "2–4 MOST engaging" in text
         assert "10 to 20 seconds" in text
+        assert "2-4 complete sentences" in text
+        assert "facts that are not visible in the video" in text
 
     def test_score_template_ranks_every_window(self):
         # The pass used to SELECT ("choose up to 3 windows from this batch"),
