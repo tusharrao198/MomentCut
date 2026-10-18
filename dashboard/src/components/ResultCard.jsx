@@ -751,6 +751,11 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             setAiThumbnailInstructions('');
         } catch (e) {
             setAiThumbnailError(e.message || 'Could not generate an AI thumbnail.');
+            // A failed request can have changed durable server state (most
+            // importantly, ``running`` -> ``unknown`` after an interrupted
+            // prior request). Reload it so the card never stays stuck on
+            // “generating…” after the recovery warning.
+            void loadAiThumbnailState();
         } finally {
             setAiThumbnailLoading(false);
         }
