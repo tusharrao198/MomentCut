@@ -8,6 +8,7 @@ from hooks import (
     HOOK_STYLES,
     _break_long_word,
     _emoji_scale,
+    _impact_word_span,
     _measure_width,
     _split_emoji_runs,
     _EMOJI_RE,
@@ -55,8 +56,23 @@ class TestLongWordWrap:
         assert _break_long_word(draw, "kurz", font, None, 1000) == ["kurz"]
 
 
+class TestImpactWord:
+    def test_uses_last_readable_word_not_trailing_emoji(self):
+        text = "THIS WENT WRONG! 😳"
+        start, end = _impact_word_span(text)
+        assert text[start:end] == "WRONG"
+
+    def test_supports_non_english_words(self):
+        text = "Esto salió increíble"
+        start, end = _impact_word_span(text)
+        assert text[start:end] == "increíble"
+
+    def test_emoji_only_has_no_impact_word(self):
+        assert _impact_word_span("🔥 😳") is None
+
+
 class TestHookStyles:
-    """The 6 styles are a contract shared with the frontend (HookModal's
+    """The styles are a contract shared with the frontend (HookModal's
     picker and HookOverlay's HOOK_LOOKS must mirror these keys)."""
 
     def test_expected_style_names(self):
@@ -64,11 +80,15 @@ class TestHookStyles:
             "pill", "classic", "dark", "yellow", "red", "outline", "outline_yellow",
         }
 
-    def test_pill_is_one_box_per_line_in_the_bundled_sans(self):
+    def test_default_is_the_modern_accent_treatment(self):
         look = HOOK_STYLES["pill"]
-        assert look["pills"] is True
+        assert look["accent"] is True
+        assert look["text"] == (255, 255, 255)
+        assert look["highlight"] == (255, 201, 40)
+        assert look["box"][3] < 200
+        assert look["outline"][1] > 0
         assert look["font"].endswith("Montserrat-ExtraBold.ttf")
-        assert os.path.exists(look["font"]), "the pill font must ship with the repo"
+        assert os.path.exists(look["font"]), "the default font must ship with the repo"
 
     def test_boxed_styles_have_opaque_box_and_shadow(self):
         for name in ("classic", "dark", "yellow", "red"):
@@ -132,16 +152,15 @@ class TestCreateHookImage:
         assert os.path.exists(path) and w > 0 and h > 0
 
 
-def test_pill_hook_image_stacks_one_box_per_line(tmp_path):
-    """Two lines of text -> two rows of box pixels with a boxless column
-    beside the shorter one (it is its own pill, not one shared card)."""
+def test_default_hook_uses_one_translucent_panel_and_gold_impact_word(tmp_path):
     from hooks import create_hook_image
     from PIL import Image
     out = tmp_path / "pill.png"
-    path, w, h = create_hook_image("una frase bastante larga para partirse en dos lineas",
+    path, w, h = create_hook_image("THIS MISSION WENT COMPLETELY WRONG",
                                    600, str(out), style="pill")
     img = Image.open(path).convert("RGBA")
     assert (img.width, img.height) == (w, h)
-    alpha_rows = [any(img.getpixel((x, y))[3] > 200 for x in range(0, img.width, 4))
-                  for y in range(img.height)]
-    assert sum(alpha_rows) > 0
+    pixels = list(img.getdata())
+    assert any(a > 0 for _, _, _, a in pixels)
+    assert any(r > 220 and 150 < g < 230 and b < 100 and a > 0
+               for r, g, b, a in pixels)

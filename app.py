@@ -3350,7 +3350,7 @@ async def process_endpoint(
         from hooks import HOOK_STYLES
         if auto_hook_style in HOOK_STYLES:
             env["AUTO_HOOK_STYLE"] = auto_hook_style
-        print(f"[auto-hook] job={job_id} style={env.get('AUTO_HOOK_STYLE', 'classic')}")
+        print(f"[auto-hook] job={job_id} style={env.get('AUTO_HOOK_STYLE', 'pill')}")
 
     # Manual generation controls (discussion #65): optional clip-count target
     # and duration band, forwarded to the selection prompts via the same env
@@ -5416,7 +5416,8 @@ class HookRequest(BaseModel):
     position: Optional[str] = "auto"
     size: Optional[str] = "M" # S, M, L
     duration_seconds: Optional[float] = None  # None = hook visible for the whole clip
-    style: Optional[str] = "pill"  # pill/classic/dark/yellow/red/outline/outline_yellow
+    # "pill" is the backwards-compatible identifier for the modern default.
+    style: Optional[str] = "pill"
     font: Optional[str] = None  # montserrat/anton/serif (hooks.HOOK_FONTS); None = the style's own
     remove: Optional[bool] = False  # strip the burned hook instead of adding one
 

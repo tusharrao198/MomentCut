@@ -13,7 +13,7 @@ const ENTRANCE_OPTIONS = [
 
 // Must mirror hooks.py HOOK_STYLES.
 const HOOK_STYLES = [
-    { value: 'pill', label: 'Pills', box: 'rgba(255,255,255,0.98)', text: '#000', sans: true },
+    { value: 'pill', label: 'Modern (Default)', box: 'rgba(12,15,20,0.62)', text: '#fff', highlight: '#FFC928', sans: true },
     { value: 'classic', label: 'Classic', box: 'rgba(255,255,255,0.94)', text: '#000' },
     { value: 'dark', label: 'Dark', box: 'rgba(18,18,20,0.92)', text: '#fff' },
     { value: 'yellow', label: 'Yellow', box: 'rgba(255,214,0,0.96)', text: '#000' },
@@ -171,9 +171,15 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                                         title={s.label}
                                     >
                                         {s.value === 'pill' ? (
-                                            <span className="flex flex-col items-center gap-0.5 py-0.5" style={FONT_CSS[font || styleFont(s.value)]}>
-                                                <span className="rounded-md px-1.5 text-[13px] leading-5 bg-white text-black">Aa Bb</span>
-                                                <span className="rounded-md px-1.5 text-[13px] leading-5 bg-white text-black">Cc</span>
+                                            <span
+                                                className="block rounded-md px-1 py-1.5 text-[13px] leading-5 text-white"
+                                                style={{
+                                                    ...FONT_CSS[font || styleFont(s.value)],
+                                                    background: 'linear-gradient(180deg, rgba(12,15,20,.72), rgba(12,15,20,.52))',
+                                                    textShadow: '-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000',
+                                                }}
+                                            >
+                                                Aa <span style={{ color: s.highlight }}>Bb</span>
                                             </span>
                                         ) : (
                                             <span
