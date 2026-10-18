@@ -5,6 +5,8 @@ Standard-library only so both main.py and gemini_worker.py can import it and
 the logic stays unit-testable without the heavy video dependencies.
 """
 
+import math
+
 # USD per 1M tokens (input, output incl. thinking), from ai.google.dev pricing.
 MODEL_PRICES = {
     "gemini-3.5-flash": (1.50, 9.00),
@@ -186,6 +188,69 @@ def clip_duration_bounds():
     if hi < lo + 5.0:  # keep a real band: degenerate ranges starve the model
         hi = min(180.0, lo + 5.0)
     return round(lo, 3), round(hi, 3)
+
+
+def _finite_number(value):
+    """Return ``value`` as a finite float, or ``None`` when it is unusable."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def reconcile_scored_windows(scored_windows, source_windows, fallback_score=0):
+    """Reconcile a model's score response to the exact scoring input.
+
+    A score is only meaningful for a window the model was actually shown.
+    Small local models occasionally repeat an id, invent one, or omit a weak
+    window despite the prompt. Keep one canonical result per source id, ignore
+    unknown ids, and retain missing windows at the fallback score so a bad
+    response cannot silently shrink the candidate pool.
+    """
+    sources = []
+    by_id = {}
+    for window in source_windows or []:
+        if not isinstance(window, dict):
+            continue
+        window_id = window.get("id")
+        if not isinstance(window_id, str) or not window_id or window_id in by_id:
+            continue
+        canonical = dict(window)
+        by_id[window_id] = canonical
+        sources.append(window_id)
+
+    try:
+        fallback = int(round(float(fallback_score)))
+    except (TypeError, ValueError, OverflowError):
+        fallback = 0
+    fallback = min(100, max(0, fallback))
+
+    chosen = {}
+    for scored in scored_windows or []:
+        if not isinstance(scored, dict):
+            continue
+        window_id = scored.get("id")
+        if not isinstance(window_id, str) or window_id not in by_id:
+            continue
+        score = _finite_number(scored.get("score"))
+        if score is None:
+            score = fallback
+        score = min(100, max(0, int(round(score))))
+        candidate = dict(by_id[window_id])
+        candidate["score"] = score
+        candidate["reason"] = str(scored.get("reason") or "")
+        existing = chosen.get(window_id)
+        if existing is None or score > existing["score"]:
+            chosen[window_id] = candidate
+
+    reconciled = []
+    for window_id in sources:
+        fallback_window = dict(by_id[window_id])
+        fallback_window["score"] = fallback
+        fallback_window["reason"] = "Model did not return a usable score."
+        reconciled.append(chosen.get(window_id, fallback_window))
+    return reconciled
 
 
 def compact_words(words, precision=2):
