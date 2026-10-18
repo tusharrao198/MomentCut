@@ -6,6 +6,7 @@ multi-tenant, and the three stores record ownership three different ways), and
 a session id or output_dir that walks out of the working directories must not
 delete anything at all.
 """
+import asyncio
 import os
 
 import pytest
@@ -37,6 +38,8 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "jobs", {})
     monkeypatch.setattr(app, "saas_jobs", {})
     monkeypatch.setattr(app, "thumbnail_sessions", {})
+    monkeypatch.setattr(app, "_postiz_publish_locks", {})
+    monkeypatch.setattr(app, "_clip_thumbnail_locks", {})
     return tmp_path
 
 
@@ -60,6 +63,17 @@ class TestClipJobs:
 
         assert not os.path.exists("output/job2")
         assert "job2" not in app.jobs
+
+    def test_erasing_job_discards_its_idle_secondary_locks(self, workdir):
+        _write("output/job3/clip.mp4")
+        app.jobs["job3"] = {"user_id": MINE, "status": "completed"}
+        app._postiz_publish_locks[("job3", 0)] = asyncio.Lock()
+        app._clip_thumbnail_locks[("job3", 0)] = asyncio.Lock()
+
+        app._purge_local_jobs_for_user(MINE)
+
+        assert not any(key[0] == "job3" for key in app._postiz_publish_locks)
+        assert not any(key[0] == "job3" for key in app._clip_thumbnail_locks)
 
     def test_leaves_another_users_jobs_alone(self, workdir):
         _write("output/theirs/.owner", THEIRS)
