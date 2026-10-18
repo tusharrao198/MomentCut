@@ -34,7 +34,8 @@ import layout_picker
 import llm_backend
 import vision_backend
 from clip_selection import (build_transcript_windows, clip_count_targets,
-                            clip_duration_bounds, dedupe_overlapping,
+                            apply_global_candidate_ranking, clip_duration_bounds,
+                            dedupe_overlapping, dedupe_ranked_with_floor,
                             normalise_detail_candidates,
                             reconcile_scored_windows, score_batches, shortlist_target,
                             snap_clip_to_words_in_window, trim_to_best)
@@ -2040,8 +2041,258 @@ def score_batch_size():
     return 3 if llm_backend.active() else 8
 
 
+def local_detail_fallback_limit():
+    """Maximum lower-ranked windows inspected when the local floor is missed."""
+    raw = os.environ.get("LLM_DETAIL_FALLBACK_WINDOWS", "").strip()
+    if not raw:
+        return 8
+    try:
+        value = max(0, int(raw))
+    except ValueError:
+        return 8
+    if value > 20:
+        print(
+            f"⚠️ LLM_DETAIL_FALLBACK_WINDOWS={value} is too large; using 20 "
+            "to keep one-window recovery bounded."
+        )
+        return 20
+    return value
+
+
+def _local_window_detail_prompt(window, *, video_duration, language,
+                                min_secs, max_secs, correction=""):
+    return gemini_worker.LOCAL_WINDOW_DETAIL_PROMPT_TEMPLATE.format(
+        video_duration=video_duration,
+        language=language,
+        min_secs=min_secs,
+        max_secs=max_secs,
+        window_id=window["id"],
+        window_start=window["start"],
+        window_end=window["end"],
+        window_text=window["text"],
+        correction=correction,
+    )
+
+
+def _run_local_detail_window(client, model_name, window, *, video_duration,
+                             language, min_secs, max_secs, costs, label,
+                             words=None):
+    """Ask the local model for zero-or-one clip and validate it immediately."""
+    correction = ""
+    for semantic_attempt in range(2):
+        prompt = _local_window_detail_prompt(
+            window,
+            video_duration=video_duration,
+            language=language,
+            min_secs=min_secs,
+            max_secs=max_secs,
+            correction=correction,
+        )
+        try:
+            parsed, cost = _run_gemini_stage(
+                client,
+                model_name,
+                prompt,
+                gemini_worker.LocalWindowDetailResponse,
+            )
+        except Exception as error:
+            if not _is_local_malformed_response_error(error):
+                raise
+            print(
+                f"   ⚠️ {label}: local LLM returned unusable data for "
+                f"{window['id']}; skipping it ({error})"
+            )
+            return None
+        if cost:
+            costs.append(cost)
+
+        raw_clip = parsed.get("clip") if isinstance(parsed, dict) else None
+        if raw_clip is None:
+            return None
+        if not isinstance(raw_clip, dict):
+            print(
+                f"   ⚠️ {label}: local LLM returned a non-object clip for "
+                f"{window['id']}; skipping it."
+            )
+            return None
+
+        # There was exactly one source window in this request. Do not let an
+        # otherwise useful candidate disappear because a small model omitted
+        # or copied the wrong ownership id.
+        raw_clip = dict(raw_clip)
+        raw_clip["source_window_id"] = window["id"]
+        valid = normalise_detail_candidates(
+            [raw_clip],
+            [window],
+            video_duration,
+            min_secs,
+            max_secs,
+        )
+        if valid:
+            candidate = valid[0]
+            if words:
+                candidate["proposed"] = [
+                    candidate.get("start", 0),
+                    candidate.get("end", 0),
+                ]
+                start, end = snap_clip_to_words_in_window(
+                    candidate.get("start", 0),
+                    candidate.get("end", 0),
+                    words,
+                    video_duration,
+                    window,
+                    min_duration=min_secs,
+                    max_duration=max_secs,
+                )
+                candidate["start"], candidate["end"] = start, end
+                candidate["_word_snapped"] = True
+            return candidate
+
+        if semantic_attempt == 0:
+            print(
+                f"   ⚠️ {label}: {window['id']} returned timestamps outside "
+                "its allowed window/duration; requesting one correction."
+            )
+            correction = (
+                "\nCORRECTION REQUIRED: your previous non-null clip had invalid "
+                f"timestamps. Return null, or one clip wholly inside "
+                f"{window['start']}..{window['end']} seconds whose duration is "
+                f"{min_secs:g}..{max_secs:g} seconds."
+            )
+            continue
+
+        print(
+            f"   ⚠️ {label}: {window['id']} remained semantically invalid "
+            "after one correction; skipping it."
+        )
+    return None
+
+
+def _run_local_detail_windows(client, model_name, primary_windows,
+                              fallback_windows, *, video_duration, language,
+                              min_secs, max_secs, min_clips, costs,
+                              max_clips=None, words=None):
+    """Collect one validated candidate per primary window, then bounded fallback."""
+    candidates = []
+    for window in primary_windows:
+        candidate = _run_local_detail_window(
+            client,
+            model_name,
+            window,
+            video_duration=video_duration,
+            language=language,
+            min_secs=min_secs,
+            max_secs=max_secs,
+            costs=costs,
+            label="detail-window",
+            words=words,
+        )
+        if candidate:
+            candidates.append(candidate)
+
+    unique = dedupe_overlapping(candidates)
+    if len(unique) >= min_clips:
+        return candidates
+
+    fallback_limit = local_detail_fallback_limit()
+    recovery_windows = list(fallback_windows or [])[:fallback_limit]
+    if recovery_windows:
+        recovery_target = max(
+            min_clips,
+            min(int(max_clips or min_clips), min_clips + 2),
+        )
+        print(
+            f"   Local detail produced {len(unique)} non-overlapping clip(s) "
+            f"of {min_clips}; checking up to {len(recovery_windows)} "
+            f"lower-ranked window(s) one by one (target {recovery_target} "
+            "for ranking headroom)."
+        )
+    else:
+        recovery_target = min_clips
+    for window in recovery_windows:
+        candidate = _run_local_detail_window(
+            client,
+            model_name,
+            window,
+            video_duration=video_duration,
+            language=language,
+            min_secs=min_secs,
+            max_secs=max_secs,
+            costs=costs,
+            label="detail-fallback",
+            words=words,
+        )
+        if candidate:
+            candidates.append(candidate)
+            if len(dedupe_overlapping(candidates)) >= recovery_target:
+                break
+    return candidates
+
+
+def _rank_local_candidates(client, model_name, candidates, *,
+                           transcript_result=None, language="unknown", costs):
+    """Globally compare independent window picks; fall back without data loss."""
+    prepared = []
+    payload = []
+    for index, candidate in enumerate(candidates or [], 1):
+        entry = dict(candidate)
+        candidate_id = entry.get("_candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            candidate_id = f"candidate_{index:03d}"
+        entry["_candidate_id"] = candidate_id
+        entry["_detail_predicted_score"] = entry.get("predicted_score")
+        prepared.append(entry)
+        excerpt = clip_packaging.clip_transcript_excerpt(
+            transcript_result,
+            entry.get("start"),
+            entry.get("end"),
+        )
+        payload.append({
+            "candidate_id": candidate_id,
+            "start": entry.get("start"),
+            "end": entry.get("end"),
+            "preliminary_score": entry.get("predicted_score"),
+            "hook": entry.get("viral_hook_text"),
+            "title": entry.get("video_title_for_youtube_short"),
+            "why": entry.get("why"),
+            # Keep ten candidates plus schema comfortably inside an 8k
+            # context. The exact cut timestamps retain the full source truth.
+            "clip_transcript": excerpt[:600],
+        })
+
+    if len(prepared) < 2:
+        return prepared
+
+    prompt = gemini_worker.LOCAL_CLIP_RANK_PROMPT_TEMPLATE.format(
+        language=language,
+        candidates_json=json.dumps(payload, ensure_ascii=False),
+    )
+    try:
+        parsed, cost = _run_gemini_stage(
+            client,
+            model_name,
+            prompt,
+            gemini_worker.LocalClipRankResponse,
+        )
+        if cost:
+            costs.append(cost)
+        rankings = parsed.get("candidates") if isinstance(parsed, dict) else []
+        ranked = apply_global_candidate_ranking(prepared, rankings)
+        print(f"   Globally ranked {len(ranked)} local clip candidate(s).")
+        return ranked
+    except Exception as error:
+        # Ranking improves comparison across independent windows, but it must
+        # never erase valid, already-grounded cuts when a local model/server
+        # has a bad final response.
+        print(
+            "   ⚠️ global-rank: local LLM ranking failed; retaining "
+            f"independent scores ({error})."
+        )
+        return apply_global_candidate_ranking(prepared, [])
+
+
 def get_viral_clips(transcript_result, video_duration):
-    """Two-pass clip selection: score transcript windows, then detail the best.
+    """Windowed clip selection: score candidates, then extract/rank the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
     transcript clusters picks near the start), and the cheap scoring pass keeps
@@ -2053,7 +2304,10 @@ def get_viral_clips(transcript_result, video_duration):
         # Self-hosted text model: no Google key needed for this stage.
         client = None
         model_name = llm_backend.model_name()
-        print(f"\U0001f916  Analyzing with local LLM at {llm_backend.base_url()} (2-pass: score → detail)...")
+        print(
+            f"\U0001f916  Analyzing with local LLM at {llm_backend.base_url()} "
+            "(score → one-window detail → global rank)..."
+        )
     else:
         if not clip_analysis_enabled():
             print("❌ Gemini clip analysis is disabled. Configure LLM_BASE_URL and "
@@ -2144,40 +2398,92 @@ def get_viral_clips(transcript_result, video_duration):
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
             return build
 
-        raw_shorts = _run_stage_split(client, model_name, shortlist,
-                                      _detail_prompt_for(min_clips, max_clips),
-                                      gemini_worker.DetailResponse, "shorts", costs, "detail")
-        shorts = normalise_detail_candidates(
-            raw_shorts, shortlist, video_duration, min_secs, max_secs)
-        if len(shorts) < len(raw_shorts):
-            print(f"   ⚠️ detail: discarded {len(raw_shorts) - len(shorts)} invalid clip candidate(s).")
+        if llm_backend.active():
+            shortlisted_ids = {window["id"] for window in shortlist}
+            fallback_windows = [
+                by_id[item["id"]]
+                for item in scored
+                if item.get("id") in by_id and item["id"] not in shortlisted_ids
+            ]
+            shorts = _run_local_detail_windows(
+                client,
+                model_name,
+                shortlist,
+                fallback_windows,
+                video_duration=video_duration,
+                language=language,
+                min_secs=min_secs,
+                max_secs=max_secs,
+                min_clips=min_clips,
+                max_clips=max_clips,
+                costs=costs,
+                words=words,
+            )
+            shorts = _rank_local_candidates(
+                client,
+                model_name,
+                shorts,
+                transcript_result=transcript_result,
+                language=language,
+                costs=costs,
+            )
+            # Rank before overlap removal so the globally stronger version of
+            # a repeated moment survives. Keep the best-first order until the
+            # ceiling has been applied, then restore chronological rendering.
+            shorts, preserved_floor = dedupe_ranked_with_floor(
+                shorts,
+                min_clips,
+            )
+            if preserved_floor:
+                print(
+                    "   Global overlap ranking would fall below the clip "
+                    "floor; retained the independent non-overlapping choices."
+                )
+            shorts = shorts[:max_clips]
+            shorts = sorted(shorts, key=lambda s: float(s.get("start") or 0))
+            for short in shorts:
+                short.pop("_candidate_id", None)
+                short.pop("_detail_predicted_score", None)
+        else:
+            raw_shorts = _run_stage_split(
+                client,
+                model_name,
+                shortlist,
+                _detail_prompt_for(min_clips, max_clips),
+                gemini_worker.DetailResponse,
+                "shorts",
+                costs,
+                "detail",
+            )
+            shorts = normalise_detail_candidates(
+                raw_shorts, shortlist, video_duration, min_secs, max_secs)
+            if len(shorts) < len(raw_shorts):
+                print(f"   ⚠️ detail: discarded {len(raw_shorts) - len(shorts)} invalid clip candidate(s).")
 
-        # The floor lived only in the prompt, and a prompt is not a contract:
-        # the model regularly returned half of it and the job shipped that.
-        # The windows it passed over are the cheap second chance — they are
-        # already the best-scoring ones in the video — so they get one more
-        # call for the missing clips. It may still come back empty, which is
-        # the honest answer for material that does not hold more.
-        if len(shorts) < min_clips:
-            used = {str(s.get("source_window_id") or "") for s in shorts}
-            spare = [w for w in shortlist if w["id"] not in used]
-            if spare:
-                missing = min_clips - len(shorts)
-                print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
-                      f"asking the {len(spare)} unused window(s) for {missing} more.")
-                raw_extra = _run_stage_split(
-                    client, model_name, spare,
-                    _detail_prompt_for(missing, max(missing, len(spare))),
-                    gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
-                extra = normalise_detail_candidates(
-                    raw_extra, spare, video_duration, min_secs, max_secs)
-                if len(extra) < len(raw_extra):
-                    print(f"   ⚠️ detail-floor: discarded {len(raw_extra) - len(extra)} "
-                          "invalid clip candidate(s).")
-                if extra:
-                    shorts = sorted(shorts + extra,
-                                    key=lambda s: float(s.get("start") or 0))
-                    print(f"   Recovered {len(extra)} clip(s) from them.")
+            # The floor lived only in the prompt, and a prompt is not a
+            # contract: the model regularly returned half of it and the job
+            # shipped that. The windows it passed over are the cheap second
+            # chance, so they get one more call for the missing clips.
+            if len(shorts) < min_clips:
+                used = {str(s.get("source_window_id") or "") for s in shorts}
+                spare = [w for w in shortlist if w["id"] not in used]
+                if spare:
+                    missing = min_clips - len(shorts)
+                    print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
+                          f"asking the {len(spare)} unused window(s) for {missing} more.")
+                    raw_extra = _run_stage_split(
+                        client, model_name, spare,
+                        _detail_prompt_for(missing, max(missing, len(spare))),
+                        gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
+                    extra = normalise_detail_candidates(
+                        raw_extra, spare, video_duration, min_secs, max_secs)
+                    if len(extra) < len(raw_extra):
+                        print(f"   ⚠️ detail-floor: discarded {len(raw_extra) - len(extra)} "
+                              "invalid clip candidate(s).")
+                    if extra:
+                        shorts = sorted(shorts + extra,
+                                        key=lambda s: float(s.get("start") or 0))
+                        print(f"   Recovered {len(extra)} clip(s) from them.")
 
         if len(shorts) > max_clips:
             # By score, never by position: the results arrive in transcript
@@ -2189,6 +2495,8 @@ def get_viral_clips(transcript_result, video_duration):
                   f"{max_clips + dropped}.")
         # Snap each proposed clip onto real word boundaries (+ a bit of silence).
         for s in shorts:
+            if s.pop("_word_snapped", False):
+                continue
             # Keep the model's raw proposal: it is how boundary accuracy is
             # measured (distance to the nearest word before the snap; p90 was
             # 0.4-0.5 s on 8 talks, 21-sep-2026, so the snap reaches it).
@@ -2218,18 +2526,22 @@ def get_viral_clips(transcript_result, video_duration):
                 "output_tokens": sum(c.get("output_tokens", 0) for c in costs),
                 "total_cost": sum(c.get("total_cost", 0) for c in costs),
                 "model": model_name,
-                # Preserve the backend identity through the two-pass
-                # aggregation so the dashboard never labels a local Ollama
-                # run as a zero-cost Gemini request.
+                # Preserve the backend identity through aggregation so the
+                # dashboard never labels a local Ollama run as a zero-cost
+                # Gemini request.
                 "local": all(c.get("local") is True for c in costs),
             }
             if cost_analysis["local"]:
-                print(f"\U0001f916  Local LLM analysis ({model_name}, 2-pass, {len(costs)} calls).")
+                print(
+                    f"\U0001f916  Local LLM analysis "
+                    f"({model_name}, {len(costs)} calls)."
+                )
             else:
                 print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
 
         if not shorts:
-            print("⚠️ 2-pass returned no clips.")
+            stage = "Local selection" if llm_backend.active() else "2-pass"
+            print(f"⚠️ {stage} returned no clips.")
             return None
 
         result = {"shorts": shorts}

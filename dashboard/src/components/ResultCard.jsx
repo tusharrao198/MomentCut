@@ -1384,6 +1384,31 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
 
                     <div>
                         <div className="flex items-center justify-between gap-2 mb-1.5">
+                            <label className="eyebrow">YOUTUBE DESCRIPTION</label>
+                            <button
+                                onClick={() => handleCopy(
+                                    'youtube-description',
+                                    aiThumbnailState?.youtube?.description || ''
+                                )}
+                                aria-label="copy youtube description"
+                                disabled={!aiThumbnailState?.youtube?.description}
+                                className="p-1 rounded-full text-muted hover:text-brass transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                                {copied === 'youtube-description'
+                                    ? <Check size={14} className="text-ok" />
+                                    : <Copy size={14} />}
+                            </button>
+                        </div>
+                        <p className="text-sm text-ink2 select-all break-words bg-paper rounded-input p-3 border border-rule whitespace-pre-wrap">
+                            {aiThumbnailState?.youtube?.description
+                                || (aiThumbnailState === null && !aiThumbnailError
+                                    ? 'Loading YouTube description…'
+                                    : 'No separate YouTube description was generated.')}
+                        </p>
+                    </div>
+
+                    <div>
+                        <div className="flex items-center justify-between gap-2 mb-1.5">
                             <label className="eyebrow">TIKTOK · IG CAPTION</label>
                             <button
                                 onClick={() => handleCopy('caption', clip.video_description_for_tiktok || clip.video_description_for_instagram)}

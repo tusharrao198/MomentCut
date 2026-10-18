@@ -218,7 +218,12 @@ four words. It is not the full YouTube title.
 The existing **detail** prompt, not the cheap scoring prompt, must request
 these extra fields for every selected clip:
 
-- `youtube_description_intro`: a truthful clip-specific opening paragraph;
+- `youtube_description_intro`: a truthful clip-specific opening paragraph of
+  2-4 complete sentences and roughly 45-90 words. It describes what happens,
+  the key action or payoff, and enough context for a cold viewer to understand
+  the clip. It must not invent game, mode, map, person, hardware, resolution,
+  frame-rate, or recording details that are not established by the transcript
+  or sampled frames;
 - `youtube_tags`: 5–15 distinct, specific plain tags without `#`;
 - `youtube_hashtags`: 3–5 relevant hashtags including `#shorts` when
   appropriate;

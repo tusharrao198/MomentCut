@@ -284,6 +284,7 @@ default. Point it at any OpenAI-compatible server instead:
 # .env
 LLM_BASE_URL=http://host.docker.internal:11434/v1   # Ollama on the host
 LLM_MODEL=qwen2.5:7b                                 # any chat model that follows instructions
+LLM_DETAIL_FALLBACK_WINDOWS=8                        # bounded recovery below the clip floor
 # LLM_API_KEY=...                                    # only if your server checks one (vLLM --api-key, OpenRouter)
 ```
 
@@ -307,15 +308,20 @@ and it does not fall back to Gemini if Ollama fails. See the
 [`Windows local-Ollama runbook`](docs/runbooks/local-ollama-windows-setup.md)
 for the complete configuration and operating steps, and the
 [`implementation design`](docs/architecture/local-ollama-vision.md) for the
-code architecture. Three things to know:
+code architecture. Five things to know:
 
-- **Context length.** A scoring call carries three transcript windows
-  (~2-3k tokens) and the detail call up to ten (~5k on a long podcast).
-  Ollama defaults to a 4096-token context and truncates silently, so run it
-  with `OLLAMA_CONTEXT_LENGTH=8192` (or set `num_ctx` in a Modelfile); raise
-  `LLM_SCORE_BATCH` above 3 only if your context allows it; local values above
-  8 are capped so malformed-output recovery cannot explode into hundreds of
-  calls. 7-8B models return valid JSON reliably, 3B ones do not.
+- **One-window local detail.** Scoring still compares three windows per local
+  call, but Qwen receives each shortlisted transcript window separately and
+  may return zero or one validated clip. OpenShorts then globally ranks the
+  compact candidates, removes overlaps and applies the duration-aware ceiling.
+  If overlap removal leaves the result below its floor, up to
+  `LLM_DETAIL_FALLBACK_WINDOWS` lower-ranked windows are checked one at a time.
+- **Context length.** A scoring call carries three transcript windows; detail
+  carries one window, and the final rank call carries compact excerpts only.
+  Ollama defaults GPUs below 24 GiB to a 4096-token context, so use
+  `OLLAMA_CONTEXT_LENGTH=8192` for this workflow. Raise `LLM_SCORE_BATCH` above
+  3 only if your context allows it; local values above 8 are capped. 7-8B
+  models return valid JSON more reliably than 3B ones.
 - **Silent footage.** Without `VISION_PROVIDER=ollama`, silent videos retain
   the original Gemini vision path and need a Gemini key. The local VLM path
   supports a maximum clip length of 60 seconds.
@@ -479,6 +485,7 @@ lives in [`examples/n8n/`](examples/n8n/).
 | `LLM_MODEL` | Model name on that server (default `llama3.1:8b`) |
 | `LLM_API_KEY` | Bearer token for that server, if it checks one |
 | `LLM_SCORE_BATCH` | Transcript windows per scoring call (default 3 local, 8 Gemini; local maximum 8) |
+| `LLM_DETAIL_FALLBACK_WINDOWS` | Lower-ranked transcript windows checked one-by-one only when local detail misses its floor (default 8, maximum 20) |
 | `VISION_PROVIDER` | Set to `ollama` to enable local visual selection for silent / wordless videos |
 | `VISION_BASE_URL` | Allow-listed local native Ollama endpoint (default `http://host.docker.internal:11434`) |
 | `VISION_MODEL` | Local visual model (default `qwen2.5vl:3b`) |

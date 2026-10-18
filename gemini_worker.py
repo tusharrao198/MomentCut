@@ -60,7 +60,13 @@ class DetailClipModel(BaseModel):
     # the dashboard. Defaulted so a small local model that skips it does not
     # fail schema validation and lose the clip.
     why: str = ""
-    youtube_description_intro: str = ""
+    youtube_description_intro: str = Field(
+        default="",
+        description=(
+            "A factual, clip-specific YouTube description of 2-4 complete "
+            "sentences and roughly 45-90 words, without hashtags or invented facts."
+        ),
+    )
     youtube_tags: list[str] = Field(default_factory=list)
     youtube_hashtags: list[str] = Field(default_factory=list)
     thumbnail_brief: ThumbnailBrief = Field(default_factory=ThumbnailBrief)
@@ -68,6 +74,34 @@ class DetailClipModel(BaseModel):
 
 class DetailResponse(BaseModel):
     shorts: List[DetailClipModel]
+
+
+class LocalWindowDetailClipModel(DetailClipModel):
+    """One local transcript-window result; ownership is set by the server."""
+    source_window_id: str = ""
+    predicted_score: int = 0
+    video_description_for_tiktok: str = ""
+    video_description_for_instagram: str = ""
+    video_title_for_youtube_short: str = ""
+    viral_hook_text: str = ""
+
+
+class LocalWindowDetailResponse(BaseModel):
+    """A local window can yield one grounded clip or no clip."""
+    clip: Optional[LocalWindowDetailClipModel] = None
+
+
+class LocalRankedCandidateModel(BaseModel):
+    candidate_id: str
+    # Reconciliation clamps this to 0..100. Keeping the transport schema
+    # permissive prevents one small-model arithmetic mistake from discarding
+    # an otherwise complete global ranking.
+    score: int
+    reason: str = ""
+
+
+class LocalClipRankResponse(BaseModel):
+    candidates: List[LocalRankedCandidateModel]
 
 
 # Visual (no-transcript) clip selection: Gemini watches a silent video and
@@ -82,7 +116,13 @@ class VisualClipModel(BaseModel):
     video_title_for_youtube_short: str
     viral_hook_text: str
     why: str = ""
-    youtube_description_intro: str = ""
+    youtube_description_intro: str = Field(
+        default="",
+        description=(
+            "A factual, clip-specific YouTube description of 2-4 complete "
+            "sentences and roughly 45-90 words, without hashtags or invented facts."
+        ),
+    )
     youtube_tags: list[str] = Field(default_factory=list)
     youtube_hashtags: list[str] = Field(default_factory=list)
     thumbnail_brief: ThumbnailBrief = Field(default_factory=ThumbnailBrief)
@@ -107,8 +147,14 @@ TIME CONTRACT — STRICT:
 - Cut on visual scene changes, never mid-motion.
 
 For each clip write catchy copy in {language} (a scroll-stopping hook, a TikTok
-and an Instagram description, and a YouTube title ≤100 chars). Order clips best
-to worst by how likely they are to stop a viewer scrolling.
+and an Instagram description, and a YouTube title ≤100 chars). Also write a
+truthful, clip-specific `youtube_description_intro` of 2-4 complete sentences
+and roughly 45-90 words. Describe what happens, the key action or payoff, and
+enough context for a cold viewer to understand the clip. Do not include
+hashtags, links, calls to action, or facts that are not visible in the video.
+Only name a game, mode, map, person, hardware, resolution, frame rate, or
+recording setting when the video itself clearly establishes it. Order clips
+best to worst by how likely they are to stop a viewer scrolling.
 """
 
 
@@ -365,9 +411,14 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
 - `predicted_score`: honest 0-100 estimate of viral potential.
 - `why`: one sentence, max 20 words, naming what makes THIS moment worth a
   clip — the specific hook, claim, number or payoff, not the topic.
-- `youtube_description_intro`: a truthful, clip-specific opening paragraph.
+- `youtube_description_intro`: 2-4 complete sentences, roughly 45-90 words,
+  forming a truthful, clip-specific opening paragraph. Describe what happens,
+  the key action or payoff, and enough context for a cold viewer to understand
+  the moment. Do not pad it with generic phrases or repeat the same point.
   Do not include hashtags, links, channel calls to action, playlists, music
-  credits, or facts outside the candidate-window transcript.
+  credits, or facts outside the candidate-window transcript. Only mention a
+  game, mode, map, person, hardware, resolution, frame rate, or recording
+  setting when the transcript explicitly establishes it.
 - `youtube_tags`: 5-15 distinct specific plain tags without `#`, as a JSON
   array. They must be grounded in this clip's transcript, not generic spam.
 - `youtube_hashtags`: 3-5 relevant hashtag strings as a JSON array; include
@@ -396,7 +447,7 @@ Return only:
       "video_title_for_youtube_short": "<title max 100 chars>",
       "viral_hook_text": "<short overlay max 10 words>",
       "why": "<one sentence, max 20 words>",
-      "youtube_description_intro": "<truthful clip-specific opening paragraph>",
+      "youtube_description_intro": "<2-4 factual sentences, roughly 45-90 words, describing this clip and its payoff>",
       "youtube_tags": ["<specific plain tag>", "..."],
       "youtube_hashtags": ["#shorts", "..."],
       "thumbnail_brief": {{
@@ -409,6 +460,110 @@ Return only:
         "must_include": ["<visual fact>"],
         "avoid": ["<unrelated visual>"]
       }}
+    }}
+  ]
+}}
+"""
+
+
+LOCAL_WINDOW_DETAIL_PROMPT_TEMPLATE = """
+You are a senior short-form video editor and viral copywriter.
+Evaluate exactly ONE transcript window. Return either its ONE strongest
+standalone short clip, or null when this window has no publishable moment.
+
+CLIP RULES:
+- Return only valid JSON.
+- The clip must be {min_secs:g} to {max_secs:g} seconds long, in absolute
+  seconds from the source video.
+- It must stay inside {window_start:g} to {window_end:g} seconds.
+- Open on the strongest understandable sentence; do not begin on a dangling
+  pronoun, answer, or continuation that needs earlier context.
+- End after the payoff. Do not pad a weak moment merely to return a clip.
+- `predicted_score` is an honest integer from 0 to 100.
+- All text fields must be written in TRANSCRIPT_LANGUAGE ({language}).
+- TikTok and Instagram descriptions are 1-2 punchy sentences followed by
+  3-5 relevant hashtags.
+- The YouTube title is at most 100 characters and makes no unsupported claim.
+- `viral_hook_text` is at most 10 words and names this exact moment.
+- `why` is one sentence of at most 20 words.
+- `youtube_description_intro` is 2-4 factual sentences, roughly 45-90 words,
+  explaining the moment and payoff to a cold viewer. Do not include hashtags,
+  links, calls to action, or facts absent from this transcript window.
+- `youtube_tags` contains 5-15 distinct specific strings without `#`.
+- `youtube_hashtags` contains 3-5 relevant hashtag strings.
+- `thumbnail_brief` stays grounded in this transcript. Never invent a game,
+  movie, person, hardware specification, result, or event.
+{correction}
+
+TRANSCRIPT_LANGUAGE: {language}
+VIDEO_DURATION_SECONDS: {video_duration}
+WINDOW_ID: {window_id}
+WINDOW_START_SECONDS: {window_start}
+WINDOW_END_SECONDS: {window_end}
+WINDOW_TRANSCRIPT:
+{window_text}
+
+Return only:
+{{
+  "clip": null
+}}
+
+or:
+
+{{
+  "clip": {{
+    "start": <number>,
+    "end": <number>,
+    "predicted_score": <integer 0-100>,
+    "video_description_for_tiktok": "<description + hashtags>",
+    "video_description_for_instagram": "<description + hashtags>",
+    "video_title_for_youtube_short": "<title max 100 chars>",
+    "viral_hook_text": "<short overlay max 10 words>",
+    "why": "<one sentence, max 20 words>",
+    "youtube_description_intro": "<2-4 factual sentences, roughly 45-90 words>",
+    "youtube_tags": ["<specific plain tag>", "..."],
+    "youtube_hashtags": ["#shorts", "..."],
+    "thumbnail_brief": {{
+      "subject": "<concrete subject>",
+      "moment": "<exact moment>",
+      "emotion": "<emotion>",
+      "visual_style": "<visual style>",
+      "composition": "<composition>",
+      "thumbnail_text": "<2-4 word overlay>",
+      "must_include": ["<grounded visual fact>"],
+      "avoid": ["<unrelated visual>"]
+    }}
+  }}
+}}
+"""
+
+
+LOCAL_CLIP_RANK_PROMPT_TEMPLATE = """
+You are the final editor choosing among independently extracted short clips.
+Rank EVERY candidate globally against every other candidate.
+
+Rules:
+- Return exactly one entry for every candidate_id supplied.
+- Never invent, omit, or duplicate a candidate_id.
+- `score` is an integer from 0 to 100 and should use the full range.
+- Prefer a strong first two seconds, a self-contained idea, a clear payoff,
+  specificity, emotion, surprise, and replay value.
+- Penalize clips that need missing context, repeat another candidate's point,
+  or end before the payoff.
+- Judge the clip transcript and moment, not the writing quality of its title.
+- Return only valid JSON.
+
+TRANSCRIPT_LANGUAGE: {language}
+CANDIDATES_JSON:
+{candidates_json}
+
+Return only:
+{{
+  "candidates": [
+    {{
+      "candidate_id": "<supplied candidate id>",
+      "score": <integer 0-100>,
+      "reason": "<short comparison-based reason>"
     }}
   ]
 }}
@@ -479,12 +634,77 @@ def validate_local_response_items(payload, schema, *, allow_empty=False):
     the score/detail/visual-selection schemas, retain each independently valid
     item and let the caller decide whether an empty response is meaningful.
     """
+    if schema is LocalWindowDetailResponse:
+        if not isinstance(payload, dict):
+            raise ModelResponseError("Model response was not a JSON object.")
+        raw_clip = payload.get("clip")
+        if raw_clip is None:
+            return schema.model_validate({"clip": None}).model_dump()
+        if not isinstance(raw_clip, dict):
+            raise ModelResponseError("Model response 'clip' was not an object or null.")
+
+        # Boundaries are the only irreplaceable local detail output. A small
+        # model must not lose a valid cut merely because optional publishing
+        # copy has the wrong primitive type.
+        clip = dict(raw_clip)
+        for key in (
+            "source_window_id",
+            "video_description_for_tiktok",
+            "video_description_for_instagram",
+            "video_title_for_youtube_short",
+            "viral_hook_text",
+            "why",
+            "youtube_description_intro",
+        ):
+            if not isinstance(clip.get(key), str):
+                clip[key] = ""
+        try:
+            score = int(round(float(clip.get("predicted_score", 0))))
+        except (TypeError, ValueError, OverflowError):
+            score = 0
+        clip["predicted_score"] = min(100, max(0, score))
+        for key in ("youtube_tags", "youtube_hashtags"):
+            value = clip.get(key)
+            if isinstance(value, str):
+                value = [value]
+            clip[key] = [item for item in (value or []) if isinstance(item, str)] \
+                if isinstance(value, list) else []
+        brief = clip.get("thumbnail_brief")
+        if not isinstance(brief, dict):
+            brief = {}
+        brief = dict(brief)
+        for key in (
+            "subject",
+            "moment",
+            "emotion",
+            "visual_style",
+            "composition",
+            "thumbnail_text",
+        ):
+            if not isinstance(brief.get(key), str):
+                brief[key] = ""
+        for key in ("must_include", "avoid"):
+            value = brief.get(key)
+            if isinstance(value, str):
+                value = [value]
+            brief[key] = [item for item in (value or []) if isinstance(item, str)] \
+                if isinstance(value, list) else []
+        clip["thumbnail_brief"] = brief
+        try:
+            return schema.model_validate({"clip": clip}).model_dump()
+        except ValidationError as error:
+            raise ModelResponseError(
+                "Local detail response did not contain valid clip boundaries."
+            ) from error
+
     if schema is ScoreResponse:
         key, item_schema = "windows", ScoredWindowModel
     elif schema is DetailResponse:
         key, item_schema = "shorts", DetailClipModel
     elif schema is VisualResponse:
         key, item_schema = "shorts", VisualClipModel
+    elif schema is LocalClipRankResponse:
+        key, item_schema = "candidates", LocalRankedCandidateModel
     else:
         # This helper is deliberately narrow: other schemas do not use the
         # local transcript model and must retain their original strict shape.
@@ -500,10 +720,11 @@ def validate_local_response_items(payload, schema, *, allow_empty=False):
             return schema.model_validate({key: []}).model_dump()
         raise ModelResponseError(f"Model response did not contain any '{key}' items.")
 
-    try:
-        return schema.model_validate(payload).model_dump()
-    except ValidationError:
-        pass
+    if schema is not LocalClipRankResponse:
+        try:
+            return schema.model_validate(payload).model_dump()
+        except ValidationError:
+            pass
 
     valid_items = []
     for item in raw_items:
@@ -521,8 +742,15 @@ def validate_local_response_items(payload, schema, *, allow_empty=False):
                     "id": item.get("id"),
                     "score": item.get("score"),
                 }
+            elif schema is LocalClipRankResponse and isinstance(item, dict):
+                # Small local models occasionally overshoot the requested
+                # 0..100 range. Normalize that arithmetic mistake here so one
+                # otherwise useful ranking entry is not discarded.
+                item = dict(item)
+                score = int(round(float(item.get("score"))))
+                item["score"] = min(100, max(0, score))
             valid_items.append(item_schema.model_validate(item).model_dump())
-        except ValidationError:
+        except (ValidationError, TypeError, ValueError, OverflowError):
             # A single malformed model item must not discard the rest.
             continue
 

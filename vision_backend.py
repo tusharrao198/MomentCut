@@ -515,14 +515,20 @@ TIME CONTRACT — STRICT:
 Write all metadata in {language}. `video_title_for_youtube_short` is at most
 100 characters. For every selected clip also return:
 - `why`: one short factual reason this exact visual moment is compelling.
-- `youtube_description_intro`: a truthful clip-specific opening paragraph.
+- `youtube_description_intro`: 2-4 complete sentences, roughly 45-90 words,
+  forming a truthful clip-specific opening paragraph. Describe what visibly
+  happens, the key action or payoff, and enough context for a cold viewer to
+  understand the moment. Do not pad it with generic phrases or repeat the same
+  point. Only mention a game, mode, map, person, hardware, resolution, frame
+  rate, or recording setting when the sampled frames clearly establish it.
 - `youtube_tags`: 5-15 specific plain tags without `#`, as a JSON array.
 - `youtube_hashtags`: 3-5 relevant hashtags (include #shorts when appropriate).
 - `thumbnail_brief`: an object with subject, moment, emotion, visual_style,
   composition, thumbnail_text, must_include, and avoid. Keep it grounded in
   visible frames; do not invent game, movie, people, or event names.
-Do not put hashtags inside youtube_description_intro. Return only JSON matching
-the supplied schema, with no prose.
+Do not put hashtags, links, or calls to action inside
+youtube_description_intro. Return only JSON matching the supplied schema, with
+no prose.
 """.strip()
 
 

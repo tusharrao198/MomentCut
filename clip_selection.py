@@ -166,6 +166,64 @@ def trim_to_best(shorts, max_clips):
     return [item for _, item in sorted(best, key=lambda pair: pair[0])]
 
 
+def apply_global_candidate_ranking(candidates, rankings):
+    """Apply one comparative ranking response without losing valid clips.
+
+    Local detail calls judge windows independently, so their scores are not
+    directly comparable. The final local call receives compact summaries and
+    returns globally calibrated scores. Unknown ids are ignored, duplicate ids
+    keep their highest score, and omitted ids retain their independent score so
+    a partially malformed ranking cannot discard already validated work.
+
+    The returned list is best-first. Callers may take their desired ceiling and
+    then restore transcript order for rendering.
+    """
+    canonical = []
+    by_id = {}
+    for index, candidate in enumerate(candidates or []):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = candidate.get("_candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id or candidate_id in by_id:
+            continue
+        entry = dict(candidate)
+        by_id[candidate_id] = (index, entry)
+        canonical.append(candidate_id)
+
+    ranked_scores = {}
+    ranked_reasons = {}
+    for ranking in rankings or []:
+        if not isinstance(ranking, dict):
+            continue
+        candidate_id = ranking.get("candidate_id")
+        if candidate_id not in by_id:
+            continue
+        score = _finite_number(ranking.get("score"))
+        if score is None:
+            continue
+        score = min(100, max(0, int(round(score))))
+        if candidate_id not in ranked_scores or score > ranked_scores[candidate_id]:
+            ranked_scores[candidate_id] = score
+            ranked_reasons[candidate_id] = str(ranking.get("reason") or "")
+
+    output = []
+    for candidate_id in canonical:
+        index, entry = by_id[candidate_id]
+        fallback = _finite_number(entry.get("predicted_score"))
+        fallback = min(100, max(0, int(round(fallback or 0))))
+        entry["predicted_score"] = ranked_scores.get(candidate_id, fallback)
+        if candidate_id in ranked_reasons:
+            entry["global_rank_reason"] = ranked_reasons[candidate_id]
+        output.append((index, entry))
+
+    return [
+        entry for _, entry in sorted(
+            output,
+            key=lambda pair: (-float(pair[1].get("predicted_score") or 0), pair[0]),
+        )
+    ]
+
+
 def clip_duration_bounds():
     """The clip length band (seconds) the selection prompts and word-snapping
     enforce. ``CLIP_MIN_SECONDS`` / ``CLIP_MAX_SECONDS`` override the classic
@@ -422,6 +480,49 @@ def dedupe_overlapping(shorts, ratio=0.25):
         if not clash:
             kept.append((idx, clip))
     return [c for _, c in sorted(kept, key=lambda p: p[0])]
+
+
+def dedupe_ranked_with_floor(candidates, min_clips, ratio=0.25):
+    """Dedupe global rankings without collapsing an already-reached floor.
+
+    Independent window scores can prefer two distinct clips A and C, while a
+    global model prefers overlapping middle clip B, which clashes with both.
+    A score-greedy dedupe would then turn two valid clips into one. Use global
+    scores normally, but if that drops below the floor, reuse the independent
+    score choices and keep their globally updated metadata/scores.
+    """
+    global_choice = dedupe_overlapping(candidates, ratio=ratio)
+    try:
+        floor = max(1, int(min_clips or 1))
+    except (TypeError, ValueError):
+        floor = 1
+    if len(global_choice) >= floor:
+        return global_choice, False
+
+    independent_pool = []
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        copy = dict(candidate)
+        copy["predicted_score"] = copy.get(
+            "_detail_predicted_score",
+            copy.get("predicted_score"),
+        )
+        independent_pool.append(copy)
+    independent_choice = dedupe_overlapping(independent_pool, ratio=ratio)
+    if len(independent_choice) <= len(global_choice):
+        return global_choice, False
+
+    globally_ranked = {
+        candidate.get("_candidate_id"): candidate
+        for candidate in candidates or []
+        if isinstance(candidate, dict) and candidate.get("_candidate_id")
+    }
+    recovered = [
+        globally_ranked.get(candidate.get("_candidate_id"), candidate)
+        for candidate in independent_choice
+    ]
+    return recovered, True
 
 
 def snap_clip_to_words(start, end, words, video_duration,

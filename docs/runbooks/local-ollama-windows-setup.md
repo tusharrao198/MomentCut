@@ -111,7 +111,12 @@ GPU memory at a time:
 
 These are **Windows user environment variables**, not entries in OpenShorts'
 `.env`. Quit Ollama completely from the system tray and start it again after
-setting them.
+setting them. For the 12 GB RTX 5070 Ti, keep `8192` as the normal setting.
+`16384` is a reasonable troubleshooting experiment only if a measured prompt
+still exceeds 8192 and `ollama ps` continues to show `100% GPU`. Do not use
+32768 or the model's 128K long-context ceiling for this workflow: they consume
+more KV-cache memory without helping one-window clip selection and can push
+work onto CPU.
 
 Confirm that Ollama is serving locally:
 
@@ -136,6 +141,9 @@ LLM_API_KEY=
 # Keep this at 3 for qwen2.5:7b. Local values above 8 are capped so a malformed
 # response cannot expand into hundreds of recursive recovery calls.
 LLM_SCORE_BATCH=3
+# If the top shortlist misses its duration-aware clip floor, inspect at most
+# eight lower-ranked windows individually. The code hard-caps this at 20.
+LLM_DETAIL_FALLBACK_WINDOWS=8
 LLM_TIMEOUT=600
 
 # Silent / wordless videos: timestamped frame samples -> local vision model.
@@ -267,7 +275,18 @@ Silent video — analyzing with local Ollama vision
 ```
 
 For a talking source, look for the normal local text-model analysis log. It
-should not load the vision model.
+should not load the vision model. The expected selection sequence is:
+
+```text
+Whisper transcript
+  -> score transcript windows in batches of 3
+  -> shortlist the best windows
+  -> ask Qwen for zero-or-one clip from each window
+  -> validate each result immediately
+  -> check bounded fallback windows only if below the clip floor
+  -> globally rank compact valid candidates
+  -> remove overlaps and render the winners
+```
 
 ## 7. Confirm GPU use and memory release
 
@@ -320,6 +339,8 @@ shutdown.
 | `CLIP_MAX_SECONDS up to 60` error | Set `CLIP_MAX_SECONDS=60` or remove it if it was overridden. |
 | GPU out-of-memory | Keep `MAX_CONCURRENT_JOBS=1`, `ASR_GPU_CONCURRENCY=1`, `OLLAMA_NUM_PARALLEL=1`, and `OLLAMA_MAX_LOADED_MODELS=1`. Close other GPU-heavy apps. |
 | `request ... exceeds the available context size` | Use the conservative profile above: 4 frames, 480 px maximum JPEG longest edge, and `VISION_NUM_CTX=8192`; recreate the OpenShorts backend after changing `.env`. |
+| Spoken-video Qwen context error | Confirm the Windows host has `OLLAMA_CONTEXT_LENGTH=8192`, quit/restart Ollama, keep `LLM_SCORE_BATCH=3`, and verify `ollama ps` reports context 8192 and `100% GPU`. One-window detail should not need 16384 under normal use. |
+| Talking video returns too few clips | Look for `detail-window`, `detail-fallback`, and `Globally ranked` messages. A null window is a legitimate rejection; invalid timestamps receive one correction. Increase `LLM_DETAIL_FALLBACK_WINDOWS` only after confirming the top windows genuinely return too few candidates. |
 | Silent job fails after retry attempts | This is an Ollama transport/server/model/context problem and fails the job deliberately. Check Ollama is running, `ollama list` includes `qwen2.5vl:3b`, and keep the conservative image/context settings. |
 | `Local Ollama vision returned no usable clip candidates` | OpenShorts skipped any individual frame-decode or twice-malformed response window and tried the remaining windows. The final error includes up to three named diagnostics. It means every window was skipped, empty, or produced no valid 15–60 second visual candidate. |
 | `VISION_WINDOW_SECONDS` / `VISION_WINDOW_OVERLAP_SECONDS` configuration error | Restore the 120/60 defaults. The settings must leave a 15-second step and preserve a full maximum-length clip in one window. |

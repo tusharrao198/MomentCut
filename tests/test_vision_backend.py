@@ -75,6 +75,26 @@ def test_visual_response_allows_explicit_empty_candidate_list():
     ) == {"shorts": []}
 
 
+def test_visual_prompt_requests_detailed_grounded_youtube_description():
+    prompt = vision._visual_prompt(
+        window_start=0,
+        window_end=120,
+        source_duration=300,
+        language="English",
+        min_seconds=15,
+        max_seconds=60,
+        frame_timestamps=[0, 30, 60, 90],
+        scene_boundaries=[45],
+        min_clips=1,
+        max_clips=3,
+        candidates_per_window=2,
+    )
+
+    assert "2-4 complete sentences, roughly 45-90 words" in prompt
+    assert "sampled frames clearly establish it" in prompt
+    assert "hashtags, links, or calls to action" in prompt
+
+
 def test_rejects_remote_endpoint_before_any_http(monkeypatch):
     monkeypatch.setenv("VISION_PROVIDER", "ollama")
     monkeypatch.setenv("VISION_BASE_URL", "https://example.com")
