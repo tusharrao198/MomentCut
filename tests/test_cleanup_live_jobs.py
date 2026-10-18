@@ -27,6 +27,9 @@ def disk(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "THUMBNAILS_DIR", str(out / "thumbnails"))
     monkeypatch.setattr(app_module, "JOB_RETENTION_SECONDS", 3600)
     monkeypatch.setattr(app_module, "_running_jobs", set())
+    monkeypatch.setattr(app_module, "_job_activity_counts", {})
+    monkeypatch.setattr(app_module, "_postiz_publish_locks", {})
+    monkeypatch.setattr(app_module, "_clip_thumbnail_locks", {})
     monkeypatch.setattr(app_module, "jobs", {})
     return out, up
 
@@ -104,6 +107,41 @@ class TestJobDirSweep:
         app_module._enforce_output_size_cap()
         assert live.exists() and not dead.exists()
 
+    def test_secondary_activity_lease_pins_completed_job(self, disk):
+        out, _ = disk
+        job = _job_dir(out, "postiz-upload")
+        app_module.jobs["postiz-upload"] = {"status": "completed"}
+
+        async def sweep_while_pinned():
+            async with app_module._job_activity_lease("postiz-upload"):
+                app_module._sweep_expired_job_dirs(time.time())
+                assert job.exists()
+                assert app_module._job_is_active("postiz-upload") is True
+
+        asyncio.run(sweep_while_pinned())
+        assert app_module._job_is_active("postiz-upload") is False
+        app_module._sweep_expired_job_dirs(time.time())
+        assert not job.exists()
+
+    def test_held_secondary_lock_pins_job_and_idle_locks_are_forgotten(self, disk):
+        out, _ = disk
+        job = _job_dir(out, "thumbnail-state")
+        app_module.jobs["thumbnail-state"] = {"status": "completed"}
+        async def sweep_around_lock():
+            lock = await app_module._clip_thumbnail_lock("thumbnail-state", 0)
+            await lock.acquire()
+            try:
+                app_module._sweep_expired_job_dirs(time.time())
+                assert job.exists()
+            finally:
+                lock.release()
+
+        asyncio.run(sweep_around_lock())
+        app_module._sweep_expired_job_dirs(time.time())
+
+        assert not job.exists()
+        assert not any(key[0] == "thumbnail-state"
+                       for key in app_module._clip_thumbnail_locks)
 
 class TestUploadSweep:
     def test_source_of_queued_job_survives(self, disk):

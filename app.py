@@ -1611,12 +1611,47 @@ def _dir_size(path: str) -> int:
 # first). A manifest pins its dir for at most this long, so one nobody will
 # ever resume cannot keep a directory on disk forever.
 ACTIVE_JOB_MAX_SECONDS = int(os.environ.get("ACTIVE_JOB_MAX_SECONDS", str(24 * 3600)))
+_job_activity_counts: Dict[str, int] = {}
+_job_activity_counts_lock = threading.Lock()
+
+
+@asynccontextmanager
+async def _job_activity_lease(job_id: str):
+    """Pin a completed job while a secondary operation still needs its files.
+
+    Clip generation already has queue/running state that protects it from the
+    cleanup sweeps. Postiz uploads and AI-thumbnail requests happen after that
+    state is terminal, so they need an explicit short-lived lease.
+    """
+    with _job_activity_counts_lock:
+        _job_activity_counts[job_id] = _job_activity_counts.get(job_id, 0) + 1
+    try:
+        yield
+    finally:
+        with _job_activity_counts_lock:
+            remaining = _job_activity_counts.get(job_id, 0) - 1
+            if remaining > 0:
+                _job_activity_counts[job_id] = remaining
+            else:
+                _job_activity_counts.pop(job_id, None)
 
 
 def _job_is_active(job_id, now=None) -> bool:
     """True while a job is queued or running here, or its resume manifest says
     it has not reached a terminal state yet (the other instance's jobs during a
     handover included). The disk sweeps must never touch such a job."""
+    with _job_activity_counts_lock:
+        if _job_activity_counts.get(job_id, 0) > 0:
+            return True
+    # Short state operations use per-clip asyncio locks rather than a lease.
+    # Treat a held lock as active so a cleanup tick cannot remove its files.
+    for lock_map_name in ("_postiz_publish_locks", "_clip_thumbnail_locks"):
+        lock_map = globals().get(lock_map_name, {})
+        if any(
+            key[0] == job_id and lock.locked()
+            for key, lock in tuple(lock_map.items())
+        ):
+            return True
     if job_id in _running_jobs:
         return True
     if (jobs.get(job_id) or {}).get('status') in ('queued', 'processing'):
@@ -1652,6 +1687,7 @@ def _sweep_expired_job_dirs(now):
         print(f"🧹 Purging old job: {job_id}")
         shutil.rmtree(job_path, ignore_errors=True)
         jobs.pop(job_id, None)
+        _forget_job_secondary_locks(job_id)
 
 
 def _sweep_expired_uploads(now):
@@ -1727,6 +1763,7 @@ def _enforce_output_size_cap():
         size = _dir_size(path)
         shutil.rmtree(path, ignore_errors=True)
         jobs.pop(job_id, None)
+        _forget_job_secondary_locks(job_id)
         used -= size
         print(f"🧹 Size cap: purged {job_id} ({size / 1024**2:.0f} MB)")
 
@@ -2419,6 +2456,7 @@ def _purge_local_jobs_for_user(user_id) -> int:
     for job_id in job_ids:
         _rm_under(OUTPUT_DIR, job_id)
         jobs.pop(job_id, None)
+        _forget_job_secondary_locks(job_id)
         # Source uploads are named "<job_id>_<filename>" (see /api/process).
         for path in glob.glob(os.path.join(UPLOAD_DIR, f"{glob.escape(job_id)}_*")):
             try:
@@ -5661,6 +5699,14 @@ _clip_thumbnail_generation_gate = asyncio.BoundedSemaphore(
 _clip_thumbnail_generation_gate_guard = asyncio.Lock()
 
 
+def _forget_job_secondary_locks(job_id: str) -> None:
+    """Discard idle per-clip locks after their job directory is purged."""
+    for lock_map in (_postiz_publish_locks, _clip_thumbnail_locks):
+        for key, lock in tuple(lock_map.items()):
+            if key[0] == job_id and not lock.locked():
+                lock_map.pop(key, None)
+
+
 class PostizStateError(RuntimeError):
     """A local publish-state problem that must fail closed to avoid duplicates."""
 
@@ -6624,7 +6670,8 @@ async def _post_to_postiz(
 @app.post("/api/postiz/publish")
 async def post_to_postiz(req: PostizPublishRequest, request: Request):
     """Send the selected current MP4 to the one configured Postiz YouTube account."""
-    return await _post_to_postiz(req, request)
+    async with _job_activity_lease(req.job_id):
+        return await _post_to_postiz(req, request)
 
 
 @app.post("/api/postiz/publish-thumbnail")
@@ -6639,15 +6686,16 @@ async def post_to_postiz_with_thumbnail(
     _require_local_dashboard_origin(request)
     try:
         selected_thumbnail = await _read_postiz_thumbnail(thumbnail)
-        return await _post_to_postiz(
-            PostizPublishRequest(
-                job_id=job_id,
-                clip_index=clip_index,
-                force_resend=force_resend,
-            ),
-            request,
-            selected_thumbnail,
-        )
+        async with _job_activity_lease(job_id):
+            return await _post_to_postiz(
+                PostizPublishRequest(
+                    job_id=job_id,
+                    clip_index=clip_index,
+                    force_resend=force_resend,
+                ),
+                request,
+                selected_thumbnail,
+            )
     finally:
         await thumbnail.close()
 
