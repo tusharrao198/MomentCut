@@ -34,6 +34,10 @@ class LocalVisionError(RuntimeError):
     """A local vision configuration, decoding, Ollama, or validation error."""
 
 
+class _RecoverableWindowError(LocalVisionError):
+    """A malformed local-model response affecting one analysis window only."""
+
+
 _ALLOWED_HOSTS = {
     "host.docker.internal",
     "127.0.0.1",
@@ -447,7 +451,9 @@ def _parse_visual_response(response: httpx.Response) -> dict:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Ollama response did not contain message.content.")
     parsed = gemini_worker._parse_json_response_text(content)
-    return gemini_worker.VisualResponse.model_validate(parsed).model_dump()
+    return gemini_worker.validate_local_response_items(
+        parsed, gemini_worker.VisualResponse, allow_empty=True
+    )
 
 
 def _window_response(client: httpx.Client, config: VisionConfig, prompt: str,
@@ -472,7 +478,7 @@ def _window_response(client: httpx.Client, config: VisionConfig, prompt: str,
             return _parse_visual_response(response)
         except Exception as exc:
             if attempt == 1:
-                raise LocalVisionError(
+                raise _RecoverableWindowError(
                     f"{label}: local Ollama returned invalid structured JSON "
                     f"after one correction attempt ({type(exc).__name__}: {exc})."
                 ) from exc
@@ -548,8 +554,12 @@ def _normalise_window_shorts(raw_shorts: Sequence[dict], *, window_start: float,
             end = min(window_end, end)
             if not min_seconds <= end - start <= max_seconds:
                 continue
+            window_boundaries = [
+                boundary for boundary in scene_boundaries
+                if window_start <= boundary <= window_end
+            ]
             start, end = _snap_to_scenes(
-                start, end, scene_boundaries, min_seconds, max_seconds, snap_seconds)
+                start, end, window_boundaries, min_seconds, max_seconds, snap_seconds)
 
         title = _text(raw.get("video_title_for_youtube_short"), 100)
         tiktok = _text(raw.get("video_description_for_tiktok"), 500)
@@ -627,15 +637,18 @@ def select_clips(video_path: str, video_duration: float, language: str,
         raise LocalVisionError("Local vision could not open the source video.")
     probe.release()
 
+    windows = _analysis_windows(
+        duration, config.window_seconds, config.overlap_seconds
+    )
     timeout = httpx.Timeout(config.timeout_seconds)
     with _client(timeout=timeout) as client:
         try:
             _preflight_model(client, config)
             scene_boundaries = _scene_boundaries(video_path, duration)
             all_candidates: list[dict] = []
+            diagnostics: list[str] = []
 
-            for window_start, window_end in _analysis_windows(
-                    duration, config.window_seconds, config.overlap_seconds):
+            for window_start, window_end in windows:
                 label = (f"Local vision window {window_start:.3f}s–"
                          f"{window_end:.3f}s")
                 sample_times = _sample_times(
@@ -645,12 +658,18 @@ def select_clips(video_path: str, video_duration: float, language: str,
                     frame_timestamps, images = _decode_samples(
                         video_path, duration, sample_times, config.max_frame_width)
                 except LocalVisionError as exc:
-                    raise LocalVisionError(f"{label}: {exc}") from exc
+                    detail = f"{label}: frame decode failed ({exc})"
+                    diagnostics.append(detail)
+                    print(f"   ⚠️ {detail}; skipping this window.")
+                    continue
                 except Exception as exc:
-                    raise LocalVisionError(
-                        f"{label}: local frame decoding failed "
-                        f"({type(exc).__name__}: {exc})."
-                    ) from exc
+                    detail = (
+                        f"{label}: frame decode failed "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                    diagnostics.append(detail)
+                    print(f"   ⚠️ {detail}; skipping this window.")
+                    continue
                 prompt = _visual_prompt(
                     window_start=window_start,
                     window_end=window_end,
@@ -664,7 +683,15 @@ def select_clips(video_path: str, video_duration: float, language: str,
                     max_clips=max_clips,
                     candidates_per_window=config.candidates_per_window,
                 )
-                response = _window_response(client, config, prompt, images, label)
+                try:
+                    response = _window_response(
+                        client, config, prompt, images, label
+                    )
+                except _RecoverableWindowError as exc:
+                    detail = str(exc)
+                    diagnostics.append(detail)
+                    print(f"   ⚠️ {detail}; skipping this window.")
+                    continue
                 candidates = _normalise_window_shorts(
                     response.get("shorts") or [],
                     window_start=window_start,
@@ -682,6 +709,9 @@ def select_clips(video_path: str, video_duration: float, language: str,
                     # contribute candidates. Transport, decoding, and schema
                     # failures still fail immediately above; only a valid but
                     # empty/invalid candidate list is non-fatal here.
+                    diagnostics.append(
+                        f"{label}: local Ollama returned no usable clip candidates."
+                    )
                     print(
                         f"   ⚠️ {label}: local Ollama returned no usable clip "
                         "candidates; skipping this window."
@@ -698,7 +728,19 @@ def select_clips(video_path: str, video_duration: float, language: str,
     )[:max_clips]
     shorts = sorted((clip for _, clip in ranked), key=lambda clip: clip["start"])
     if not shorts:
-        raise LocalVisionError("Local Ollama vision returned no usable clip candidates.")
+        diagnostics_text = ""
+        if diagnostics:
+            shown = diagnostics[:3]
+            diagnostics_text = (
+                f" {len(diagnostics)} window(s) were skipped: "
+                + " | ".join(shown)
+            )
+            if len(diagnostics) > len(shown):
+                diagnostics_text += f" | … {len(diagnostics) - len(shown)} more"
+        raise LocalVisionError(
+            "Local Ollama vision returned no usable clip candidates after "
+            f"{len(windows)} analysis window(s).{diagnostics_text}"
+        )
     if len(shorts) < min_clips:
         print(f"   ⚠️ Local vision found {len(shorts)} usable clip(s), below the "
               f"requested target of {min_clips}.")
