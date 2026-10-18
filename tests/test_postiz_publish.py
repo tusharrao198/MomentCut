@@ -250,7 +250,11 @@ def test_postiz_publish_uses_selected_ai_thumbnail(postiz_job, monkeypatch):
     candidate_id = "a" * 32
     root = app_module._clip_thumbnail_root(JOB_ID, 0, fingerprint)
     image = Image.new("RGB", (8, 8), color=(1, 2, 3))
-    image.save(root / f"candidate-{candidate_id}.jpg", "JPEG")
+    candidate_name = f"candidate-{candidate_id}.jpg"
+    output = io.BytesIO()
+    image.save(output, "JPEG")
+    candidate_content = output.getvalue()
+    (root / candidate_name).write_bytes(candidate_content)
     app_module._write_clip_thumbnail_state(
         job_dir / app_module.CLIP_THUMBNAIL_STATE_FILE,
         {
@@ -264,7 +268,8 @@ def test_postiz_publish_uses_selected_ai_thumbnail(postiz_job, monkeypatch):
                             "state": "completed",
                             "candidates": [{
                                 "id": candidate_id,
-                                "filename": f"candidate-{candidate_id}.jpg",
+                                "filename": candidate_name,
+                                "sha256": hashlib.sha256(candidate_content).hexdigest(),
                             }],
                         },
                     },
