@@ -19,6 +19,7 @@ import numpy as np
 from tqdm import tqdm
 import yt_dlp
 import mediapipe as mp
+import httpx
 # import whisper (replaced by faster_whisper inside function)
 from google import genai
 from google.genai import types as genai_types
@@ -1926,11 +1927,14 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
-            transient = any(tok in msg for tok in (
+            # Real httpx exception strings vary by OS and version (for
+            # example "All connection attempts failed"), so classify their
+            # type rather than relying only on a hand-written text list.
+            transient = isinstance(e, httpx.TransportError) or any(tok in msg for tok in (
                 '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
                 '500', 'INTERNAL', 'overloaded', 'Deadline',
                 'empty response body', 'did not contain a JSON object',
-                'Failed to parse Gemini JSON response',
+                'Failed to parse model JSON response',
                 # OpenAI-compatible servers: model still loading, busy, or a
                 # small model that skipped a required field this time.
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
@@ -1943,8 +1947,28 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             time.sleep(wait)
 
 
+def _stage_provider_label():
+    """Human-readable provider name for transcript-selection logs."""
+    return "local LLM" if llm_backend.active() else "Gemini"
+
+
+def _is_local_malformed_response_error(error):
+    """Whether a local model answered malformed JSON/schema data.
+
+    Only model-output failures can benefit from splitting the input. Transport,
+    server-status, context-window and configuration failures must surface as
+    fatal errors instead of being disguised as a bad transcript window.
+    """
+    if not llm_backend.active():
+        return False
+    if isinstance(error, gemini_worker.ModelResponseError):
+        return True
+    return type(error).__module__.startswith("pydantic") and \
+        type(error).__name__ == "ValidationError"
+
+
 def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs, label):
-    """Run a Gemini stage over ``items``; on a policy block, bisect.
+    """Run a transcript selection stage over ``items``; isolate bad subsets.
 
     Google's prompt filter (PROHIBITED_CONTENT) fires on some COMBINATIONS of
     transcript windows that pass individually (27-aug-2026: windows 5+6 of a
@@ -1952,6 +1976,9 @@ def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs
     A block is deterministic for a given prompt, so instead of failing the
     job the batch is split in halves until the offending combination is
     isolated; a single item that still blocks is dropped with a log line.
+    Local models can similarly return malformed JSON/schema output for a large
+    prompt while succeeding on smaller ones. Split only those model-output
+    failures; connection, server, context and configuration errors stay fatal.
     Returns the merged list found under ``key`` in each response."""
     if not items:
         return []
@@ -1960,13 +1987,30 @@ def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs
         parsed, cost = _run_gemini_stage(client, model_name, prompt, schema)
         if cost:
             costs.append(cost)
-        return list(parsed.get(key) or [])
+        values = parsed.get(key) if isinstance(parsed, dict) else None
+        if not isinstance(values, list):
+            raise gemini_worker.ModelResponseError(
+                f"Model response did not contain a list named '{key}'.")
+        return values
     except gemini_worker.GeminiBlockedError as e:
         if len(items) == 1:
             print(f"   🚫 {label}: Gemini blocked window {items[0].get('id')} on its own; skipping it ({e})")
             return []
         mid = len(items) // 2
         print(f"   🚫 {label}: Gemini blocked a batch of {len(items)}; retrying as {mid} + {len(items) - mid}")
+        return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label)
+                + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label))
+    except Exception as e:
+        if not _is_local_malformed_response_error(e):
+            raise
+        provider = _stage_provider_label()
+        if len(items) == 1:
+            print(f"   ⚠️ {label}: {provider} returned unusable data for window "
+                  f"{items[0].get('id')}; skipping it ({e})")
+            return []
+        mid = len(items) // 2
+        print(f"   ⚠️ {label}: {provider} returned unusable data for a batch of "
+              f"{len(items)}; retrying as {mid} + {len(items) - mid}")
         return (_run_stage_split(client, model_name, items[:mid], build_prompt, schema, key, costs, label)
                 + _run_stage_split(client, model_name, items[mid:], build_prompt, schema, key, costs, label))
 
@@ -2161,7 +2205,7 @@ def get_viral_clips(transcript_result, video_duration):
         print(f"🚫 {e}")
         raise
     except Exception as e:
-        print(f"❌ Gemini Error: {e}")
+        print(f"❌ {_stage_provider_label()} Error: {e}")
         return None
 
 

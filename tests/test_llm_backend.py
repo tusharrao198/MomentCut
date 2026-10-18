@@ -87,30 +87,125 @@ def test_falls_back_to_json_object_when_schema_mode_is_rejected(local, monkeypat
         formats.append(fmt)
         if fmt == "json_schema":
             return httpx.Response(400, json={"error": {"message": "response_format json_schema not supported"}})
-        return _completion({"windows": []})
+        return _completion({
+            "windows": [{
+                "id": "w0", "start": 0, "end": 90,
+                "score": 50, "reason": "usable",
+            }]
+        })
 
     _serve(handler, monkeypatch)
     parsed, _ = llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
     assert formats == ["json_schema", "json_object"]
-    assert parsed == {"windows": []}
+    assert parsed["windows"][0]["id"] == "w0"
+
+
+def test_generic_format_error_does_not_trigger_response_format_fallback(
+    local, monkeypatch
+):
+    """A context/config error must fail once, rather than issue three calls."""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(
+            400, text="Input format exceeds this model's context window")
+
+    _serve(handler, monkeypatch)
+    with pytest.raises(RuntimeError, match="context window"):
+        llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+    assert calls["n"] == 1
 
 
 def test_code_fenced_json_is_accepted(local, monkeypatch):
     """Small models wrap the object in ```json fences even when told not to."""
     def handler(request):
-        text = "```json\n" + json.dumps({"windows": []}) + "\n```"
+        text = "```json\n" + json.dumps({
+            "windows": [{
+                "id": "w0", "start": 0, "end": 90,
+                "score": 50, "reason": "usable",
+            }]
+        }) + "\n```"
         return httpx.Response(200, json={"choices": [{"message": {"content": text}}], "usage": {}})
 
     _serve(handler, monkeypatch)
     parsed, _ = llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
-    assert parsed == {"windows": []}
+    assert parsed["windows"][0]["id"] == "w0"
 
 
-def test_schema_violation_raises_instead_of_leaking_into_the_pipeline(local, monkeypatch):
+def test_salvages_valid_score_items_when_a_sibling_is_malformed(local, monkeypatch):
+    _serve(lambda r: _completion({
+        "windows": [
+            {"id": "w0", "start": 0, "end": 90, "score": 85, "reason": "usable"},
+            {"id": "broken"},
+        ]
+    }), monkeypatch)
+    parsed, _ = llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+    assert parsed["windows"] == [{
+        "id": "w0", "start": 0.0, "end": 90.0, "score": 85, "reason": "usable",
+    }]
+
+
+def test_salvages_a_local_score_without_nonessential_metadata(local, monkeypatch):
+    """Scoring consumes only ID and score; canonical windows supply the rest."""
+    _serve(lambda r: _completion({"windows": [{"id": "w0", "score": 85}]}),
+           monkeypatch)
+    parsed, _ = llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+    assert parsed["windows"] == [{
+        "id": "w0", "start": 0.0, "end": 0.0, "score": 85, "reason": "",
+    }]
+
+
+def test_salvages_a_local_score_with_invalid_unused_metadata(local, monkeypatch):
+    _serve(lambda r: _completion({
+        "windows": [{
+            "id": "w0", "start": "not-a-time", "end": None,
+            "score": 85, "reason": None,
+        }]
+    }), monkeypatch)
+    parsed, _ = llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+    assert parsed["windows"] == [{
+        "id": "w0", "start": 0.0, "end": 0.0, "score": 85, "reason": "",
+    }]
+
+
+def test_salvages_valid_detail_items_when_a_sibling_is_malformed(local, monkeypatch):
+    valid = {
+        "start": 10, "end": 40, "source_window_id": "w0", "predicted_score": 85,
+        "video_description_for_tiktok": "tiktok",
+        "video_description_for_instagram": "instagram",
+        "video_title_for_youtube_short": "title",
+        "viral_hook_text": "hook",
+    }
+    _serve(lambda r: _completion({"shorts": [valid, {"source_window_id": "w1"}]}),
+           monkeypatch)
+    parsed, _ = llm_backend.generate_json("prompt", gemini_worker.DetailResponse)
+    assert len(parsed["shorts"]) == 1
+    assert parsed["shorts"][0]["source_window_id"] == "w0"
+
+
+def test_all_invalid_local_items_raise_to_trigger_split_or_singleton_skip(local, monkeypatch):
     _serve(lambda r: _completion({"windows": [{"id": "w0"}]}), monkeypatch)
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(gemini_worker.ModelResponseError) as exc:
         llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
-    assert "validation error" in str(exc.value)
+    assert "no valid 'windows' items" in str(exc.value)
+
+
+def test_empty_local_items_raise_to_trigger_split_or_singleton_skip(local, monkeypatch):
+    _serve(lambda r: _completion({"windows": []}), monkeypatch)
+    with pytest.raises(gemini_worker.ModelResponseError) as exc:
+        llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+    assert "did not contain any 'windows' items" in str(exc.value)
+
+
+def test_all_invalid_local_detail_items_raise_to_trigger_split_or_singleton_skip(
+    local, monkeypatch
+):
+    _serve(lambda r: _completion({"shorts": [{"source_window_id": "w0"}]}),
+           monkeypatch)
+    with pytest.raises(gemini_worker.ModelResponseError) as exc:
+        llm_backend.generate_json("prompt", gemini_worker.DetailResponse)
+    assert "no valid 'shorts' items" in str(exc.value)
 
 
 def test_server_errors_surface_with_status_and_url(local, monkeypatch):
@@ -130,7 +225,9 @@ def test_stage_routes_to_local_backend_and_retries_transient(local, monkeypatch)
     def fake_generate(prompt, schema, model=None):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise httpx.ConnectError("ConnectError: connection refused")
+            # Actual httpx messages vary; this one contains none of the
+            # old string tokens, so retry must come from exception typing.
+            raise httpx.ConnectError("offline")
         return {"windows": [{"id": "w0", "start": 0, "end": 1, "score": 50, "reason": ""}]}, {"total_cost": 0.0}
 
     monkeypatch.setattr(llm_backend, "generate_json", fake_generate)
