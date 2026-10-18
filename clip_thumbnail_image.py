@@ -36,6 +36,46 @@ class ClipThumbnailRequestUnknown(ClipThumbnailImageError):
     """The image request may have reached Gemini; never retry it automatically."""
 
 
+def _provider_failure(exc: Exception, active_model: str) -> ClipThumbnailImageError:
+    """Turn known, safe Gemini HTTP outcomes into actionable dashboard text.
+
+    Provider response bodies may echo input/prompt details, so deliberately use
+    only the public HTTP-style code when the SDK exposes one.  A transport
+    failure remains unknown: it may have reached the paid image-generation
+    service even though no response made it back to OpenShorts.
+    """
+    code = getattr(exc, "code", None)
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = None
+
+    if code in (400, 404):
+        return ClipThumbnailImageError(
+            f"Gemini rejected thumbnail model configuration for {active_model}. "
+            "Confirm CLIP_THUMBNAIL_IMAGE_MODEL and CLIP_THUMBNAIL_IMAGE_SIZE."
+        )
+    if code in (401, 403):
+        return ClipThumbnailImageError(
+            f"Gemini rejected access to {active_model}. Check that GEMINI_API_KEY "
+            "belongs to a billed Gemini API project with image-generation access."
+        )
+    if code == 429:
+        return ClipThumbnailImageError(
+            f"Gemini cannot serve {active_model} for this project right now. "
+            "Check Gemini API billing and quota; Nano Banana 2 has no Gemini API "
+            "free tier."
+        )
+    if code is not None and 400 <= code < 500:
+        return ClipThumbnailImageError(
+            f"Gemini rejected the thumbnail request ({code}). Check the Gemini API "
+            "key, billing, quota, and image-model configuration."
+        )
+    return ClipThumbnailRequestUnknown(
+        f"Gemini thumbnail request did not complete ({type(exc).__name__})."
+    )
+
+
 def model_name() -> str:
     model = (os.environ.get("CLIP_THUMBNAIL_IMAGE_MODEL") or DEFAULT_MODEL).strip()
     if not model or not _MODEL_RE.fullmatch(model):
@@ -195,7 +235,11 @@ def generate_clip_thumbnail(
         parts.append(types.Part.from_bytes(data=reference_jpeg, mime_type="image/jpeg"))
 
     try:
-        response = genai.Client(api_key=key).models.generate_content(
+        # Keep the SDK client alive for the whole synchronous request. Creating
+        # it as a temporary expression can close its httpx client before the
+        # request is sent in affected google-genai releases.
+        client = genai.Client(api_key=key)
+        response = client.models.generate_content(
             model=active_model,
             contents=parts,
             config=types.GenerateContentConfig(
@@ -205,11 +249,10 @@ def generate_clip_thumbnail(
         )
     except Exception as exc:
         # Do not include provider response bodies: they can contain prompt
-        # content or request details. The caller records this outcome as
-        # uncertain rather than retrying automatically.
-        raise ClipThumbnailRequestUnknown(
-            f"Gemini thumbnail request did not complete ({type(exc).__name__})."
-        ) from exc
+        # content or request details. Known provider rejections did not create
+        # an image and can be shown as a normal retryable failure. Transport/
+        # server failures stay uncertain and must never be retried implicitly.
+        raise _provider_failure(exc, active_model) from exc
 
     try:
         parts_out = response.parts or []

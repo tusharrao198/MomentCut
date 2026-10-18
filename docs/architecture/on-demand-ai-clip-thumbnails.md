@@ -416,6 +416,9 @@ With the repository's existing `google-genai==1.75.0` SDK, call
 `client.models.generate_content(...)` with a text prompt and, optionally,
 `types.Part.from_bytes(..., mime_type="image/jpeg")`; request
 `response_modalities=["IMAGE"]` and a 16:9 `image_config`.
+Keep the `genai.Client` in a local variable until `generate_content()` returns;
+do not create it as a temporary chained expression, because affected SDK
+versions can close the underlying HTTP client before dispatch.
 
 Use `1K` as the initial image size. The final JPEG is 1280x720, so a higher
 resolution only increases latency/cost unless a later visual-quality test
@@ -423,6 +426,14 @@ demonstrates a benefit. The adapter must validate the response contains exactly
 one usable inline image byte part, not text or an arbitrary URL.
 `CLIP_THUMBNAIL_IMAGE_SIZE` accepts only `1K`, `2K`, or `4K`; no value is
 accepted silently.
+
+`gemini-3.1-flash-image` (Nano Banana 2) has no Gemini API free tier. The
+Gemini API project that owns `GEMINI_API_KEY` must have API billing enabled and
+available image-generation quota. A Google AI Pro consumer subscription does
+not itself enable Gemini API billing. An HTTP provider rejection is displayed
+as a retryable configuration/access/quota error; only transport or server
+failures are treated as an uncertain request that must not be retried
+automatically.
 
 The adapter input is:
 
@@ -690,7 +701,7 @@ there without bypassing SSRF protection for arbitrary URLs.
 | `vision_backend.py` | Extend `_visual_prompt()` and `_normalise_window_shorts()` with the compatible packaging metadata. It must never send an MP4 to an external provider. |
 | `layout_picker.py`, `screencast_layout.py`, `hook_grounding.py` | Check `GEMINI_CLIP_ANALYSIS_ENABLED` before constructing a Gemini client or sampling/sending frames. When false, retain each module's current safe local fallback (`none`, no content answer, or original Qwen-written hook). |
 | New `clip_packaging.py` | Hold `normalise_clip_packaging_metadata()`, profile loading/validation, `compose_youtube_metadata()`, tag-size accounting, and transcript-excerpt extraction. This keeps `app.py` from becoming a second packaging implementation. |
-| New `clip_thumbnail_image.py` | Hold only Nano Banana model configuration, bounded prompt construction, `generate_content` image call, inline-image extraction, Pillow decode/re-encode, 1280x720 finalisation, and AI provenance marking. It refuses work when `CLIP_AI_THUMBNAILS_ENABLED=0`. |
+| New `clip_thumbnail_image.py` | Hold only Nano Banana model configuration, bounded prompt construction, `generate_content` image call, safe provider-error classification, inline-image extraction, Pillow decode/re-encode, 1280x720 finalisation, and AI provenance marking. It refuses work when `CLIP_AI_THUMBNAILS_ENABLED=0`. |
 | `app.py` | Hold request/response Pydantic models, local-origin guard rename, per-clip state locks, global generation gate, safe frame extraction, durable thumbnail state, generate/get/select endpoints, selected-candidate resolution, and the Postiz metadata handoff. It returns a clear disabled-feature response before resolving a Gemini key. |
 | `postiz_client.py` | Accept keyword-only normalised tags and serialize them as `settings.tags: [{"label": tag, "value": tag}]`; preserve current MP4/thumbnail retry and unknown-outcome logic. |
 | `dashboard/src/components/ResultCard.jsx` | Add modal, request UUID handling, loading/error state, candidate hydration/selection, metadata disclosure, and mutually exclusive manual/AI thumbnail UI. Reuse the existing `geminiApiKey` prop only to create the existing `X-Gemini-Key` header when BYOK is used. |
@@ -748,7 +759,8 @@ change and a test first; do not point the setting at a general text model.
 An invalid/missing Gemini key or image configuration disables only
 **generate AI thumbnail**, with a useful UI message. It must not block clip
 generation, manual thumbnail upload, download, or Postiz publishing without a
-thumbnail.
+thumbnail. The default Nano Banana 2 model requires a billed Gemini API
+project; it cannot generate images with Gemini API free-tier quota.
 
 The two feature flags have different jobs:
 

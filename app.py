@@ -6845,7 +6845,7 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                 await asyncio.to_thread(
                     _set_thumbnail_batch_error,
                     req.job_id, filename, fingerprint, req.request_id, "unknown",
-                    "Gemini did not confirm the image request. Check your quota before starting a new batch.",
+                    str(exc),
                 )
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             except clip_thumbnail_image.ClipThumbnailImageError as exc:
