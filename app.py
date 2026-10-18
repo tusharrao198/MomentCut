@@ -6710,11 +6710,11 @@ async def post_to_postiz_with_thumbnail(
         await thumbnail.close()
 
 
-@app.post("/api/postiz/clear-thumbnail")
-async def clear_postiz_thumbnail(req: PostizPublishRequest, request: Request):
-    """Forget the thumbnail chosen for a future resend of this exact MP4.
+async def _clear_postiz_thumbnail(req: PostizPublishRequest, request: Request):
+    """Atomically clear thumbnail choices for a future resend of this MP4.
 
-    This changes only OpenShorts' local handoff state. It never modifies an
+    This clears both the browser-independent Postiz thumbnail cache and the
+    selected AI candidate in one server request. It never modifies an
     already-created Postiz draft or an uploaded/published YouTube video.
     """
     _require_local_dashboard_origin(request)
@@ -6728,40 +6728,144 @@ async def clear_postiz_thumbnail(req: PostizPublishRequest, request: Request):
     if req.clip_index < 0 or req.clip_index >= len(clips):
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    lock = await _postiz_publish_lock(req.job_id, req.clip_index)
-    async with lock:
-        current_clip = clips[req.clip_index]
-        if not isinstance(current_clip, dict):
-            raise HTTPException(status_code=409, detail="Clip metadata is invalid.")
-        try:
-            _file_path, filename, fingerprint = await asyncio.to_thread(
-                _resolve_postiz_clip, req.job_id, [dict(current_clip)], 0
-            )
-            state_path = _postiz_state_path(req.job_id)
-            state = await asyncio.to_thread(_read_postiz_state, state_path)
-        except PostizStateError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
-        if record is None:
-            return {"success": True, "cleared": False}
-        if not isinstance(record, dict):
-            raise HTTPException(
-                status_code=409,
-                detail="Saved Postiz publish state is invalid. Check Postiz before retrying.",
-            )
-        had_thumbnail = "thumbnail" in record
-        if had_thumbnail:
-            record.pop("thumbnail", None)
+    publish_lock = await _postiz_publish_lock(req.job_id, req.clip_index)
+    async with publish_lock:
+        thumbnail_lock = await _clip_thumbnail_lock(req.job_id, req.clip_index)
+        async with thumbnail_lock:
+            current_clip = clips[req.clip_index]
+            if not isinstance(current_clip, dict):
+                raise HTTPException(status_code=409, detail="Clip metadata is invalid.")
             try:
-                await asyncio.to_thread(_write_postiz_state, state_path, state)
+                _file_path, filename, fingerprint = await asyncio.to_thread(
+                    _resolve_postiz_clip, req.job_id, [dict(current_clip)], 0
+                )
+                postiz_state_path = _postiz_state_path(req.job_id)
+                postiz_state = await asyncio.to_thread(
+                    _read_postiz_state, postiz_state_path
+                )
+                thumbnail_state_path = _clip_thumbnail_state_path(req.job_id)
+                thumbnail_state = await asyncio.to_thread(
+                    _read_clip_thumbnail_state, thumbnail_state_path
+                )
             except PostizStateError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"success": True, "cleared": had_thumbnail}
+            except ClipThumbnailStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            version_key = _thumbnail_version_key(filename, fingerprint)
+            postiz_record = postiz_state["versions"].get(version_key)
+            if postiz_record is not None and not isinstance(postiz_record, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Saved Postiz publish state is invalid. Check Postiz before retrying.",
+                )
+            thumbnail_record = thumbnail_state["versions"].get(version_key)
+            if thumbnail_record is not None and not isinstance(thumbnail_record, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Existing AI thumbnail state is invalid. Generate a new thumbnail batch.",
+                )
+
+            had_postiz_thumbnail = (
+                isinstance(postiz_record, dict) and "thumbnail" in postiz_record
+            )
+            had_ai_selection = (
+                isinstance(thumbnail_record, dict)
+                and thumbnail_record.get("selected_candidate_id") is not None
+            )
+            if not had_postiz_thumbnail and not had_ai_selection:
+                transcript = await asyncio.to_thread(_read_job_transcript, req.job_id)
+                return {
+                    "success": True,
+                    "cleared": False,
+                    **_thumbnail_record_view(
+                        req.job_id,
+                        req.clip_index,
+                        filename,
+                        fingerprint,
+                        thumbnail_record,
+                        current_clip,
+                        transcript,
+                    ),
+                }
+
+            # Two independent state files cannot be atomically renamed
+            # together. Work on copies, write Postiz first, and restore it if
+            # the subsequent AI-selection write fails. Both locks remain held
+            # through the transaction and rollback.
+            postiz_next = copy.deepcopy(postiz_state)
+            thumbnail_next = copy.deepcopy(thumbnail_state)
+            postiz_next_record = postiz_next["versions"].get(version_key)
+            thumbnail_next_record = thumbnail_next["versions"].get(version_key)
+            if isinstance(postiz_next_record, dict):
+                postiz_next_record.pop("thumbnail", None)
+            if isinstance(thumbnail_next_record, dict):
+                thumbnail_next_record["selected_candidate_id"] = None
+
+            postiz_written = False
+            try:
+                if had_postiz_thumbnail:
+                    await asyncio.to_thread(
+                        _write_postiz_state, postiz_state_path, postiz_next
+                    )
+                    postiz_written = True
+                if had_ai_selection:
+                    await asyncio.to_thread(
+                        _write_clip_thumbnail_state,
+                        thumbnail_state_path,
+                        thumbnail_next,
+                    )
+            except PostizStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ClipThumbnailStateError as exc:
+                if postiz_written:
+                    try:
+                        await asyncio.to_thread(
+                            _write_postiz_state, postiz_state_path, postiz_state
+                        )
+                    except PostizStateError as rollback_exc:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Could not safely clear thumbnail choices; recovery of "
+                                "the saved Postiz thumbnail also failed. Check Postiz "
+                                "before sending this clip again."
+                            ),
+                        ) from rollback_exc
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Could not safely clear thumbnail choices; no changes were "
+                        "saved. Try again before sending this clip."
+                    ),
+                ) from exc
+
+            transcript = await asyncio.to_thread(_read_job_transcript, req.job_id)
+            return {
+                "success": True,
+                "cleared": True,
+                **_thumbnail_record_view(
+                    req.job_id,
+                    req.clip_index,
+                    filename,
+                    fingerprint,
+                    thumbnail_next_record,
+                    current_clip,
+                    transcript,
+                ),
+            }
 
 
-@app.post("/api/postiz/update-thumbnail")
-async def update_postiz_draft_thumbnail(req: PostizPublishRequest, request: Request):
+@app.post("/api/postiz/clear-thumbnail")
+async def clear_postiz_thumbnail(req: PostizPublishRequest, request: Request):
+    """Pin the clip while clearing server-side thumbnail choices."""
+    async with _job_activity_lease(req.job_id):
+        return await _clear_postiz_thumbnail(req, request)
+
+
+async def _update_postiz_draft_thumbnail(
+    req: PostizPublishRequest, request: Request
+):
     """Apply a selected AI thumbnail to the existing server-recorded Postiz draft.
 
     This intentionally cannot create a post. It only updates the thumbnail
@@ -7509,6 +7613,13 @@ async def _select_clip_thumbnail(
     return _thumbnail_record_view(
         job_id, clip_index, filename, fingerprint, record, clip, transcript
     )
+
+
+@app.post("/api/postiz/update-thumbnail")
+async def update_postiz_draft_thumbnail(req: PostizPublishRequest, request: Request):
+    """Pin the clip while its existing Postiz draft thumbnail is updated."""
+    async with _job_activity_lease(req.job_id):
+        return await _update_postiz_draft_thumbnail(req, request)
 
 
 @app.post("/api/clip-thumbnail/{job_id}/{clip_index}/select")

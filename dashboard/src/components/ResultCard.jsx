@@ -183,6 +183,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
     const [aiThumbnailCount, setAiThumbnailCount] = useState(1);
     const [aiThumbnailState, setAiThumbnailState] = useState(null);
     const [aiThumbnailLoading, setAiThumbnailLoading] = useState(false);
+    const [thumbnailSelectionSaving, setThumbnailSelectionSaving] = useState(false);
     const [aiThumbnailError, setAiThumbnailError] = useState(null);
     const [copied, setCopied] = useState(null);
 
@@ -690,6 +691,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             setPostizResult({
                 success: true,
                 reused: data.reused,
+                postId: data.postId,
                 msg: data.message || "Sent to Postiz."
             });
             // A successful draft handoff changes the server-side thumbnail
@@ -717,6 +719,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             if (!res.ok) throw new Error(data.detail || 'Could not update the Postiz draft thumbnail.');
             setPostizResult({
                 success: true,
+                postId: data.postId,
                 msg: data.message || 'Postiz draft thumbnail updated.',
             });
             void loadAiThumbnailState();
@@ -730,7 +733,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
         }
     };
 
-    const handlePostizThumbnailChange = (event) => {
+    const handlePostizThumbnailChange = async (event) => {
         const selected = event.target.files?.[0] || null;
         if (!selected) return;
         if (selected.type && !['image/jpeg', 'image/png'].includes(selected.type)) {
@@ -743,11 +746,25 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             event.target.value = '';
             return;
         }
+        setPostizSending(true);
         setPostizResult(null);
-        setPostizThumbnail(selected);
-        // A browser file wins for this send, but clear the persisted AI
-        // selection too so a later send cannot unexpectedly reuse it.
-        void selectAiThumbnail(null);
+        try {
+            // A manual thumbnail is a replacement choice. Clear both
+            // server-side fallbacks first, in one request, before showing the
+            // newly selected browser file as ready to send.
+            const data = await clearStoredPostizThumbnail();
+            setAiThumbnailState(data);
+            setAiThumbnailError(null);
+            setPostizThumbnail(selected);
+        } catch (e) {
+            event.target.value = '';
+            setPostizResult({
+                success: false,
+                msg: e.message || 'Could not replace the saved thumbnail choice.',
+            });
+        } finally {
+            setPostizSending(false);
+        }
     };
 
     const clearStoredPostizThumbnail = async () => {
@@ -765,11 +782,12 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
         setPostizSending(true);
         setPostizResult(null);
         try {
-            await clearStoredPostizThumbnail();
+            const data = await clearStoredPostizThumbnail();
+            setAiThumbnailState(data);
+            setAiThumbnailError(null);
             setPostizThumbnail(null);
             if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
             setPostizResult({ success: true, msg: 'Thumbnail cleared for future Postiz sends.' });
-            void loadAiThumbnailState();
         } catch (e) {
             setPostizResult({
                 success: false,
@@ -781,8 +799,16 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
     };
 
     const selectAiThumbnail = async (candidateId) => {
+        setThumbnailSelectionSaving(true);
         try {
-            if (!candidateId) await clearStoredPostizThumbnail();
+            if (!candidateId) {
+                const data = await clearStoredPostizThumbnail();
+                setAiThumbnailState(data);
+                setAiThumbnailError(null);
+                setPostizThumbnail(null);
+                if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
+                return;
+            }
             const res = await apiFetch(`/api/clip-thumbnail/${jobId}/${index}/select`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -798,6 +824,8 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             }
         } catch (e) {
             setAiThumbnailError(e.message || 'Could not select this AI thumbnail.');
+        } finally {
+            setThumbnailSelectionSaving(false);
         }
     };
 
@@ -839,7 +867,9 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
     const isVideoChanging = isEditing || isSubtitling || isHooking || isTranslating
         || (bulkProgress?.running ?? false);
     const aiThumbnailBusy = aiThumbnailLoading || aiThumbnailState?.hasRunningBatch === true;
-    const postizAlreadySent = !!postizResult?.success || aiThumbnailState?.postizLocked === true;
+    const postizAlreadySent = (
+        typeof postizResult?.postId === 'string' && postizResult.postId.length > 0
+    ) || aiThumbnailState?.postizLocked === true;
     const postizDraftThumbnailEditable =
         aiThumbnailState?.postizDraftThumbnailEditable === true;
     const thumbnailActionsLocked =
@@ -1048,7 +1078,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                                 <button
                                     key={candidate.id}
                                     onClick={() => void selectAiThumbnail(candidate.id)}
-                                    disabled={aiThumbnailBusy || thumbnailActionsLocked}
+                                    disabled={postizSending || thumbnailSelectionSaving || aiThumbnailBusy || thumbnailActionsLocked}
                                     title={candidate.selected
                                         ? 'Selected AI thumbnail'
                                         : postizDraftThumbnailEditable
@@ -1151,7 +1181,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     />
                     <button
                         onClick={() => postizThumbnailInputRef.current?.click()}
-                        disabled={postizSending || isVideoChanging || aiThumbnailBusy}
+                        disabled={postizSending || thumbnailSelectionSaving || isVideoChanging || aiThumbnailBusy}
                         title={postizThumbnail
                             ? `Selected thumbnail: ${postizThumbnail.name}. Click to replace it.`
                             : 'Optional: select a JPEG or PNG YouTube thumbnail (maximum 2 MB)'}
@@ -1163,7 +1193,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     {!isManaged && clipAiThumbnailsEnabled && (
                         <button
                             onClick={() => setShowAiThumbnailModal(true)}
-                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || thumbnailActionsLocked}
+                            disabled={postizSending || thumbnailSelectionSaving || isVideoChanging || aiThumbnailBusy || thumbnailActionsLocked}
                             title={thumbnailActionsLocked
                                 ? 'This clip was already sent for publishing and no longer has an editable Postiz draft.'
                                 : 'Create a Gemini AI thumbnail only for this clip'}
@@ -1178,7 +1208,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     {(postizThumbnail || aiThumbnailState?.postizThumbnailSaved) && (
                         <button
                             onClick={handleClearPostizThumbnail}
-                            disabled={postizSending}
+                            disabled={postizSending || thumbnailSelectionSaving}
                             title="Remove the selected thumbnail and clear it for future Postiz sends"
                             className={QUIET_BTN}
                         >
@@ -1189,7 +1219,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     {aiThumbnailState?.selectedCandidateId && (
                         <button
                             onClick={() => void selectAiThumbnail(null)}
-                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || thumbnailActionsLocked}
+                            disabled={postizSending || thumbnailSelectionSaving || isVideoChanging || aiThumbnailBusy || thumbnailActionsLocked}
                             title="Do not send an AI thumbnail with this clip"
                             className={QUIET_BTN}
                         >
@@ -1200,7 +1230,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     {postizDraftThumbnailEditable && aiThumbnailState?.selectedCandidateId && (
                         <button
                             onClick={handleUpdatePostizDraftThumbnail}
-                            disabled={postizSending || isVideoChanging || aiThumbnailBusy}
+                            disabled={postizSending || thumbnailSelectionSaving || isVideoChanging || aiThumbnailBusy}
                             title="Apply the selected AI thumbnail to the existing Postiz draft"
                             className="btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap disabled:opacity-45 disabled:cursor-not-allowed"
                         >
@@ -1213,7 +1243,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
 
                     <button
                         onClick={handleSendToPostiz}
-                        disabled={postizSending || !postizConfigured || isVideoChanging || aiThumbnailBusy}
+                        disabled={postizSending || thumbnailSelectionSaving || !postizConfigured || isVideoChanging || aiThumbnailBusy}
                         title={isVideoChanging
                             ? 'Wait for the current video edit to finish before sending it to Postiz'
                             : postizAlreadySent
