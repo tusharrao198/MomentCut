@@ -1,7 +1,9 @@
 """Unit tests for the opt-in local Ollama silent-video picker."""
+import base64
 import json
 
 import httpx
+import numpy as np
 import pytest
 
 import vision_backend as vision
@@ -96,13 +98,11 @@ def test_blank_model_uses_the_approved_default(monkeypatch):
     assert vision._config(60).model == "qwen2.5vl:3b"
 
 
-def test_clamps_tunables_and_rejects_window_that_cannot_cover_a_clip(monkeypatch):
+def test_safe_tunables_warn_and_clamp(monkeypatch, capsys):
     monkeypatch.setenv("VISION_PROVIDER", "ollama")
     monkeypatch.setenv("VISION_BASE_URL", "http://localhost:11434")
     monkeypatch.setenv("VISION_TIMEOUT_SECONDS", "9999")
     monkeypatch.setenv("VISION_RETRY_ATTEMPTS", "0")
-    monkeypatch.setenv("VISION_WINDOW_SECONDS", "999")
-    monkeypatch.setenv("VISION_WINDOW_OVERLAP_SECONDS", "1")
     monkeypatch.setenv("VISION_FRAMES_PER_WINDOW", "-3")
     monkeypatch.setenv("VISION_MAX_FRAME_WIDTH", "2000")
     monkeypatch.setenv("VISION_NUM_CTX", "1")
@@ -118,10 +118,44 @@ def test_clamps_tunables_and_rejects_window_that_cannot_cover_a_clip(monkeypatch
     assert config.num_ctx == 2048
     assert config.candidates_per_window == 3
     assert config.scene_snap_seconds == 3
+    assert "VISION_TIMEOUT_SECONDS=9999" in capsys.readouterr().out
+
+
+def test_invalid_non_numeric_safe_tunable_warns_and_uses_default(monkeypatch, capsys):
+    monkeypatch.setenv("VISION_PROVIDER", "ollama")
+    monkeypatch.setenv("VISION_BASE_URL", "http://localhost:11434")
+    monkeypatch.setenv("VISION_NUM_CTX", "lots")
+
+    assert vision._config(60).num_ctx == 8192
+    assert "VISION_NUM_CTX='lots' is not a whole number; using 8192" in capsys.readouterr().out
+
+
+def test_rejects_window_geometry_that_breaks_coverage_or_window_budget(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "ollama")
+    monkeypatch.setenv("VISION_BASE_URL", "http://localhost:11434")
 
     monkeypatch.setenv("VISION_WINDOW_SECONDS", "60")
-    with pytest.raises(vision.LocalVisionError, match="greater than CLIP_MAX_SECONDS"):
+    with pytest.raises(vision.LocalVisionError, match="at least 75"):
         vision._config(60)
+
+    monkeypatch.setenv("VISION_WINDOW_SECONDS", "999")
+    with pytest.raises(vision.LocalVisionError, match="allowed range 60–120"):
+        vision._config(60)
+
+    monkeypatch.setenv("VISION_WINDOW_SECONDS", "120")
+    monkeypatch.setenv("VISION_WINDOW_OVERLAP_SECONDS", "106")
+    with pytest.raises(vision.LocalVisionError, match="allowed range 60–105"):
+        vision._config(60)
+
+
+def test_shorter_clip_limit_uses_a_safe_default_overlap(monkeypatch):
+    monkeypatch.setenv("VISION_PROVIDER", "ollama")
+    monkeypatch.setenv("VISION_BASE_URL", "http://localhost:11434")
+    monkeypatch.setenv("VISION_WINDOW_SECONDS", "60")
+
+    config = vision._config(15)
+
+    assert (config.window_seconds, config.overlap_seconds) == (60, 45)
 
 
 def test_dropped_frame_drops_its_matching_timestamp(monkeypatch):
@@ -141,6 +175,18 @@ def test_dropped_frame_drops_its_matching_timestamp(monkeypatch):
     assert images == ["first", "third"]
 
 
+def test_portrait_frame_is_capped_by_longest_edge():
+    image = vision._jpeg_base64(np.zeros((2000, 500, 3), dtype=np.uint8), 480)
+    decoded = vision.cv2.imdecode(
+        np.frombuffer(base64.b64decode(image), dtype=np.uint8),
+        vision.cv2.IMREAD_COLOR,
+    )
+
+    assert decoded is not None
+    assert max(decoded.shape[:2]) <= 480
+    assert decoded.shape[:2] == (480, 120)
+
+
 def test_overlapping_windows_cover_every_maximum_length_candidate():
     windows = vision._analysis_windows(720, 120, 60)
     assert len(windows) == 11
@@ -148,6 +194,19 @@ def test_overlapping_windows_cover_every_maximum_length_candidate():
         end = start + 60
         assert any(window_start <= start and window_end >= end
                    for window_start, window_end in windows)
+
+
+def test_analysis_windows_reject_pathological_step_and_call_count():
+    with pytest.raises(vision.LocalVisionError, match="at least 15 seconds"):
+        vision._analysis_windows(180, 120, 106)
+
+    with pytest.raises(vision.LocalVisionError, match="127 analysis windows"):
+        vision._analysis_windows(2000, 120, 105)
+
+
+def test_analysis_windows_reject_source_longer_than_hard_limit():
+    with pytest.raises(vision.LocalVisionError, match="up to 120 minutes"):
+        vision._analysis_windows(vision._MAX_VISION_SOURCE_SECONDS + 1, 120, 60)
 
 
 def test_low_regular_frame_count_still_adds_at_most_two_scene_frames():

@@ -318,6 +318,9 @@ code architecture. Three things to know:
 - **Silent footage.** Without `VISION_PROVIDER=ollama`, silent videos retain
   the original Gemini vision path and need a Gemini key. The local VLM path
   supports a maximum clip length of 60 seconds.
+- **Vision bounds.** Local visual selection caps JPEG samples by their longest
+  edge (480 px by default), limits sources to 120 minutes and at most 120
+  analysis windows, and requires overlap to leave at least a 15-second step.
 - **What still needs Gemini.** The automatic layout picker (`AUTO_LAYOUT`)
   and the on-screen content detector remain Gemini-backed. A local silent
   video picker does not automatically make those unrelated optional features
