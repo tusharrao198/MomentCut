@@ -4,6 +4,8 @@ Regression cover for OSError 36 ("File name too long") killing /api/hook in
 prod on 26-jul-2026: a Bengali video title passed the 100-CHARACTER cap while
 already being ~300 bytes, and the derived temp name pushed it further.
 """
+from urllib.parse import urlsplit
+
 import pytest
 
 main = pytest.importorskip("main")          # cv2 etc., absent in minimal CI
@@ -48,9 +50,29 @@ class TestSanitizeFilename:
         hook_png = f"temp_hook_abcd1234_{captioned}.png"
         assert len(hook_png.encode("utf-8")) < FS_LIMIT, len(hook_png.encode("utf-8"))
 
-    def test_still_strips_unsafe_characters(self):
-        assert main.sanitize_filename('a<b>c:d"e/f\\g|h?i*j#k') == "abcdefghijk"
+    def test_replaces_unsafe_characters_with_underscores(self):
+        assert main.sanitize_filename(
+            'a<b>c:d"e/f\\g|h?i*j#k'
+        ) == "a_b_c_d_e_f_g_h_i_j_k"
         assert main.sanitize_filename("with spaces") == "with_spaces"
+
+    def test_replaces_url_delimiters_and_percent_encoding(self):
+        safe = main.sanitize_filename("Mission #45? retry%23")
+        assert safe == "Mission_45_retry_23"
+        parsed = urlsplit(f"/videos/job/{safe}_clip_1.mp4")
+        assert parsed.query == ""
+        assert parsed.fragment == ""
+
+    def test_collapses_replacement_runs_and_has_a_safe_fallback(self):
+        assert main.sanitize_filename("a #?:% b") == "a_b"
+        assert main.sanitize_filename("###") == "video"
+
+    def test_local_upload_uses_the_same_safe_stem(self):
+        # Docker presents the Windows bind mount as a normal Linux path.
+        path = "/app/uploads/job_GTA Mission #45? retry%23.mp4"
+        assert main.video_title_from_local_path(path) == (
+            "job_GTA_Mission_45_retry_23"
+        )
 
     def test_combining_accents_are_precomposed(self):
         """A Spanish title arrives from yt-dlp in either Unicode spelling.
