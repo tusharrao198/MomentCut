@@ -37,7 +37,7 @@ from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             normalise_detail_candidates,
                             reconcile_scored_windows, score_batches, shortlist_target,
-                            snap_clip_to_words, trim_to_best)
+                            snap_clip_to_words_in_window, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
 from dotenv import load_dotenv
@@ -2193,8 +2193,15 @@ def get_viral_clips(transcript_result, video_duration):
             # measured (distance to the nearest word before the snap; p90 was
             # 0.4-0.5 s on 8 talks, 21-sep-2026, so the snap reaches it).
             s["proposed"] = [s.get("start", 0), s.get("end", 0)]
-            ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
-                                        min_duration=min_secs, max_duration=max_secs)
+            ns, ne = snap_clip_to_words_in_window(
+                s.get("start", 0),
+                s.get("end", 0),
+                words,
+                video_duration,
+                by_id.get(s.get("source_window_id")),
+                min_duration=min_secs,
+                max_duration=max_secs,
+            )
             s["start"], s["end"] = ns, ne
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):

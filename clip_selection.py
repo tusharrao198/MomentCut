@@ -487,3 +487,39 @@ def snap_clip_to_words(start, end, words, video_duration,
     if new_end <= new_start or new_end - new_start < min_duration:
         return original
     return (round(new_start, 3), round(new_end, 3))
+
+
+def snap_clip_to_words_in_window(
+    start, end, words, video_duration, source_window,
+    min_duration=15.0, max_duration=60.0,
+):
+    """Snap a validated candidate without escaping the window the model saw.
+
+    Word-level timestamps are source-wide. A nearby word belonging to an
+    adjacent transcript window must not move a local model's final render
+    outside its grounded ``source_window_id``.
+    """
+    original = (round(float(start), 3), round(float(end), 3))
+    snapped = snap_clip_to_words(
+        start,
+        end,
+        words,
+        video_duration,
+        min_duration=min_duration,
+        max_duration=max_duration,
+    )
+    if not isinstance(source_window, dict):
+        return original
+    window_start = _finite_number(source_window.get("start"))
+    window_end = _finite_number(source_window.get("end"))
+    if window_start is None or window_end is None or window_end <= window_start:
+        return original
+    snapped_duration = snapped[1] - snapped[0]
+    if (
+        snapped[0] < window_start - 0.001
+        or snapped[1] > window_end + 0.001
+        or snapped_duration < min_duration
+        or snapped_duration > max_duration
+    ):
+        return original
+    return snapped
