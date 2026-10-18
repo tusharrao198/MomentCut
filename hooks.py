@@ -382,7 +382,10 @@ def _draw_accent_hook(text, target_width, font_path, font_size,
             index == highlight_line, look["text"], look["highlight"], outline)
         current_y += line_h + line_gap
 
-    max_canvas_w = int(target_width + 2 * margin)
+    # ``target_width`` is the complete 9:16 safe-area budget, including the
+    # transparent shadow margin—not merely the charcoal panel. This guarantees
+    # the composited overlay stays inside 82% of the vertical frame width.
+    max_canvas_w = int(target_width)
     if canvas_w > max_canvas_w:
         ratio = max_canvas_w / float(canvas_w)
         canvas_w = max_canvas_w
