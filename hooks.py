@@ -199,13 +199,18 @@ def download_font_if_needed():
         except Exception as e:
             print(f"❌ Failed to download font: {e}")
 
-# Hook visual styles. Each maps to box fill (RGBA, alpha 0 = no box), text
-# color, and an optional text outline (color, px) for box-less looks.
+# Hook visual styles. ``pill`` remains the internal name of the default for
+# backwards compatibility with saved dashboard preferences and API callers,
+# but its visual treatment is now the modern accent look rather than white
+# boxes around black text.
 HOOK_STYLES = {
-    # Default. TikTok-native look: every line its own white rounded box,
-    # black bold sans (Montserrat ExtraBold).
-    "pill":    {"box": (255, 255, 255, 250), "text": (0, 0, 0), "outline": None, "shadow": False,
-                "font": PILL_FONT_PATH, "pills": True},
+    # Default. Premium creator look: bold white Montserrat, the final impact
+    # word in warm gold, a thin dark stroke, and one translucent charcoal
+    # backdrop. The legacy key is intentionally retained so existing "pill"
+    # preferences receive the new default without a migration.
+    "pill":    {"box": (12, 15, 20, 165), "text": (255, 255, 255),
+                "highlight": (255, 201, 40), "outline": ((0, 0, 0), 4),
+                "shadow": True, "font": PILL_FONT_PATH, "accent": True},
     # White card, black serif text (original look).
     "classic": {"box": (255, 255, 255, 240), "text": (0, 0, 0), "outline": None, "shadow": True},
     # Dark card, white text.
@@ -219,6 +224,173 @@ HOOK_STYLES = {
     # No box: yellow text with black outline.
     "outline_yellow": {"box": (0, 0, 0, 0),  "text": (255, 214, 0),   "outline": ((0, 0, 0), 8), "shadow": False},
 }
+
+
+def _impact_word_span(text):
+    """Character span of the final readable word, ignoring trailing emoji.
+
+    Hooks commonly end in punctuation or an emoji. Highlighting the last
+    whitespace token would colour that emoji instead of the phrase's payoff,
+    so select the final Unicode letter/number word.
+    """
+    matches = list(re.finditer(r"[^\W_]+(?:['’][^\W_]+)*", text, re.UNICODE))
+    if not matches:
+        return None
+    match = matches[-1]
+    return match.start(), match.end()
+
+
+def _balanced_accent_lines(text, draw, font, emoji_font, max_width):
+    """Return one or two balanced lines for the default hook treatment."""
+    words = text.replace("\n", " ").split()
+    if not words:
+        return [" "]
+    whole = " ".join(words)
+    if _measure_width(draw, whole, font, emoji_font) <= max_width:
+        return [whole]
+    if len(words) == 1:
+        return [whole]
+
+    choices = []
+    for split in range(1, len(words)):
+        first = " ".join(words[:split])
+        second = " ".join(words[split:])
+        first_w = _measure_width(draw, first, font, emoji_font)
+        second_w = _measure_width(draw, second, font, emoji_font)
+        overflow = max(0.0, first_w - max_width) + max(0.0, second_w - max_width)
+        choices.append((overflow, abs(first_w - second_w), max(first_w, second_w),
+                        [first, second]))
+    return min(choices, key=lambda item: item[:3])[3]
+
+
+def _draw_accent_line(img, draw, x, y, line, font, emoji_font, impact_word,
+                      highlight_this_line, text_fill, highlight_fill, outline):
+    """Draw one centred line, colouring only its final impact-word occurrence."""
+    if not impact_word or not highlight_this_line:
+        _draw_mixed(img, draw, (x, y), line, font, emoji_font,
+                    fill=text_fill, outline=outline)
+        return
+
+    matches = list(re.finditer(re.escape(impact_word), line, re.IGNORECASE))
+    if not matches:
+        _draw_mixed(img, draw, (x, y), line, font, emoji_font,
+                    fill=text_fill, outline=outline)
+        return
+    match = matches[-1]
+    pieces = (
+        (line[:match.start()], text_fill),
+        (line[match.start():match.end()], highlight_fill),
+        (line[match.end():], text_fill),
+    )
+    cursor = float(x)
+    for piece, fill in pieces:
+        if not piece:
+            continue
+        _draw_mixed(img, draw, (cursor, y), piece, font, emoji_font,
+                    fill=fill, outline=outline)
+        cursor += _measure_width(draw, piece, font, emoji_font)
+
+
+def _draw_accent_hook(text, target_width, font_path, font_size,
+                      output_image_path, look):
+    """Render the default two-line white/gold hook on a subtle dark panel."""
+    # Emoji use the platform font when available. If the container has none,
+    # remove them instead of drawing empty tofu squares, matching other styles.
+    emoji_font = _load_emoji_font(font_size) if _EMOJI_RE.search(text) else None
+    if _EMOJI_RE.search(text) and emoji_font is None:
+        text = re.sub(r"[ \t]{2,}", " ", _EMOJI_RE.sub("", text)).strip()
+
+    max_text_width = max(1, int(target_width - font_size * 0.72))
+    min_font_size = max(24, int(font_size * 0.70))
+    while True:
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+        emoji_font = _load_emoji_font(font_size) if _EMOJI_RE.search(text) else None
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        lines = _balanced_accent_lines(text, probe, font, emoji_font, max_text_width)
+        widest = max(_measure_width(probe, line, font, emoji_font) for line in lines)
+        if widest <= max_text_width or font_size <= min_font_size:
+            break
+        font_size = max(min_font_size, font_size - 2)
+
+    pad_x = int(font_size * 0.38)
+    pad_y = int(font_size * 0.28)
+    line_gap = int(font_size * 0.12)
+    margin = max(18, int(font_size * 0.30))
+    widths = [int(_measure_width(probe, line, font, emoji_font)) for line in lines]
+    boxes = [probe.textbbox((0, 0), line or "Ágj", font=font) for line in lines]
+    heights = [max(box[3] - box[1], font_size) for box in boxes]
+    # Render the complete text even when one pathological word cannot fit at
+    # the minimum font size. The finished overlay is scaled below; clipping it
+    # to target_width here would permanently cut characters off.
+    panel_w = max(widths) + 2 * pad_x
+    panel_h = sum(heights) + line_gap * (len(lines) - 1) + 2 * pad_y
+    canvas_w = int(panel_w + 2 * margin)
+    canvas_h = int(panel_h + 2 * margin)
+
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    panel_box = (margin, margin, margin + panel_w, margin + panel_h)
+    radius = int(font_size * 0.28)
+
+    # Soft shadow, kept separate from the translucent panel so dark footage
+    # remains readable without creating an opaque caption box.
+    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rounded_rectangle(
+        (panel_box[0] + 4, panel_box[1] + 6,
+         panel_box[2] + 4, panel_box[3] + 6),
+        radius=radius,
+        fill=(0, 0, 0, 115),
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(max(5, int(font_size * 0.12))))
+    img.alpha_composite(shadow)
+
+    # A gentle top-to-bottom alpha gradient rather than a flat black card.
+    panel = Image.new("RGBA", (int(panel_w), int(panel_h)), (0, 0, 0, 0))
+    panel_draw = ImageDraw.Draw(panel)
+    base = look["box"]
+    for row in range(max(1, int(panel_h))):
+        progress = row / max(panel_h - 1, 1)
+        alpha = int(base[3] * (1.0 - 0.22 * progress))
+        panel_draw.line((0, row, panel_w, row), fill=(*base[:3], alpha))
+    mask = Image.new("L", panel.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, panel_w - 1, panel_h - 1), radius=radius, fill=255)
+    panel.putalpha(Image.composite(panel.getchannel("A"), Image.new("L", panel.size, 0), mask))
+    img.alpha_composite(panel, (margin, margin))
+
+    impact_span = _impact_word_span(text)
+    impact_word = text[impact_span[0]:impact_span[1]] if impact_span else None
+    highlight_line = None
+    if impact_word:
+        for index in range(len(lines) - 1, -1, -1):
+            if re.search(re.escape(impact_word), lines[index], re.IGNORECASE):
+                highlight_line = index
+                break
+
+    draw = ImageDraw.Draw(img)
+    current_y = margin + pad_y
+    outline = look["outline"]
+    for index, (line, line_w, box, line_h) in enumerate(
+            zip(lines, widths, boxes, heights)):
+        x = (canvas_w - line_w) / 2
+        y = current_y - box[1]
+        _draw_accent_line(
+            img, draw, x, y, line, font, emoji_font, impact_word,
+            index == highlight_line, look["text"], look["highlight"], outline)
+        current_y += line_h + line_gap
+
+    max_canvas_w = int(target_width + 2 * margin)
+    if canvas_w > max_canvas_w:
+        ratio = max_canvas_w / float(canvas_w)
+        canvas_w = max_canvas_w
+        canvas_h = max(1, int(round(canvas_h * ratio)))
+        img = img.resize((canvas_w, canvas_h), Image.LANCZOS)
+
+    img.save(output_image_path)
+    return output_image_path, canvas_w, canvas_h
 
 
 def _draw_pills(lines, font, emoji_font, font_size, box_fill, text_fill, output_image_path):
@@ -256,7 +428,8 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     """
     Generates a hook overlay image using pixel-based wrapping.
     target_width: The max width the box should occupy (e.g. 85% of video)
-    style: one of HOOK_STYLES (pill/classic/dark/yellow/red/outline/outline_yellow)
+    style: one of HOOK_STYLES. ``pill`` is the backwards-compatible key for
+      the modern default white/gold accent treatment.
     """
     download_font_if_needed()
 
@@ -289,6 +462,14 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     except Exception as e:
         print(f"⚠️ Warning: Could not load font {font_path}, using default. Error: {e}")
         font = ImageFont.load_default()
+
+    if look.get("accent"):
+        # add_hook_to_video gives styles a 90%-of-frame budget. The modern
+        # default deliberately uses an 82% panel so it reads as a title rather
+        # than another full-width subtitle band.
+        accent_width = max(1, int(target_width * (82 / 90)))
+        return _draw_accent_hook(
+            text, accent_width, font_path, font_size, output_image_path, look)
 
     # Emoji handling: render with an emoji-capable font if one exists,
     # otherwise strip emoji instead of drawing tofu boxes.

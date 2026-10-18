@@ -37,20 +37,72 @@ const POSITION_STYLE: Record<string, React.CSSProperties> = {
 interface HookLook {
   box: string | null;
   text: string;
+  highlight?: string;
   outlinePx: number;
   shadow: boolean;
   /** One rounded box per line (hooks.py _draw_pills) instead of one card. */
   pills?: boolean;
+  /** Modern default treatment kept under the legacy "pill" identifier. */
+  accent?: boolean;
 }
 
 const HOOK_LOOKS: Record<string, HookLook> = {
-  pill: { box: "rgba(255, 255, 255, 0.98)", text: "#000000", outlinePx: 0, shadow: false, pills: true },
+  pill: {
+    box: "linear-gradient(180deg, rgba(12, 15, 20, 0.66), rgba(12, 15, 20, 0.51))",
+    text: "#FFFFFF",
+    highlight: "#FFC928",
+    outlinePx: 4,
+    shadow: true,
+    accent: true,
+  },
   classic: { box: "rgba(255, 255, 255, 0.94)", text: "#000000", outlinePx: 0, shadow: true },
   dark: { box: "rgba(18, 18, 20, 0.92)", text: "#FFFFFF", outlinePx: 0, shadow: true },
   yellow: { box: "rgba(255, 214, 0, 0.96)", text: "#000000", outlinePx: 0, shadow: true },
   red: { box: "rgba(220, 38, 38, 0.96)", text: "#FFFFFF", outlinePx: 0, shadow: true },
   outline: { box: null, text: "#FFFFFF", outlinePx: 8, shadow: false },
   outline_yellow: { box: null, text: "#FFD600", outlinePx: 8, shadow: false },
+};
+
+const splitImpactWord = (text: string) => {
+  const matches = Array.from(text.matchAll(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu));
+  const match = matches[matches.length - 1];
+  if (!match || match.index === undefined) {
+    return { before: text, impact: "", after: "" };
+  }
+  const end = match.index + match[0].length;
+  return {
+    before: text.slice(0, match.index),
+    impact: match[0],
+    after: text.slice(end),
+  };
+};
+
+const balanceAccentLines = (text: string) => {
+  const targetCharacters = 21;
+  const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  if (words.length < 2) return [words.join(" ") || " "];
+  const whole = words.join(" ");
+  // At the default 1080-wide composition this approximates the server's
+  // font-metric fit test; longer hooks are always split into exactly two
+  // balanced lines rather than being left to wrap into three unpredictably.
+  if (whole.length <= targetCharacters) return [whole];
+
+  let best = [words[0], words.slice(1).join(" ")];
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (let split = 1; split < words.length; split += 1) {
+    const first = words.slice(0, split).join(" ");
+    const second = words.slice(split).join(" ");
+    const overflow = (
+      Math.max(0, first.length - targetCharacters)
+      + Math.max(0, second.length - targetCharacters)
+    );
+    const score = overflow * 100 + Math.abs(first.length - second.length);
+    if (score < bestScore) {
+      best = [first, second];
+      bestScore = score;
+    }
+  }
+  return best;
 };
 
 export const HookOverlay: React.FC<HookOverlayProps> = ({ config }) => {
@@ -129,9 +181,71 @@ const HookBox: React.FC<HookBoxProps> = ({ config, displayFrames }) => {
 
   // Typeface and size as hooks.py: the chosen font, else the style's own;
   // font size = factor x the 90%-of-width box.
-  const typeface = HOOK_FONTS[config.font ?? (look.pills ? "montserrat" : "serif")] ?? HOOK_FONTS.serif;
+  const typeface = HOOK_FONTS[
+    config.font ?? (look.pills || look.accent ? "montserrat" : "serif")
+  ] ?? HOOK_FONTS.serif;
   const fontSize = Math.round(1080 * 0.9 * typeface.factor * scale);
   const outlinePx = Math.round(look.outlinePx * scale);
+
+  if (look.accent) {
+    const lines = balanceAccentLines(config.text);
+    const longestLine = Math.max(...lines.map((line) => line.length), 1);
+    const fitScale = Math.min(1, 21 / longestLine);
+    const accentFontSize = Math.max(12, Math.round(fontSize * fitScale));
+    const accentOutline = Math.max(2, Math.round(outlinePx * fitScale));
+    const stroke = `${accentOutline}px #000000`;
+    const textStyle: React.CSSProperties = {
+      fontFamily: typeface.family,
+      fontSize: accentFontSize,
+      fontWeight: typeface.weight,
+      lineHeight: 1.12,
+      WebkitTextStroke: stroke,
+      paintOrder: "stroke fill",
+      textShadow: "0 5px 14px rgba(0, 0, 0, 0.48)",
+    };
+    return (
+      <div
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          display: "flex",
+          justifyContent: "center",
+          ...positionStyle,
+        }}
+      >
+        <div
+          style={{
+            opacity: animOpacity,
+            transform: `scale(${animScale}) translateY(${animTranslateY}px)`,
+            width: "fit-content",
+            maxWidth: "82%",
+            padding: `${Math.round(accentFontSize * 0.28)}px ${Math.round(accentFontSize * 0.38)}px`,
+            borderRadius: Math.round(accentFontSize * 0.28),
+            background: look.box ?? "transparent",
+            boxShadow: "0 8px 24px rgba(0, 0, 0, 0.34)",
+            backdropFilter: "blur(4px)",
+            textAlign: "center",
+            wordBreak: "break-word",
+          }}
+        >
+          {lines.map((line, index) => {
+            const isImpactLine = index === lines.length - 1;
+            const parts = isImpactLine
+              ? splitImpactWord(line)
+              : { before: line, impact: "", after: "" };
+            return (
+              <div key={`${index}-${line}`} style={{ whiteSpace: "nowrap" }}>
+                <span style={{ ...textStyle, color: look.text }}>{parts.before}</span>
+                <span style={{ ...textStyle, color: look.highlight }}>{parts.impact}</span>
+                <span style={{ ...textStyle, color: look.text }}>{parts.after}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   if (look.pills) {
     // box-decoration-break: clone gives every wrapped line its own padded,
