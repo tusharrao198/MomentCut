@@ -656,6 +656,12 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             });
             return;
         }
+        const forceResend = postizAlreadySent;
+        if (forceResend && !window.confirm(
+            'Send this clip to Postiz again? This may create another Postiz post; the earlier one will not be deleted.'
+        )) {
+            return;
+        }
         setPostizSending(true);
         setPostizResult(null);
         try {
@@ -663,12 +669,17 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             let options = {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ job_id: jobId, clip_index: index })
+                body: JSON.stringify({
+                    job_id: jobId,
+                    clip_index: index,
+                    force_resend: forceResend,
+                })
             };
             if (postizThumbnail) {
                 const form = new FormData();
                 form.append('job_id', jobId);
                 form.append('clip_index', String(index));
+                form.append('force_resend', String(forceResend));
                 form.append('thumbnail', postizThumbnail);
                 path = '/api/postiz/publish-thumbnail';
                 options = { method: 'POST', body: form };
@@ -739,8 +750,39 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
         void selectAiThumbnail(null);
     };
 
+    const clearStoredPostizThumbnail = async () => {
+        const res = await apiFetch('/api/postiz/clear-thumbnail', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ job_id: jobId, clip_index: index }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || 'Could not clear the saved Postiz thumbnail.');
+        return data;
+    };
+
+    const handleClearPostizThumbnail = async () => {
+        setPostizSending(true);
+        setPostizResult(null);
+        try {
+            await clearStoredPostizThumbnail();
+            setPostizThumbnail(null);
+            if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
+            setPostizResult({ success: true, msg: 'Thumbnail cleared for future Postiz sends.' });
+            void loadAiThumbnailState();
+        } catch (e) {
+            setPostizResult({
+                success: false,
+                msg: e.message || 'Could not clear the saved Postiz thumbnail.',
+            });
+        } finally {
+            setPostizSending(false);
+        }
+    };
+
     const selectAiThumbnail = async (candidateId) => {
         try {
+            if (!candidateId) await clearStoredPostizThumbnail();
             const res = await apiFetch(`/api/clip-thumbnail/${jobId}/${index}/select`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1109,7 +1151,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     />
                     <button
                         onClick={() => postizThumbnailInputRef.current?.click()}
-                        disabled={postizSending || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
+                        disabled={postizSending || isVideoChanging || aiThumbnailBusy}
                         title={postizThumbnail
                             ? `Selected thumbnail: ${postizThumbnail.name}. Click to replace it.`
                             : 'Optional: select a JPEG or PNG YouTube thumbnail (maximum 2 MB)'}
@@ -1133,14 +1175,11 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                             {aiThumbnailBusy ? 'generating…' : 'generate AI thumb'}
                         </button>
                     )}
-                    {postizThumbnail && (
+                    {(postizThumbnail || aiThumbnailState?.postizThumbnailSaved) && (
                         <button
-                            onClick={() => {
-                                setPostizThumbnail(null);
-                                if (postizThumbnailInputRef.current) postizThumbnailInputRef.current.value = '';
-                            }}
-                            disabled={postizSending || postizAlreadySent}
-                            title="Remove the selected thumbnail before sending"
+                            onClick={handleClearPostizThumbnail}
+                            disabled={postizSending}
+                            title="Remove the selected thumbnail and clear it for future Postiz sends"
                             className={QUIET_BTN}
                         >
                             <X size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
@@ -1174,11 +1213,11 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
 
                     <button
                         onClick={handleSendToPostiz}
-                        disabled={postizSending || !postizConfigured || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
+                        disabled={postizSending || !postizConfigured || isVideoChanging || aiThumbnailBusy}
                         title={isVideoChanging
                             ? 'Wait for the current video edit to finish before sending it to Postiz'
                             : postizAlreadySent
-                            ? 'This clip was already sent to Postiz. Update its draft in Postiz.'
+                            ? 'Send this clip to Postiz again and create another post'
                             : postizConfigured
                             ? (postizPostType === 'now'
                                 ? 'Send this clip to Postiz for YouTube publishing'
@@ -1192,7 +1231,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                         {postizSending
                             ? 'sending…'
                             : postizConfigured
-                                ? 'send to postiz'
+                                ? (postizAlreadySent ? 'send again' : 'send to postiz')
                                 : 'configure postiz'}
                     </button>
                     <button
