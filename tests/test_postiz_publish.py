@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import hashlib
+import io
 import json
 import os
 import uuid
@@ -78,10 +80,65 @@ def _publish_with_thumbnail(content=VALID_PNG, content_type="image/png"):
     )
 
 
+def _update_ai_thumbnail():
+    return _request(
+        "post",
+        "/api/postiz/update-thumbnail",
+        headers={"Origin": ORIGIN},
+        json={"job_id": JOB_ID, "clip_index": 0},
+    )
+
+
+def _selected_ai_thumbnail_state(job_dir):
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    candidate_id = "a" * 32
+    image = Image.new("RGB", (8, 8), color=(1, 2, 3))
+    output = io.BytesIO()
+    image.save(output, "JPEG")
+    content = output.getvalue()
+    root = app_module._clip_thumbnail_root(JOB_ID, 0, fingerprint)
+    candidate_name = f"candidate-{candidate_id}.jpg"
+    (root / candidate_name).write_bytes(content)
+    app_module._write_clip_thumbnail_state(
+        job_dir / app_module.CLIP_THUMBNAIL_STATE_FILE,
+        {
+            "versions": {
+                f"{filename}:{fingerprint}": {
+                    "filename": filename,
+                    "sha256": fingerprint,
+                    "selected_candidate_id": candidate_id,
+                    "batches": {
+                        str(uuid.uuid4()): {
+                            "state": "completed",
+                            "candidates": [{
+                                "id": candidate_id,
+                                "filename": candidate_name,
+                                "sha256": hashlib.sha256(content).hexdigest(),
+                            }],
+                        },
+                    },
+                },
+            },
+        },
+    )
+
+
 def test_postiz_publish_rejects_hostile_browser_origin():
     response = _request(
         "post",
         "/api/postiz/publish",
+        headers={"Origin": "https://attacker.example"},
+        json={"job_id": JOB_ID, "clip_index": 0},
+    )
+    assert response.status_code == 403
+    assert "local OpenShorts dashboard" in response.json()["detail"]
+
+
+def test_postiz_draft_thumbnail_update_rejects_hostile_browser_origin():
+    response = _request(
+        "post",
+        "/api/postiz/update-thumbnail",
         headers={"Origin": "https://attacker.example"},
         json={"job_id": JOB_ID, "clip_index": 0},
     )
@@ -249,6 +306,58 @@ def test_postiz_publish_uses_selected_ai_thumbnail(postiz_job, monkeypatch):
         "id": "thumbnail-1",
         "path": "/uploads/thumbnail.jpg",
     }
+
+
+def test_postiz_draft_thumbnail_update_never_creates_another_post(postiz_job, monkeypatch):
+    job_dir, _config = postiz_job
+    _selected_ai_thumbnail_state(job_dir)
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    app_module._write_postiz_state(
+        app_module._postiz_state_path(JOB_ID),
+        {
+            "versions": {
+                f"{filename}:{fingerprint}": {
+                    "state": "post_created",
+                    "filename": filename,
+                    "sha256": fingerprint,
+                    "action": "draft",
+                    "post_id": "post-1",
+                    "media": {"id": "media-1", "path": "/uploads/clip.mp4"},
+                },
+            },
+        },
+    )
+    captured = {}
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_thumbnail",
+        lambda _config, content, filename, content_type:
+        captured.update(content=content, filename=filename, content_type=content_type)
+        or {"id": "thumbnail-1", "path": "/uploads/thumbnail.jpg"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "update_youtube_thumbnail",
+        lambda _config, post_id, thumbnail:
+        captured.update(post_id=post_id, thumbnail=thumbnail),
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "create_youtube_post",
+        lambda *_args: pytest.fail("must not create another Postiz post"),
+    )
+
+    response = _update_ai_thumbnail()
+
+    assert response.status_code == 200
+    assert response.json()["postId"] == "post-1"
+    assert captured["post_id"] == "post-1"
+    assert captured["thumbnail"] == {
+        "id": "thumbnail-1",
+        "path": "/uploads/thumbnail.jpg",
+    }
+    assert captured["content_type"] == "image/jpeg"
 
 
 def test_postiz_publish_thumbnail_rejects_invalid_image_before_upload(postiz_job, monkeypatch):

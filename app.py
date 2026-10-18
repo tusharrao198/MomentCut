@@ -6005,7 +6005,7 @@ def _thumbnail_url(job_id: str, clip_index: int, fingerprint: str, filename: str
 
 
 def _postiz_version_is_locked(job_id: str, filename: str, fingerprint: str) -> bool:
-    """True when an exact rendered version must not be changed after handoff."""
+    """True when an exact rendered version must not be handed off again."""
     state = _read_postiz_state(_postiz_state_path(job_id))
     record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
     return isinstance(record, dict) and record.get("state") in {
@@ -6013,6 +6013,26 @@ def _postiz_version_is_locked(job_id: str, filename: str, fingerprint: str) -> b
         "post_create_pending",
         "post_create_unknown",
     }
+
+
+def _postiz_draft_thumbnail_is_editable(
+    job_id: str, filename: str, fingerprint: str
+) -> bool:
+    """Whether this exact clip has a recorded Postiz draft that can be updated.
+
+    Never trust a browser-provided post id. This accepts only the server-saved
+    result of the original idempotent handoff, and only when that handoff was a
+    draft rather than an immediate publish attempt.
+    """
+    state = _read_postiz_state(_postiz_state_path(job_id))
+    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+    return (
+        isinstance(record, dict)
+        and record.get("state") == "post_created"
+        and record.get("action") == "draft"
+        and isinstance(record.get("post_id"), str)
+        and bool(record["post_id"].strip())
+    )
 
 
 def _thumbnail_record_view(
@@ -6034,6 +6054,7 @@ def _thumbnail_record_view(
         "batchState": None,
         "hasRunningBatch": False,
         "postizLocked": False,
+        "postizDraftThumbnailEditable": False,
         "youtube": {
             "title": _postiz_metadata(clip)[0],
             "description": description,
@@ -6049,6 +6070,9 @@ def _thumbnail_record_view(
     }
     try:
         payload["postizLocked"] = _postiz_version_is_locked(
+            job_id, filename, fingerprint
+        )
+        payload["postizDraftThumbnailEditable"] = _postiz_draft_thumbnail_is_editable(
             job_id, filename, fingerprint
         )
     except PostizStateError:
@@ -6555,6 +6579,130 @@ async def post_to_postiz_with_thumbnail(
         await thumbnail.close()
 
 
+@app.post("/api/postiz/update-thumbnail")
+async def update_postiz_draft_thumbnail(req: PostizPublishRequest, request: Request):
+    """Apply a selected AI thumbnail to the existing server-recorded Postiz draft.
+
+    This intentionally cannot create a post. It only updates the thumbnail
+    setting on the draft produced by the original handoff for this exact MP4.
+    """
+    _require_local_dashboard_origin(request)
+    try:
+        config = postiz_client.configuration()
+    except postiz_client.PostizError as exc:
+        raise _postiz_http_error(exc) from exc
+    if not _JOB_ID_RE.fullmatch(req.job_id or ""):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not await _ensure_job_files(req.job_id, request) or req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    clips = (job.get("result") or {}).get("clips") or []
+    if req.clip_index < 0 or req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    publish_lock = await _postiz_publish_lock(req.job_id, req.clip_index)
+    async with publish_lock:
+        try:
+            _file_path, filename, fingerprint = await asyncio.to_thread(
+                _resolve_postiz_clip, req.job_id, clips, req.clip_index
+            )
+            state_path = _postiz_state_path(req.job_id)
+            state = await asyncio.to_thread(_read_postiz_state, state_path)
+        except PostizStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        version_key = _thumbnail_version_key(filename, fingerprint)
+        record = state["versions"].get(version_key)
+        post_id = record.get("post_id") if isinstance(record, dict) else None
+        if not (
+            isinstance(record, dict)
+            and record.get("state") == "post_created"
+            and record.get("action") == "draft"
+            and isinstance(post_id, str)
+            and post_id.strip()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This clip has no editable Postiz draft. Create a draft first, "
+                    "or update the published/scheduled post directly in Postiz."
+                ),
+            )
+
+        thumbnail_lock = await _clip_thumbnail_lock(req.job_id, req.clip_index)
+        async with thumbnail_lock:
+            try:
+                thumbnail = await asyncio.to_thread(
+                    _selected_ai_thumbnail, req.job_id, req.clip_index, filename, fingerprint
+                )
+            except ClipThumbnailStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if thumbnail is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Select an AI thumbnail before updating the Postiz draft.",
+            )
+
+        stored_thumbnail = record.get("thumbnail")
+        same_thumbnail = (
+            isinstance(stored_thumbnail, dict)
+            and stored_thumbnail.get("sha256") == thumbnail.get("sha256")
+            and isinstance(stored_thumbnail.get("media"), dict)
+            and stored_thumbnail["media"].get("id")
+            and stored_thumbnail["media"].get("path")
+        )
+        if same_thumbnail:
+            thumbnail_media = stored_thumbnail["media"]
+        else:
+            try:
+                thumbnail_media = await asyncio.to_thread(
+                    postiz_client.upload_thumbnail,
+                    config,
+                    thumbnail["content"],
+                    thumbnail["filename"],
+                    thumbnail["content_type"],
+                )
+            except postiz_client.PostizError as exc:
+                raise _postiz_http_error(exc) from exc
+            record["thumbnail"] = {
+                "filename": thumbnail["filename"],
+                "sha256": thumbnail["sha256"],
+                "media": thumbnail_media,
+            }
+            try:
+                await asyncio.to_thread(_write_postiz_state, state_path, state)
+            except PostizStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        try:
+            await asyncio.to_thread(
+                postiz_client.update_youtube_thumbnail,
+                config,
+                post_id,
+                thumbnail_media,
+            )
+        except postiz_client.PostizError as exc:
+            raise _postiz_http_error(exc) from exc
+
+        record["thumbnail_updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            await asyncio.to_thread(_write_postiz_state, state_path, state)
+        except PostizStateError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Postiz updated the draft thumbnail, but OpenShorts could not save "
+                    "its local state. Check Postiz before retrying."
+                ),
+            ) from exc
+        return {
+            "success": True,
+            "message": "Postiz draft thumbnail updated.",
+            "postId": post_id,
+        }
+
+
 async def _clip_thumbnail_context(
     job_id: str, clip_index: int, request: Request
 ) -> tuple[dict, dict, Path, str, str, dict]:
@@ -6683,9 +6831,13 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
         try:
             state_path = _clip_thumbnail_state_path(req.job_id)
             state = await asyncio.to_thread(_read_clip_thumbnail_state, state_path)
-            if await asyncio.to_thread(
+            postiz_locked = await asyncio.to_thread(
                 _postiz_version_is_locked, req.job_id, filename, fingerprint
-            ):
+            )
+            draft_thumbnail_editable = await asyncio.to_thread(
+                _postiz_draft_thumbnail_is_editable, req.job_id, filename, fingerprint
+            )
+            if postiz_locked and not draft_thumbnail_editable:
                 raise HTTPException(
                     status_code=409,
                     detail="This exact clip was already sent to Postiz. Update its draft in Postiz.",
@@ -6829,6 +6981,9 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                     req.job_id, filename, fingerprint, req.request_id, "failed", str(exc),
                 )
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+        completed_candidates = 0
+        partial_batch_state = "completed"
+        partial_batch_message = None
         for number in range(req.count):
             # Each iteration is intentional: candidate count is a quota/cost
             # choice, never an automatic retry of an uncertain request.
@@ -6842,6 +6997,13 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                     thumbnail_text=brief.get("thumbnail_text", ""),
                 )
             except clip_thumbnail_image.ClipThumbnailRequestUnknown as exc:
+                if completed_candidates:
+                    partial_batch_state = "unknown"
+                    partial_batch_message = (
+                        f"Generated {completed_candidates} of {req.count} candidates. "
+                        f"{exc} No further candidate requests were made."
+                    )
+                    break
                 await asyncio.to_thread(
                     _set_thumbnail_batch_error,
                     req.job_id, filename, fingerprint, req.request_id, "unknown",
@@ -6849,6 +7011,13 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                 )
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             except clip_thumbnail_image.ClipThumbnailImageError as exc:
+                if completed_candidates:
+                    partial_batch_state = "failed"
+                    partial_batch_message = (
+                        f"Generated {completed_candidates} of {req.count} candidates. "
+                        f"{exc} No further candidate requests were made."
+                    )
+                    break
                 await asyncio.to_thread(
                     _set_thumbnail_batch_error,
                     req.job_id, filename, fingerprint, req.request_id, "failed", str(exc),
@@ -6896,7 +7065,9 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                 )
             except PostizStateError:
                 postiz_locked = True
-            if postiz_locked:
+            if postiz_locked and not await asyncio.to_thread(
+                _postiz_draft_thumbnail_is_editable, req.job_id, filename, fingerprint
+            ):
                 await asyncio.to_thread(
                     _set_thumbnail_batch_error,
                     req.job_id, filename, fingerprint, req.request_id, "failed",
@@ -6930,6 +7101,7 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                         "filename": candidate_filename,
                         "sha256": hashlib.sha256(content).hexdigest(),
                     })
+                    completed_candidates += 1
                     await asyncio.to_thread(
                         _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
                     )
@@ -6945,7 +7117,9 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                 batch = record.get("batches", {}).get(req.request_id) if isinstance(record, dict) else None
                 if not isinstance(batch, dict):
                     raise ClipThumbnailStateError("AI thumbnail state was lost before completion.")
-                batch["state"] = "completed"
+                batch["state"] = partial_batch_state
+                if partial_batch_message:
+                    batch["message"] = partial_batch_message
                 batch["completed_at"] = datetime.now(timezone.utc).isoformat()
                 await asyncio.to_thread(
                     _write_clip_thumbnail_state, _clip_thumbnail_state_path(req.job_id), state
@@ -6980,9 +7154,13 @@ async def select_clip_thumbnail(
     lock = await _clip_thumbnail_lock(job_id, clip_index)
     async with lock:
         try:
-            if await asyncio.to_thread(
+            postiz_locked = await asyncio.to_thread(
                 _postiz_version_is_locked, job_id, filename, fingerprint
-            ):
+            )
+            draft_thumbnail_editable = await asyncio.to_thread(
+                _postiz_draft_thumbnail_is_editable, job_id, filename, fingerprint
+            )
+            if postiz_locked and not draft_thumbnail_editable:
                 raise HTTPException(
                     status_code=409,
                     detail="This exact clip was already sent to Postiz. Update its draft in Postiz.",

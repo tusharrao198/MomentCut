@@ -679,8 +679,39 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                 reused: data.reused,
                 msg: data.message || "Sent to Postiz."
             });
+            // A successful draft handoff changes the server-side thumbnail
+            // permissions for this exact clip. Refresh rather than relying on
+            // stale pre-send state, so Generate AI thumb becomes available
+            // immediately for an editable Postiz draft.
+            void loadAiThumbnailState();
         } catch (e) {
             setPostizResult({ success: false, msg: e.message || "Could not send this clip to Postiz." });
+        } finally {
+            setPostizSending(false);
+        }
+    };
+
+    const handleUpdatePostizDraftThumbnail = async () => {
+        setPostizSending(true);
+        setPostizResult(null);
+        try {
+            const res = await apiFetch('/api/postiz/update-thumbnail', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ job_id: jobId, clip_index: index }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || 'Could not update the Postiz draft thumbnail.');
+            setPostizResult({
+                success: true,
+                msg: data.message || 'Postiz draft thumbnail updated.',
+            });
+            void loadAiThumbnailState();
+        } catch (e) {
+            setPostizResult({
+                success: false,
+                msg: e.message || 'Could not update the Postiz draft thumbnail.',
+            });
         } finally {
             setPostizSending(false);
         }
@@ -765,6 +796,10 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
         || (bulkProgress?.running ?? false);
     const aiThumbnailBusy = aiThumbnailLoading || aiThumbnailState?.hasRunningBatch === true;
     const postizAlreadySent = !!postizResult?.success || aiThumbnailState?.postizLocked === true;
+    const postizDraftThumbnailEditable =
+        aiThumbnailState?.postizDraftThumbnailEditable === true;
+    const thumbnailActionsLocked =
+        postizAlreadySent && !postizDraftThumbnailEditable;
 
     // Browser-rendered previews (Remotion) live in a blob: URL that exists only
     // in this tab, so they always win over the durable copy.
@@ -969,8 +1004,12 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                                 <button
                                     key={candidate.id}
                                     onClick={() => void selectAiThumbnail(candidate.id)}
-                                    disabled={aiThumbnailBusy || postizAlreadySent}
-                                    title={candidate.selected ? 'Selected AI thumbnail' : 'Use this AI thumbnail for Send to Postiz'}
+                                    disabled={aiThumbnailBusy || thumbnailActionsLocked}
+                                    title={candidate.selected
+                                        ? 'Selected AI thumbnail'
+                                        : postizDraftThumbnailEditable
+                                            ? 'Select this thumbnail, then update the existing Postiz draft'
+                                            : 'Use this thumbnail for Send to Postiz'}
                                     className={`rounded-input overflow-hidden border text-left transition-colors ${candidate.selected ? 'border-brass ring-1 ring-brass' : 'border-rule hover:border-rule2'} disabled:opacity-50`}
                                 >
                                     <img
@@ -1080,9 +1119,9 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     {!isManaged && clipAiThumbnailsEnabled && (
                         <button
                             onClick={() => setShowAiThumbnailModal(true)}
-                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
-                            title={postizAlreadySent
-                                ? 'This clip was already sent to Postiz. Update its draft in Postiz.'
+                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || thumbnailActionsLocked}
+                            title={thumbnailActionsLocked
+                                ? 'This clip was already sent for publishing and no longer has an editable Postiz draft.'
                                 : 'Create a Gemini AI thumbnail only for this clip'}
                             className={QUIET_BTN}
                         >
@@ -1109,12 +1148,25 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
                     {aiThumbnailState?.selectedCandidateId && (
                         <button
                             onClick={() => void selectAiThumbnail(null)}
-                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || postizAlreadySent}
+                            disabled={postizSending || isVideoChanging || aiThumbnailBusy || thumbnailActionsLocked}
                             title="Do not send an AI thumbnail with this clip"
                             className={QUIET_BTN}
                         >
                             <X size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
                             clear AI thumb
+                        </button>
+                    )}
+                    {postizDraftThumbnailEditable && aiThumbnailState?.selectedCandidateId && (
+                        <button
+                            onClick={handleUpdatePostizDraftThumbnail}
+                            disabled={postizSending || isVideoChanging || aiThumbnailBusy}
+                            title="Apply the selected AI thumbnail to the existing Postiz draft"
+                            className="btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap disabled:opacity-45 disabled:cursor-not-allowed"
+                        >
+                            {postizSending
+                                ? <Loader2 size={16} className="animate-spin shrink-0" />
+                                : <ImagePlus size={16} className="shrink-0" />}
+                            {postizSending ? 'updating…' : 'update draft thumb'}
                         </button>
                     )}
 
