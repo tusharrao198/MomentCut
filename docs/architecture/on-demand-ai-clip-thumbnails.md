@@ -512,10 +512,12 @@ manual file first calls the select route with `candidate_id: null`; selecting
 an AI candidate clears the browser's manual file input. The manual
 `/api/postiz/publish-thumbnail` route always wins for that request.
 
-The card also gets a collapsed **YouTube details** panel containing title,
-composed description, tags, and a truncation warning if applicable. It is a
-review surface, not a second metadata-editing system: after **send to postiz**
-the user edits the created Postiz draft before publishing if wording needs a
+Every completed result card gets a collapsed **YouTube details** panel
+containing title, composed description, tags, and a truncation warning if
+applicable. It loads through the read-only thumbnail-state endpoint but is
+available even when AI thumbnail generation is disabled. It is a review
+surface, not a second metadata-editing system: after **send to postiz** the
+user edits the created Postiz draft before publishing if wording needs a
 change.
 
 Rules:

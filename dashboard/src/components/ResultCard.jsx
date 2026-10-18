@@ -209,12 +209,14 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
     };
 
     useEffect(() => {
-        if (!clipAiThumbnailsEnabled || isManaged) return undefined;
+        // The same read-only endpoint returns the exact composed YouTube
+        // title, description, and tags used for Postiz. Metadata review must
+        // not depend on the optional AI-thumbnail feature being enabled.
         void loadAiThumbnailState();
         // The current rendered filename is part of the server-side thumbnail
         // version key. Reload state after a subtitle/edit/reframe replacement.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [jobId, index, clip.video_url, clipAiThumbnailsEnabled, isManaged]);
+    }, [jobId, index, clip.video_url]);
 
     const handleCopy = async (field, text) => {
         try {
