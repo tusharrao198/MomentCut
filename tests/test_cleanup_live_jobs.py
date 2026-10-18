@@ -57,6 +57,17 @@ def _upload(up, job_id, age=OLD):
     return f
 
 
+def _retained_source(out, job_id, age=OLD):
+    job = _job_dir(out, job_id, age=age)
+    source = job / "source_video.mp4"
+    source.write_bytes(b"source")
+    _age(source, age)
+    (job / "source_metadata.json").write_text(
+        '{"source_video":"source_video.mp4"}', encoding="utf-8"
+    )
+    return source
+
+
 class TestJobDirSweep:
     def test_finished_old_job_is_purged(self, disk):
         out, _ = disk
@@ -186,6 +197,32 @@ class TestUploadSweep:
         monkeypatch.setattr(app_module, "UPLOADS_MAX_GB", 1 / 1024 ** 3)
         app_module._enforce_uploads_size_cap()
         assert live.exists() and not dead.exists()
+
+
+class TestRetainedSourceSweep:
+    def test_source_of_queued_url_job_survives(self, disk, monkeypatch):
+        out, _ = disk
+        monkeypatch.setattr(app_module, "SOURCE_RETENTION_SECONDS", 60)
+        source = _retained_source(out, "queued-url")
+        app_module.jobs["queued-url"] = {"status": "queued"}
+
+        assert list(app_module._sweep_retained_sources(time.time())) == []
+        assert source.exists()
+
+    def test_secondary_lease_pins_retained_source(self, disk, monkeypatch):
+        out, _ = disk
+        monkeypatch.setattr(app_module, "SOURCE_RETENTION_SECONDS", 60)
+        source = _retained_source(out, "postiz-url")
+        app_module.jobs["postiz-url"] = {"status": "completed"}
+
+        async def sweep_while_pinned():
+            async with app_module._job_activity_lease("postiz-url"):
+                assert list(app_module._sweep_retained_sources(time.time())) == []
+                assert source.exists()
+
+        asyncio.run(sweep_while_pinned())
+        assert list(app_module._sweep_retained_sources(time.time())) == ["postiz-url"]
+        assert not source.exists()
 
 
 class TestSettleWithoutEntry:
