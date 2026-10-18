@@ -2018,11 +2018,23 @@ def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs
 
 def score_batch_size():
     """Transcript windows per scoring call: ``LLM_SCORE_BATCH`` if set, else
-    8 for Gemini (1M context) and 3 for an OpenAI-compatible server."""
+    8 for Gemini (1M context) and 3 for an OpenAI-compatible server.
+
+    Local malformed-output recovery recursively bisects a batch. Cap an
+    explicit local override so one typo cannot multiply into hundreds of model
+    calls before the individual bad window is isolated.
+    """
     raw = os.environ.get("LLM_SCORE_BATCH", "").strip()
     if raw:
         try:
-            return max(1, int(raw))
+            value = max(1, int(raw))
+            if llm_backend.active() and value > 8:
+                print(
+                    f"⚠️ LLM_SCORE_BATCH={value} is too large for bounded local "
+                    "recovery; using 8."
+                )
+                return 8
+            return value
         except ValueError:
             pass
     return 3 if llm_backend.active() else 8

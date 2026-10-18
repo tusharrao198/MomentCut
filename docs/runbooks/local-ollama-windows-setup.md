@@ -133,6 +133,8 @@ Add or replace the local-model settings with this block:
 LLM_BASE_URL=http://host.docker.internal:11434/v1
 LLM_MODEL=qwen2.5:7b
 LLM_API_KEY=
+# Keep this at 3 for qwen2.5:7b. Local values above 8 are capped so a malformed
+# response cannot expand into hundreds of recursive recovery calls.
 LLM_SCORE_BATCH=3
 LLM_TIMEOUT=600
 
