@@ -395,7 +395,7 @@ Return only:
       "youtube_description_intro": "<truthful clip-specific opening paragraph>",
       "youtube_tags": ["<specific plain tag>", "..."],
       "youtube_hashtags": ["#shorts", "..."],
-      "thumbnail_brief": {
+      "thumbnail_brief": {{
         "subject": "<concrete subject>",
         "moment": "<exact moment>",
         "emotion": "<emotion>",
@@ -404,7 +404,7 @@ Return only:
         "thumbnail_text": "<2-4 word overlay>",
         "must_include": ["<visual fact>"],
         "avoid": ["<unrelated visual>"]
-      }
+      }}
     }}
   ]
 }}

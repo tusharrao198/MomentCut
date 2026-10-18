@@ -164,6 +164,8 @@ class TestDetailPromptCarriesTheCount:
             min_secs=15.0, max_secs=60.0, windows_json="[]")
         assert f"return {low} to {high} clips" in prompt
         assert "15 to 60 seconds" in prompt
+        assert '"thumbnail_brief": {' in prompt
+        assert '"subject": "<concrete subject>"' in prompt
         # The JSON schema example legitimately keeps braces (they are {{ }} in
         # the template), so assert on unsubstituted placeholders specifically.
         assert re.findall(r"\{[a-z_]+\}", prompt) == []
