@@ -162,6 +162,8 @@ GEMINI_CLIP_ANALYSIS_ENABLED=0
 
 # Optional: enable only if you want the per-clip "generate AI thumb" button.
 # Gemini receives one locally extracted JPG reference frame, not the MP4.
+# Nano Banana 2 has no Gemini API free tier: this key must belong to a
+# Gemini API project with billing enabled and image-generation quota.
 CLIP_AI_THUMBNAILS_ENABLED=1
 GEMINI_API_KEY=your_google_ai_studio_key
 CLIP_THUMBNAIL_IMAGE_MODEL=gemini-3.1-flash-image
@@ -183,6 +185,11 @@ Important limits:
   Windows laptop.
 - OpenShorts' own dashboard, API, and renderer are bound to `127.0.0.1`; other
   devices on Wi-Fi cannot reach them.
+- `gemini-3.1-flash-image` (Nano Banana 2) cannot generate images using a
+  Gemini API free-tier key. Enable billing on the Google Cloud project that
+  owns `GEMINI_API_KEY`; a Google AI Pro chat subscription is separate from
+  Gemini API billing. This affects only the optional **generate AI thumb**
+  action, never local clip generation or Postiz upload.
 
 ## 4. Build and start OpenShorts
 

@@ -163,6 +163,30 @@ def test_unknown_image_request_is_not_retried_automatically(thumbnail_job, monke
     assert second.json()["batchState"] == "unknown"
 
 
+def test_known_gemini_quota_rejection_is_retryable(thumbnail_job, monkeypatch):
+    """A 429 response is a confirmed rejection, not an uncertain paid request."""
+    class QuotaError(Exception):
+        code = 429
+
+    class Model:
+        def generate_content(self, **_kwargs):
+            raise QuotaError()
+
+    class Client:
+        models = Model()
+
+    monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
+    monkeypatch.setattr(clip_thumbnail_image.genai, "Client", lambda **_kwargs: Client())
+
+    response = _generate()
+
+    assert response.status_code == 502
+    assert "no Gemini API free tier" in response.json()["detail"]
+    retry = _generate()
+    assert retry.status_code == 502
+    assert "batchState" not in retry.json()
+
+
 def test_orphaned_running_batch_is_marked_unknown_before_a_new_request(
     thumbnail_job, monkeypatch
 ):
