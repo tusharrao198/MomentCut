@@ -253,6 +253,65 @@ def reconcile_scored_windows(scored_windows, source_windows, fallback_score=0):
     return reconciled
 
 
+def normalise_detail_candidates(candidates, source_windows, video_duration,
+                                min_duration, max_duration):
+    """Return only safe, renderable detail candidates.
+
+    A model may return valid JSON with impossible timestamps or a made-up
+    ``source_window_id``. Constrain each candidate to its known source window
+    and the source-video duration, then require the requested duration band
+    before word snapping can move its cut points.
+    """
+    duration = _finite_number(video_duration)
+    minimum = _finite_number(min_duration)
+    maximum = _finite_number(max_duration)
+    if duration is None or duration <= 0 or minimum is None or maximum is None \
+            or minimum <= 0 or maximum < minimum:
+        return []
+
+    windows_by_id = {}
+    for window in source_windows or []:
+        if not isinstance(window, dict):
+            continue
+        window_id = window.get("id")
+        start = _finite_number(window.get("start"))
+        end = _finite_number(window.get("end"))
+        if not isinstance(window_id, str) or not window_id or start is None or end is None:
+            continue
+        start = max(0.0, start)
+        end = min(duration, end)
+        if end > start:
+            windows_by_id[window_id] = (start, end)
+
+    normalised = []
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        window_id = candidate.get("source_window_id")
+        if not isinstance(window_id, str) or window_id not in windows_by_id:
+            continue
+        start = _finite_number(candidate.get("start"))
+        end = _finite_number(candidate.get("end"))
+        if start is None or end is None:
+            continue
+
+        window_start, window_end = windows_by_id[window_id]
+        start = max(0.0, window_start, start)
+        end = min(duration, window_end, end)
+        if end <= start:
+            continue
+        span = end - start
+        if span < minimum or span > maximum:
+            continue
+
+        clip = dict(candidate)
+        clip["source_window_id"] = window_id
+        clip["start"] = round(start, 3)
+        clip["end"] = round(end, 3)
+        normalised.append(clip)
+    return normalised
+
+
 def compact_words(words, precision=2):
     """Round word timestamps for prompts — full float precision wastes tokens."""
     return [

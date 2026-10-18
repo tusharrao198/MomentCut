@@ -35,6 +35,7 @@ import llm_backend
 import vision_backend
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
+                            normalise_detail_candidates,
                             reconcile_scored_windows, score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
@@ -2131,9 +2132,13 @@ def get_viral_clips(transcript_result, video_duration):
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
             return build
 
-        shorts = _run_stage_split(client, model_name, shortlist,
-                                  _detail_prompt_for(min_clips, max_clips),
-                                  gemini_worker.DetailResponse, "shorts", costs, "detail")
+        raw_shorts = _run_stage_split(client, model_name, shortlist,
+                                      _detail_prompt_for(min_clips, max_clips),
+                                      gemini_worker.DetailResponse, "shorts", costs, "detail")
+        shorts = normalise_detail_candidates(
+            raw_shorts, shortlist, video_duration, min_secs, max_secs)
+        if len(shorts) < len(raw_shorts):
+            print(f"   ⚠️ detail: discarded {len(raw_shorts) - len(shorts)} invalid clip candidate(s).")
 
         # The floor lived only in the prompt, and a prompt is not a contract:
         # the model regularly returned half of it and the job shipped that.
@@ -2148,10 +2153,15 @@ def get_viral_clips(transcript_result, video_duration):
                 missing = min_clips - len(shorts)
                 print(f"   Detail returned {len(shorts)} clip(s) of {min_clips}; "
                       f"asking the {len(spare)} unused window(s) for {missing} more.")
-                extra = _run_stage_split(
+                raw_extra = _run_stage_split(
                     client, model_name, spare,
                     _detail_prompt_for(missing, max(missing, len(spare))),
                     gemini_worker.DetailResponse, "shorts", costs, "detail-floor")
+                extra = normalise_detail_candidates(
+                    raw_extra, spare, video_duration, min_secs, max_secs)
+                if len(extra) < len(raw_extra):
+                    print(f"   ⚠️ detail-floor: discarded {len(raw_extra) - len(extra)} "
+                          "invalid clip candidate(s).")
                 if extra:
                     shorts = sorted(shorts + extra,
                                     key=lambda s: float(s.get("start") or 0))
