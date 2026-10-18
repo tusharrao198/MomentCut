@@ -95,8 +95,13 @@ def _is_format_rejection(resp: httpx.Response) -> bool:
     if resp.status_code not in (400, 422):
         return False
     body = resp.text.lower()
-    return "response_format" in body or "json_schema" in body or "json_object" in body \
-        or "format" in body
+    # Do not treat a generic word such as "format" as a response-format
+    # rejection. For example, a context-length error may say "input format
+    # exceeds context window"; retrying it with two weaker response formats
+    # only adds calls and masks the actual configuration/model limit.
+    return ("response_format" in body or "response format" in body
+            or "json_schema" in body or "json schema" in body
+            or "json_object" in body or "json object" in body)
 
 
 def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = None,
@@ -105,8 +110,9 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
 
     Returns ``(parsed_dict, cost_analysis)`` in the exact shape
     ``main._run_gemini_stage`` returns, so the caller does not branch on the
-    provider. Raises on HTTP errors, empty bodies and schema violations; the
-    retry policy lives in the caller, same as for Gemini.
+    provider. Raises on HTTP errors and unusable model bodies; a score/detail
+    response with mixed valid and invalid list items salvages its valid items.
+    The retry/split policy lives in the caller, same as for Gemini.
     """
     import gemini_worker  # local import: keeps this module free of the google SDK
 
@@ -145,10 +151,11 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
         if isinstance(text, list):  # some servers return content parts
             text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
     parsed = gemini_worker._parse_json_response_text(text)
-    # Validate against the same schema Gemini enforces server-side, so a
-    # local model that drops a field fails here with a readable error
-    # (retried by the caller) instead of deep inside the clip pipeline.
-    validated = schema.model_validate(parsed).model_dump()
+    # Gemini enforces its response schema server-side. For the local transcript
+    # picker, preserve independently valid score/detail items when a small
+    # model corrupts just one sibling; an all-invalid response still raises so
+    # main.py can bisect that batch or skip its failing singleton.
+    validated = gemini_worker.validate_local_response_items(parsed, schema)
 
     usage = data.get("usage") or {}
     cost = {
