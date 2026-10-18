@@ -153,9 +153,12 @@ def _config(max_seconds: float) -> VisionConfig:
         retry_attempts=_read_int("VISION_RETRY_ATTEMPTS", 3, 1, 3),
         window_seconds=window_seconds,
         overlap_seconds=overlap_seconds,
-        frames_per_window=_read_int("VISION_FRAMES_PER_WINDOW", 8, 4, 10),
-        max_frame_width=_read_int("VISION_MAX_FRAME_WIDTH", 640, 480, 768),
-        num_ctx=_read_int("VISION_NUM_CTX", 4096, 2048, 8192),
+        # Keep the default request comfortably below qwen2.5vl:3b's configured
+        # 8K context on a 12 GB laptop GPU. Scene sampling can add two images,
+        # so 4 regular samples is deliberately conservative.
+        frames_per_window=_read_int("VISION_FRAMES_PER_WINDOW", 4, 4, 10),
+        max_frame_width=_read_int("VISION_MAX_FRAME_WIDTH", 480, 480, 768),
+        num_ctx=_read_int("VISION_NUM_CTX", 8192, 2048, 8192),
         candidates_per_window=_read_int("VISION_CANDIDATES_PER_WINDOW", 2, 1, 3),
         scene_snap_seconds=_read_float("VISION_SCENE_SNAP_SECONDS", 2.0, 0.0, 3.0),
     )
@@ -674,9 +677,16 @@ def select_clips(video_path: str, video_duration: float, language: str,
                     candidates_per_window=config.candidates_per_window,
                 )
                 if not candidates:
-                    raise LocalVisionError(
-                        f"{label}: local Ollama returned no usable clip candidates."
+                    # A VLM can reasonably find no standalone moment in one
+                    # particular window. Continue so later windows can still
+                    # contribute candidates. Transport, decoding, and schema
+                    # failures still fail immediately above; only a valid but
+                    # empty/invalid candidate list is non-fatal here.
+                    print(
+                        f"   ⚠️ {label}: local Ollama returned no usable clip "
+                        "candidates; skipping this window."
                     )
+                    continue
                 all_candidates.extend(candidates)
         finally:
             _unload(client, config)
