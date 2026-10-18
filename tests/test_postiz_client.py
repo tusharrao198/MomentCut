@@ -258,6 +258,49 @@ def test_create_post_serializes_youtube_tags_as_postiz_tag_objects(monkeypatch):
     ]
 
 
+def test_update_draft_thumbnail_uses_settings_endpoint(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"postId": "post-123"})
+
+    _install_transport(monkeypatch, handler)
+    pc.update_youtube_thumbnail(
+        pc.configuration(),
+        "post-123",
+        {"id": "thumbnail-1", "path": "/uploads/thumbnail.jpg"},
+    )
+
+    assert seen == {
+        "method": "PUT",
+        "url": f"{pc.EXPECTED_API_BASE_URL}/posts/post-123/settings",
+        "authorization": "postiz-test-key",
+        "body": {
+            "settings": {
+                "thumbnail": {"id": "thumbnail-1", "path": "/uploads/thumbnail.jpg"},
+            },
+        },
+    }
+
+
+def test_update_draft_thumbnail_rejects_bad_id_before_network_call(monkeypatch):
+    monkeypatch.setattr(
+        pc,
+        "_client",
+        lambda *_args, **_kwargs: pytest.fail("must not call Postiz"),
+    )
+    with pytest.raises(pc.PostizError, match="draft id"):
+        pc.update_youtube_thumbnail(
+            pc.configuration(),
+            "bad/id",
+            {"id": "thumbnail-1", "path": "/uploads/thumbnail.jpg"},
+        )
+
+
 @pytest.mark.parametrize("response", [
     httpx.Response(500, text="temporary"),
     httpx.Response(201, json=[]),
