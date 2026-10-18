@@ -5668,6 +5668,10 @@ class PostizStateError(RuntimeError):
 class PostizPublishRequest(BaseModel):
     job_id: str
     clip_index: int
+    # A deliberate user action may create a second Postiz post for the same
+    # rendered MP4. It is never the default: ordinary repeated requests remain
+    # idempotent, and ambiguous outcomes still fail closed.
+    force_resend: bool = False
 
 
 class ClipThumbnailGenerateRequest(BaseModel):
@@ -6035,6 +6039,13 @@ def _postiz_draft_thumbnail_is_editable(
     )
 
 
+def _postiz_thumbnail_is_saved(job_id: str, filename: str, fingerprint: str) -> bool:
+    """Whether a future resend would reuse a server-recorded thumbnail."""
+    state = _read_postiz_state(_postiz_state_path(job_id))
+    record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+    return isinstance(record, dict) and "thumbnail" in record
+
+
 def _thumbnail_record_view(
     job_id: str,
     clip_index: int,
@@ -6055,6 +6066,7 @@ def _thumbnail_record_view(
         "hasRunningBatch": False,
         "postizLocked": False,
         "postizDraftThumbnailEditable": False,
+        "postizThumbnailSaved": False,
         "youtube": {
             "title": _postiz_metadata(clip)[0],
             "description": description,
@@ -6073,6 +6085,9 @@ def _thumbnail_record_view(
             job_id, filename, fingerprint
         )
         payload["postizDraftThumbnailEditable"] = _postiz_draft_thumbnail_is_editable(
+            job_id, filename, fingerprint
+        )
+        payload["postizThumbnailSaved"] = _postiz_thumbnail_is_saved(
             job_id, filename, fingerprint
         )
     except PostizStateError:
@@ -6310,6 +6325,8 @@ async def _post_to_postiz(
         version_key = f"{filename}:{fingerprint}"
         versions = state["versions"]
         record = versions.get(version_key)
+        resent_post = False
+        integration = None
         if record is not None:
             if not isinstance(record, dict):
                 raise HTTPException(
@@ -6317,14 +6334,57 @@ async def _post_to_postiz(
                     detail="Saved Postiz publish state is invalid. Check Postiz before retrying.",
                 )
             state_name = record.get("state")
-            if state_name == "post_created" and isinstance(record.get("post_id"), str):
-                return {
-                    "success": True,
-                    "reused": True,
+            if state_name == "post_created":
+                previous_post_id = record.get("post_id")
+                if not isinstance(previous_post_id, str) or not previous_post_id.strip():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Saved Postiz post id is invalid. Check Postiz before retrying.",
+                    )
+                if not req.force_resend:
+                    return {
+                        "success": True,
+                        "reused": True,
+                        "action": record.get("action") or config.post_type,
+                        "postId": previous_post_id,
+                        "message": "This exact clip version was already sent to Postiz.",
+                    }
+                # Verify the active YouTube integration before changing the
+                # durable record for the known previous post. A bad token or
+                # temporarily unavailable Postiz must leave that old draft
+                # fully intact and editable.
+                try:
+                    integration = await asyncio.to_thread(
+                        postiz_client.resolve_youtube_integration, config
+                    )
+                except postiz_client.PostizError as exc:
+                    raise _postiz_http_error(exc) from exc
+                # Preserve the known previous post before resetting only the
+                # post-creation state. The existing media record is reused, so
+                # an explicit resend does not upload a second copy of the MP4.
+                previous_posts = record.get("previous_posts")
+                if previous_posts is None:
+                    previous_posts = []
+                    record["previous_posts"] = previous_posts
+                if not isinstance(previous_posts, list):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Saved Postiz publish history is invalid. Check Postiz before retrying.",
+                    )
+                previous_posts.append({
+                    "post_id": previous_post_id,
                     "action": record.get("action") or config.post_type,
-                    "postId": record["post_id"],
-                    "message": "This exact clip version was already sent to Postiz.",
-                }
+                })
+                record["state"] = "media_uploaded"
+                record.pop("post_id", None)
+                record.pop("integration_id", None)
+                record.pop("action", None)
+                state_name = "media_uploaded"
+                try:
+                    await asyncio.to_thread(_write_postiz_state, state_path, state)
+                except PostizStateError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                resent_post = True
             if state_name in ("post_create_pending", "post_create_unknown"):
                 if state_name == "post_create_pending":
                     record["state"] = "post_create_unknown"
@@ -6350,12 +6410,13 @@ async def _post_to_postiz(
                     detail="Saved Postiz publish state is incomplete. Check Postiz before retrying.",
                 )
 
-        try:
-            integration = await asyncio.to_thread(
-                postiz_client.resolve_youtube_integration, config
-            )
-        except postiz_client.PostizError as exc:
-            raise _postiz_http_error(exc) from exc
+        if integration is None:
+            try:
+                integration = await asyncio.to_thread(
+                    postiz_client.resolve_youtube_integration, config
+                )
+            except postiz_client.PostizError as exc:
+                raise _postiz_http_error(exc) from exc
 
         if not isinstance(record, dict) or record.get("state") != "media_uploaded":
             try:
@@ -6539,11 +6600,18 @@ async def _post_to_postiz(
             ) from exc
 
         action = record.get("action") or config.post_type
-        message = (
-            "Postiz draft created."
-            if action == "draft"
-            else "Sent to Postiz for YouTube publishing."
-        )
+        if resent_post:
+            message = (
+                "New Postiz draft created. The previous Postiz post was kept."
+                if action == "draft"
+                else "Sent again to Postiz for YouTube publishing. The previous Postiz post was kept."
+            )
+        else:
+            message = (
+                "Postiz draft created."
+                if action == "draft"
+                else "Sent to Postiz for YouTube publishing."
+            )
         return {
             "success": True,
             "reused": False,
@@ -6564,6 +6632,7 @@ async def post_to_postiz_with_thumbnail(
     request: Request,
     job_id: str = Form(...),
     clip_index: int = Form(...),
+    force_resend: bool = Form(False),
     thumbnail: UploadFile = File(...),
 ):
     """Send the selected current MP4 and a custom thumbnail to local Postiz."""
@@ -6571,12 +6640,66 @@ async def post_to_postiz_with_thumbnail(
     try:
         selected_thumbnail = await _read_postiz_thumbnail(thumbnail)
         return await _post_to_postiz(
-            PostizPublishRequest(job_id=job_id, clip_index=clip_index),
+            PostizPublishRequest(
+                job_id=job_id,
+                clip_index=clip_index,
+                force_resend=force_resend,
+            ),
             request,
             selected_thumbnail,
         )
     finally:
         await thumbnail.close()
+
+
+@app.post("/api/postiz/clear-thumbnail")
+async def clear_postiz_thumbnail(req: PostizPublishRequest, request: Request):
+    """Forget the thumbnail chosen for a future resend of this exact MP4.
+
+    This changes only OpenShorts' local handoff state. It never modifies an
+    already-created Postiz draft or an uploaded/published YouTube video.
+    """
+    _require_local_dashboard_origin(request)
+    if not _JOB_ID_RE.fullmatch(req.job_id or ""):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not await _ensure_job_files(req.job_id, request) or req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    clips = (job.get("result") or {}).get("clips") or []
+    if req.clip_index < 0 or req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    lock = await _postiz_publish_lock(req.job_id, req.clip_index)
+    async with lock:
+        current_clip = clips[req.clip_index]
+        if not isinstance(current_clip, dict):
+            raise HTTPException(status_code=409, detail="Clip metadata is invalid.")
+        try:
+            _file_path, filename, fingerprint = await asyncio.to_thread(
+                _resolve_postiz_clip, req.job_id, [dict(current_clip)], 0
+            )
+            state_path = _postiz_state_path(req.job_id)
+            state = await asyncio.to_thread(_read_postiz_state, state_path)
+        except PostizStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
+        if record is None:
+            return {"success": True, "cleared": False}
+        if not isinstance(record, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="Saved Postiz publish state is invalid. Check Postiz before retrying.",
+            )
+        had_thumbnail = "thumbnail" in record
+        if had_thumbnail:
+            record.pop("thumbnail", None)
+            try:
+                await asyncio.to_thread(_write_postiz_state, state_path, state)
+            except PostizStateError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"success": True, "cleared": had_thumbnail}
 
 
 @app.post("/api/postiz/update-thumbnail")

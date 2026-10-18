@@ -61,12 +61,16 @@ def postiz_job(tmp_path, monkeypatch):
     return job_dir, config
 
 
-def _publish():
+def _publish(force_resend=False):
     return _request(
         "post",
         "/api/postiz/publish",
         headers={"Origin": ORIGIN},
-        json={"job_id": JOB_ID, "clip_index": 0},
+        json={
+            "job_id": JOB_ID,
+            "clip_index": 0,
+            "force_resend": force_resend,
+        },
     )
 
 
@@ -84,6 +88,15 @@ def _update_ai_thumbnail():
     return _request(
         "post",
         "/api/postiz/update-thumbnail",
+        headers={"Origin": ORIGIN},
+        json={"job_id": JOB_ID, "clip_index": 0},
+    )
+
+
+def _clear_stored_thumbnail():
+    return _request(
+        "post",
+        "/api/postiz/clear-thumbnail",
         headers={"Origin": ORIGIN},
         json={"job_id": JOB_ID, "clip_index": 0},
     )
@@ -146,6 +159,17 @@ def test_postiz_draft_thumbnail_update_rejects_hostile_browser_origin():
     assert "local OpenShorts dashboard" in response.json()["detail"]
 
 
+def test_postiz_clear_thumbnail_rejects_hostile_browser_origin():
+    response = _request(
+        "post",
+        "/api/postiz/clear-thumbnail",
+        headers={"Origin": "https://attacker.example"},
+        json={"job_id": JOB_ID, "clip_index": 0},
+    )
+    assert response.status_code == 403
+    assert "local OpenShorts dashboard" in response.json()["detail"]
+
+
 def test_self_host_cors_rejects_hostile_preflight():
     response = _request(
         "options",
@@ -194,6 +218,125 @@ def test_postiz_publish_creates_once_then_reuses_same_rendered_version(postiz_jo
     assert second.json()["reused"] is True
     assert uploaded == [(str(postiz_job[0] / "clip.mp4"), "clip.mp4")]
     assert created == [True]
+
+
+def test_postiz_publish_force_resend_creates_new_post_without_reuploading_media(postiz_job, monkeypatch):
+    uploaded, created = [], []
+    monkeypatch.setattr(
+        postiz_client,
+        "resolve_youtube_integration",
+        lambda _config: {"id": "yt-1", "identifier": "youtube"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_file",
+        lambda _config, path, filename: uploaded.append((str(path), filename))
+        or {"id": "media-1", "path": "/uploads/clip.mp4"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "create_youtube_post",
+        lambda *_args: created.append(True) or f"post-{len(created)}",
+    )
+
+    first = _publish()
+    resent = _publish(force_resend=True)
+
+    assert first.status_code == 200
+    assert resent.status_code == 200
+    assert resent.json()["reused"] is False
+    assert "previous Postiz post was kept" in resent.json()["message"]
+    assert uploaded == [(str(postiz_job[0] / "clip.mp4"), "clip.mp4")]
+    assert created == [True, True]
+
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, digest = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    state = app_module._read_postiz_state(app_module._postiz_state_path(JOB_ID))
+    record = state["versions"][f"{filename}:{digest}"]
+    assert record["post_id"] == "post-2"
+    assert record["previous_posts"] == [{"post_id": "post-1", "action": "draft"}]
+
+
+def test_postiz_publish_rejects_empty_saved_post_id(postiz_job):
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, digest = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    app_module._write_postiz_state(
+        app_module._postiz_state_path(JOB_ID),
+        {
+            "versions": {
+                f"{filename}:{digest}": {
+                    "state": "post_created",
+                    "filename": filename,
+                    "sha256": digest,
+                    "post_id": "   ",
+                    "media": {"id": "media-1", "path": "/uploads/clip.mp4"},
+                },
+            },
+        },
+    )
+
+    response = _publish(force_resend=True)
+
+    assert response.status_code == 409
+    assert "post id is invalid" in response.json()["detail"]
+
+
+def test_force_resend_keeps_old_record_when_youtube_preflight_fails(postiz_job, monkeypatch):
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, digest = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    state_path = app_module._postiz_state_path(JOB_ID)
+    initial = {
+        "versions": {
+            f"{filename}:{digest}": {
+                "state": "post_created",
+                "filename": filename,
+                "sha256": digest,
+                "post_id": "post-existing",
+                "action": "draft",
+                "media": {"id": "media-1", "path": "/uploads/clip.mp4"},
+            },
+        },
+    }
+    app_module._write_postiz_state(state_path, initial)
+
+    def unavailable(_config):
+        raise postiz_client.PostizError("YouTube is unavailable.")
+
+    monkeypatch.setattr(postiz_client, "resolve_youtube_integration", unavailable)
+    response = _publish(force_resend=True)
+
+    assert response.status_code == 400
+    assert app_module._read_postiz_state(state_path) == initial
+
+
+def test_clear_thumbnail_prevents_its_reuse_on_force_resend(postiz_job, monkeypatch):
+    created_thumbnails = []
+    monkeypatch.setattr(
+        postiz_client,
+        "resolve_youtube_integration",
+        lambda _config: {"id": "yt-1", "identifier": "youtube"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_file",
+        lambda *_args: {"id": "media-1", "path": "/uploads/clip.mp4"},
+    )
+    monkeypatch.setattr(
+        postiz_client,
+        "upload_thumbnail",
+        lambda *_args: {"id": "thumbnail-1", "path": "/uploads/thumbnail.png"},
+    )
+
+    def create_post(_config, _integration_id, _media, _title, _description, thumbnail=None, **_kwargs):
+        created_thumbnails.append(thumbnail)
+        return f"post-{len(created_thumbnails)}"
+
+    monkeypatch.setattr(postiz_client, "create_youtube_post", create_post)
+    assert _publish_with_thumbnail().status_code == 200
+    assert _clear_stored_thumbnail().json() == {"success": True, "cleared": True}
+    assert _publish(force_resend=True).status_code == 200
+    assert created_thumbnails[0] == {"id": "thumbnail-1", "path": "/uploads/thumbnail.png"}
+    assert created_thumbnails[1] is None
 
 
 def test_postiz_publish_thumbnail_uploads_and_attaches_it(postiz_job, monkeypatch):
