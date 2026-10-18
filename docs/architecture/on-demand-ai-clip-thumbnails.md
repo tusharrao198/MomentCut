@@ -49,7 +49,7 @@ any other automatic Gemini video-analysis helper.
 | Spoken-video clip selection and packaging JSON | Local Ollama `qwen2.5:7b` | Once during normal audio-video clip analysis, after local Whisper transcription | Keep `LLM_BASE_URL` set and set `GEMINI_CLIP_ANALYSIS_ENABLED=0`. |
 | Silent/speech-sparse visual clip selection | Local Ollama `qwen2.5vl:3b` | Once during silent-video analysis | Keep `VISION_PROVIDER=ollama` and set `GEMINI_CLIP_ANALYSIS_ENABLED=0`. |
 | Optional layout/on-screen/hook frame enhancement | Gemini today, but not wanted in this setup | Only when the related layout/hook option is enabled | Set `GEMINI_CLIP_ANALYSIS_ENABLED=0`; the helpers must skip without a Gemini request. |
-| On-demand per-clip AI thumbnail image | Gemini Nano Banana, `gemini-3.1-flash-image` | Only after the user clicks **Generate AI thumbnail** for that individual clip | Set `CLIP_AI_THUMBNAILS_ENABLED=0`, remove the Gemini key, or do not use the button. Clip generation and Postiz publishing continue without it. |
+| On-demand per-clip AI thumbnail image | Gemini Nano Banana, `gemini-3.1-flash-image` | Only after the user sets `CLIP_AI_THUMBNAILS_ENABLED=1` and clicks **Generate AI thumbnail** for that individual clip | This feature defaults off. Set `CLIP_AI_THUMBNAILS_ENABLED=0`, remove the Gemini key, or do not use the button to disable it. Clip generation and Postiz publishing continue without it. |
 
 For the intended private/local configuration, use all three settings below:
 
