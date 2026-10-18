@@ -34,5 +34,10 @@ def clip_analysis_enabled() -> bool:
 
 
 def clip_ai_thumbnails_enabled() -> bool:
-    """Whether the explicit per-clip Nano Banana action is available."""
-    return _enabled("CLIP_AI_THUMBNAILS_ENABLED", True)
+    """Whether the explicit per-clip Nano Banana action is available.
+
+    This new image-generation feature is deliberately opt-in. A self-hosted
+    local-first installation must set ``CLIP_AI_THUMBNAILS_ENABLED=1`` before
+    the dashboard exposes an action that can use a Gemini key and quota.
+    """
+    return _enabled("CLIP_AI_THUMBNAILS_ENABLED", False)
