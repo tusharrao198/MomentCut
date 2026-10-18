@@ -1782,6 +1782,8 @@ def _sweep_retained_sources(now=None):
     for job_id in os.listdir(OUTPUT_DIR):
         if job_id == os.path.basename(THUMBNAILS_DIR):
             continue
+        if _job_is_active(job_id, now):
+            continue
         try:
             metas = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
             if not metas:
