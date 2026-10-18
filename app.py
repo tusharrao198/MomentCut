@@ -1,4 +1,5 @@
 import os
+import copy
 import clip_packaging
 import clip_thumbnail_image
 import llm_backend
@@ -6372,6 +6373,7 @@ async def _post_to_postiz(
         versions = state["versions"]
         record = versions.get(version_key)
         resent_post = False
+        resend_previous_record = None
         integration = None
         if record is not None:
             if not isinstance(record, dict):
@@ -6405,31 +6407,20 @@ async def _post_to_postiz(
                     )
                 except postiz_client.PostizError as exc:
                     raise _postiz_http_error(exc) from exc
-                # Preserve the known previous post before resetting only the
-                # post-creation state. The existing media record is reused, so
-                # an explicit resend does not upload a second copy of the MP4.
+                # Keep the complete successful record until the replacement
+                # create succeeds. We still persist a pending marker immediately
+                # before the non-idempotent request, but a definite Postiz 4xx
+                # restores this snapshot so the existing draft remains editable.
                 previous_posts = record.get("previous_posts")
                 if previous_posts is None:
                     previous_posts = []
-                    record["previous_posts"] = previous_posts
                 if not isinstance(previous_posts, list):
                     raise HTTPException(
                         status_code=409,
                         detail="Saved Postiz publish history is invalid. Check Postiz before retrying.",
                     )
-                previous_posts.append({
-                    "post_id": previous_post_id,
-                    "action": record.get("action") or config.post_type,
-                })
-                record["state"] = "media_uploaded"
-                record.pop("post_id", None)
-                record.pop("integration_id", None)
-                record.pop("action", None)
+                resend_previous_record = copy.deepcopy(record)
                 state_name = "media_uploaded"
-                try:
-                    await asyncio.to_thread(_write_postiz_state, state_path, state)
-                except PostizStateError as exc:
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
                 resent_post = True
             if state_name in ("post_create_pending", "post_create_unknown"):
                 if state_name == "post_create_pending":
@@ -6464,7 +6455,13 @@ async def _post_to_postiz(
             except postiz_client.PostizError as exc:
                 raise _postiz_http_error(exc) from exc
 
-        if not isinstance(record, dict) or record.get("state") != "media_uploaded":
+        if (
+            not isinstance(record, dict)
+            or (
+                record.get("state") != "media_uploaded"
+                and resend_previous_record is None
+            )
+        ):
             try:
                 media = await asyncio.to_thread(
                     postiz_client.upload_file, config, file_path, filename
@@ -6562,6 +6559,14 @@ async def _post_to_postiz(
         # This durable transition is deliberately before the non-idempotent
         # create request. A crash after Postiz accepts the call cannot result in
         # OpenShorts blindly creating a second YouTube post on the next click.
+        if resend_previous_record is not None:
+            previous_posts = list(resend_previous_record.get("previous_posts") or [])
+            previous_posts.append({
+                "post_id": resend_previous_record["post_id"],
+                "action": resend_previous_record.get("action") or config.post_type,
+            })
+            record["previous_posts"] = previous_posts
+            record.pop("post_id", None)
         record["state"] = "post_create_pending"
         record["integration_id"] = str(integration.get("id") or "")
         record["action"] = config.post_type
@@ -6624,9 +6629,14 @@ async def _post_to_postiz(
                 pass
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except postiz_client.PostizError as exc:
-            # A definite 4xx response did not create a post. Retain the media
-            # reference so correcting configuration does not upload it again.
-            record["state"] = "media_uploaded"
+            # A definite 4xx response did not create a post. For an initial
+            # attempt retain its uploaded media; for a resend restore the exact
+            # previous successful record so its draft remains editable.
+            if resend_previous_record is not None:
+                record = resend_previous_record
+                versions[version_key] = record
+            else:
+                record["state"] = "media_uploaded"
             try:
                 await asyncio.to_thread(_write_postiz_state, state_path, state)
             except PostizStateError as state_exc:
