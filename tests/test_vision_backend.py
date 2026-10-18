@@ -55,6 +55,24 @@ def _ollama_response(payload):
     })
 
 
+def test_visual_response_salvages_valid_candidate_beside_malformed_sibling():
+    parsed = vision._parse_visual_response(_ollama_response({
+        "shorts": [
+            _clip()["shorts"][0],
+            {"start": 5, "end": 25},
+        ],
+    }))
+
+    assert len(parsed["shorts"]) == 1
+    assert parsed["shorts"][0]["start"] == 10.0
+
+
+def test_visual_response_allows_explicit_empty_candidate_list():
+    assert vision._parse_visual_response(
+        _ollama_response({"shorts": []})
+    ) == {"shorts": []}
+
+
 def test_rejects_remote_endpoint_before_any_http(monkeypatch):
     monkeypatch.setenv("VISION_PROVIDER", "ollama")
     monkeypatch.setenv("VISION_BASE_URL", "https://example.com")
@@ -149,6 +167,24 @@ def test_scene_snap_only_applies_when_duration_remains_valid():
     ) == (10.0, 25.0)
 
 
+def test_scene_snap_does_not_move_a_window_clip_into_a_neighbouring_window():
+    result = vision._normalise_window_shorts(
+        _clip(start=121, end=151)["shorts"],
+        window_start=120,
+        window_end=240,
+        source_duration=300,
+        min_seconds=15,
+        max_seconds=60,
+        # 119 is close enough to the proposed start, but belongs to the
+        # previous analysis window and must not become this clip's start.
+        scene_boundaries=[119, 151],
+        snap_seconds=2,
+        candidates_per_window=2,
+    )
+
+    assert [(clip["start"], clip["end"]) for clip in result] == [(121.0, 151.0)]
+
+
 def test_short_source_can_produce_one_full_duration_candidate():
     result = vision._normalise_window_shorts(
         _clip(start=1, end=9)["shorts"],
@@ -190,7 +226,9 @@ def test_two_bad_json_replies_fail_after_one_corrective_retry(local_vision):
             calls["count"] += 1
             return httpx.Response(200, json={"message": {"content": "not json"}})
 
-    with pytest.raises(vision.LocalVisionError, match="after one correction attempt"):
+    with pytest.raises(
+            vision._RecoverableWindowError,
+            match="after one correction attempt"):
         vision._window_response(
             Client(), local_vision, "prompt", ["frame"], "Local vision window 0s–60s"
         )
@@ -224,7 +262,8 @@ def test_401_fails_without_retry(local_vision):
     assert calls["count"] == 1
 
 
-def test_one_failed_window_fails_the_job_and_attempts_unload(local_vision, monkeypatch):
+def test_ollama_transport_failure_still_fails_fast_and_attempts_unload(
+        local_vision, monkeypatch):
     class Capture:
         def __init__(self, _path):
             pass
@@ -308,6 +347,133 @@ def test_empty_window_is_skipped_when_a_later_window_has_candidates(
     assert unloaded == [True]
 
 
+def test_decode_failure_is_skipped_when_a_later_window_has_candidates(
+        local_vision, monkeypatch, capsys):
+    class Capture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(vision.cv2, "VideoCapture", Capture)
+    monkeypatch.setattr(vision, "_client", lambda **_kwargs: Client())
+    monkeypatch.setattr(vision, "_preflight_model", lambda *_args: None)
+    monkeypatch.setattr(vision, "_scene_boundaries", lambda *_args: [])
+    decode_results = iter((
+        vision.LocalVisionError("could not decode any frame"),
+        ([70.0], ["image"]),
+    ))
+
+    def decode_samples(*_args):
+        result = next(decode_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(vision, "_decode_samples", decode_samples)
+    monkeypatch.setattr(vision, "_window_response", lambda *_args: _clip(70, 100))
+    monkeypatch.setattr(vision, "_unload", lambda *_args: None)
+
+    result = vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
+
+    assert [(clip["start"], clip["end"]) for clip in result["shorts"]] == [
+        (70.0, 100.0)
+    ]
+    assert "Local vision window 0.000s–120.000s: frame decode failed" in capsys.readouterr().out
+
+
+def test_invalid_structured_response_is_skipped_when_later_window_succeeds(
+        local_vision, monkeypatch, capsys):
+    class Capture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(vision.cv2, "VideoCapture", Capture)
+    monkeypatch.setattr(vision, "_client", lambda **_kwargs: Client())
+    monkeypatch.setattr(vision, "_preflight_model", lambda *_args: None)
+    monkeypatch.setattr(vision, "_scene_boundaries", lambda *_args: [])
+    monkeypatch.setattr(vision, "_decode_samples", lambda *_args: ([10.0], ["image"]))
+    responses = iter((
+        vision._RecoverableWindowError(
+            "Local vision window 0.000s–120.000s: local Ollama returned invalid "
+            "structured JSON after one correction attempt (ValueError: bad JSON)."
+        ),
+        _clip(70, 100),
+    ))
+    monkeypatch.setattr(vision, "_window_response", lambda *_args: next(responses))
+    monkeypatch.setattr(vision, "_unload", lambda *_args: None)
+
+    result = vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
+
+    assert [(clip["start"], clip["end"]) for clip in result["shorts"]] == [
+        (70.0, 100.0)
+    ]
+    assert "invalid structured JSON after one correction attempt" in capsys.readouterr().out
+
+
+def test_all_invalid_structured_responses_report_aggregate_diagnostics(
+        local_vision, monkeypatch):
+    class Capture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(vision.cv2, "VideoCapture", Capture)
+    monkeypatch.setattr(vision, "_client", lambda **_kwargs: Client())
+    monkeypatch.setattr(vision, "_preflight_model", lambda *_args: None)
+    monkeypatch.setattr(vision, "_scene_boundaries", lambda *_args: [])
+    monkeypatch.setattr(vision, "_decode_samples", lambda *_args: ([10.0], ["image"]))
+    monkeypatch.setattr(
+        vision, "_window_response",
+        lambda *_args: (_ for _ in ()).throw(
+            vision._RecoverableWindowError("invalid structured JSON after correction")
+        ),
+    )
+    monkeypatch.setattr(vision, "_unload", lambda *_args: None)
+
+    with pytest.raises(
+            vision.LocalVisionError,
+            match=r"no usable clip candidates after 2 analysis window\(s\).*"
+                  r"2 window\(s\) were skipped: invalid structured JSON after correction"):
+        vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
+
+
 def test_all_empty_windows_fail_after_every_window_is_examined(
         local_vision, monkeypatch):
     class Capture:
@@ -347,14 +513,18 @@ def test_all_empty_windows_fail_after_every_window_is_examined(
 
     with pytest.raises(
             vision.LocalVisionError,
-            match="Local Ollama vision returned no usable clip candidates"):
+            match=r"Local Ollama vision returned no usable clip candidates after "
+                  r"2 analysis window\(s\)\. 2 window\(s\) were skipped: "
+                  r"Local vision window 0\.000s–120\.000s: local Ollama returned "
+                  r"no usable clip candidates\."):
         vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
 
     assert calls["count"] == 2
     assert unloaded == [True]
 
 
-def test_decode_failure_names_the_failed_window(local_vision, monkeypatch):
+def test_all_decode_failures_report_aggregate_window_diagnostics(
+        local_vision, monkeypatch):
     class Capture:
         def __init__(self, _path):
             pass
@@ -385,7 +555,8 @@ def test_decode_failure_names_the_failed_window(local_vision, monkeypatch):
 
     with pytest.raises(
             vision.LocalVisionError,
-            match=r"Local vision window 0\.000s–120\.000s: could not decode any frame"):
+            match=r"no usable clip candidates after 2 analysis window\(s\).*"
+                  r"Local vision window 0\.000s–120\.000s: frame decode failed"):
         vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
 
 

@@ -8,7 +8,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from clip_selection import (clip_count_targets, clip_duration_bounds,
                             lookup_model_prices)
@@ -29,6 +29,10 @@ class ScoredWindowModel(BaseModel):
 
 class ScoreResponse(BaseModel):
     windows: List[ScoredWindowModel]
+
+
+class ModelResponseError(ValueError):
+    """The model answered, but its response was not usable structured output."""
 
 
 class ThumbnailBrief(BaseModel):
@@ -449,10 +453,10 @@ def _escape_invalid_unicode_escapes(text: str) -> str:
 
 def _parse_json_response_text(text: str) -> dict:
     if not text:
-        raise ValueError("Gemini returned an empty response body.")
+        raise ModelResponseError("Model returned an empty response body.")
     candidate = _extract_json_candidate(text).replace("\x00", "").strip()
     if not candidate:
-        raise ValueError("Gemini response did not contain a JSON object.")
+        raise ModelResponseError("Model response did not contain a JSON object.")
     parse_attempts = [candidate]
     sanitized_candidate = _escape_invalid_unicode_escapes(candidate)
     if sanitized_candidate != candidate:
@@ -463,7 +467,68 @@ def _parse_json_response_text(text: str) -> dict:
             return json.loads(parse_candidate)
         except json.JSONDecodeError as e:
             last_error = e
-    raise ValueError(f"Failed to parse Gemini JSON response: {last_error}")
+    raise ModelResponseError(f"Failed to parse model JSON response: {last_error}")
+
+
+def validate_local_response_items(payload, schema, *, allow_empty=False):
+    """Validate a local selection response without losing good list items.
+
+    Gemini applies ``response_schema`` server-side, so its whole-response
+    validation remains the normal all-or-nothing contract. Local OpenAI-
+    compatible models can produce one malformed item beside useful ones. For
+    the score/detail/visual-selection schemas, retain each independently valid
+    item and let the caller decide whether an empty response is meaningful.
+    """
+    if schema is ScoreResponse:
+        key, item_schema = "windows", ScoredWindowModel
+    elif schema is DetailResponse:
+        key, item_schema = "shorts", DetailClipModel
+    elif schema is VisualResponse:
+        key, item_schema = "shorts", VisualClipModel
+    else:
+        # This helper is deliberately narrow: other schemas do not use the
+        # local transcript model and must retain their original strict shape.
+        return schema.model_validate(payload).model_dump()
+
+    if not isinstance(payload, dict):
+        raise ModelResponseError("Model response was not a JSON object.")
+    raw_items = payload.get(key)
+    if not isinstance(raw_items, list):
+        raise ModelResponseError(f"Model response did not contain a list named '{key}'.")
+    if not raw_items:
+        if allow_empty:
+            return schema.model_validate({key: []}).model_dump()
+        raise ModelResponseError(f"Model response did not contain any '{key}' items.")
+
+    try:
+        return schema.model_validate(payload).model_dump()
+    except ValidationError:
+        pass
+
+    valid_items = []
+    for item in raw_items:
+        try:
+            # The score reconciliation path deliberately replaces model
+            # start/end with the canonical input window and treats ``reason``
+            # as display-only. Do not discard an otherwise useful local score
+            # merely because a small model omitted one of those fields; an id
+            # and score are still required and validated by Pydantic.
+            if schema is ScoreResponse and isinstance(item, dict):
+                item = {
+                    "start": 0,
+                    "end": 0,
+                    "reason": str(item.get("reason") or ""),
+                    "id": item.get("id"),
+                    "score": item.get("score"),
+                }
+            valid_items.append(item_schema.model_validate(item).model_dump())
+        except ValidationError:
+            # A single malformed model item must not discard the rest.
+            continue
+
+    if not valid_items:
+        raise ModelResponseError(f"Model response did not contain any valid '{key}' items.")
+    return schema.model_validate({key: valid_items}).model_dump()
 
 
 def upload_media(client, path, mime_type=None):
