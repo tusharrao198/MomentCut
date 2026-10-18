@@ -735,7 +735,7 @@ creation are not included in this scope.
 
 | File | Exact responsibility |
 |---|---|
-| New `gemini_feature_flags.py` | Provide one strict boolean reader for `GEMINI_CLIP_ANALYSIS_ENABLED` (default `true` for backwards compatibility) and `CLIP_AI_THUMBNAILS_ENABLED` (default `true` once this feature ships). No caller may infer permission to call Gemini merely from a key being present. |
+| New `gemini_feature_flags.py` | Provide one strict boolean reader for `GEMINI_CLIP_ANALYSIS_ENABLED` (default `true` for backwards compatibility) and `CLIP_AI_THUMBNAILS_ENABLED` (default `false`; explicit paid-image opt-in). No caller may infer permission to call Gemini merely from a key being present. |
 | `gemini_worker.py` | Import `Field`; add `ThumbnailBrief`; extend `DetailClipModel` and `VisualClipModel`; extend `DETAIL_PROMPT_TEMPLATE` with the four packaging fields. |
 | `main.py` | Call the packaging normaliser after successful local/Gemini detail results and before clip metadata is written. Before either Gemini score/detail fallback or Gemini silent-video fallback, reject with a clear local-model configuration error when `GEMINI_CLIP_ANALYSIS_ENABLED=0`. No new model call is added. |
 | `vision_backend.py` | Extend `_visual_prompt()` and `_normalise_window_shorts()` with the compatible packaging metadata. It must never send an MP4 to an external provider. |
