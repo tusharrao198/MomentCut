@@ -235,7 +235,7 @@ def test_create_post_includes_optional_youtube_thumbnail(monkeypatch):
     }
 
 
-def test_create_post_serializes_youtube_tags_as_label_objects(monkeypatch):
+def test_create_post_serializes_youtube_tags_as_postiz_tag_objects(monkeypatch):
     seen = {}
 
     def handler(request):
@@ -253,8 +253,8 @@ def test_create_post_serializes_youtube_tags_as_label_objects(monkeypatch):
     )
 
     assert seen["body"]["posts"][0]["settings"]["tags"] == [
-        {"label": "gameplay"},
-        {"label": "Boss Fight"},
+        {"label": "gameplay", "value": "gameplay"},
+        {"label": "Boss Fight", "value": "Boss Fight"},
     ]
 
 

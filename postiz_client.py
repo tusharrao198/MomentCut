@@ -313,7 +313,9 @@ def create_youtube_post(
     if not media_id or not media_path:
         raise PostizError("Saved Postiz media state is invalid.")
     youtube_tags = [
-        {"label": label}
+        # Postiz validates both display text and canonical value. They are the
+        # same for OpenShorts' already-normalised plain-string tags.
+        {"label": label, "value": label}
         for label in normalise_tags(tags or [], maximum_items=20)
     ]
 

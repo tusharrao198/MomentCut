@@ -669,8 +669,9 @@ the private `openshorts-postiz` Docker network.
 
 Extend `postiz_client.create_youtube_post()` with keyword-only
 `tags: list[str] | None = None`, normalise them before constructing the
-payload, and send each as `{"label": "<tag>"}` in YouTube `settings.tags`.
-Postiz's YouTube provider reads `settings.tags[*].label`. Update
+payload, and send each as `{"label": "<tag>", "value": "<tag>"}` in YouTube
+`settings.tags`. Postiz validates both fields and its YouTube provider reads
+`settings.tags[*].label`. Update
 `_postiz_metadata()` to return title, composed long YouTube description,
 normalised tags, and the `truncated` flag instead of falling back to the
 Instagram/TikTok caption.
@@ -691,7 +692,7 @@ there without bypassing SSRF protection for arbitrary URLs.
 | New `clip_packaging.py` | Hold `normalise_clip_packaging_metadata()`, profile loading/validation, `compose_youtube_metadata()`, tag-size accounting, and transcript-excerpt extraction. This keeps `app.py` from becoming a second packaging implementation. |
 | New `clip_thumbnail_image.py` | Hold only Nano Banana model configuration, bounded prompt construction, `generate_content` image call, inline-image extraction, Pillow decode/re-encode, 1280x720 finalisation, and AI provenance marking. It refuses work when `CLIP_AI_THUMBNAILS_ENABLED=0`. |
 | `app.py` | Hold request/response Pydantic models, local-origin guard rename, per-clip state locks, global generation gate, safe frame extraction, durable thumbnail state, generate/get/select endpoints, selected-candidate resolution, and the Postiz metadata handoff. It returns a clear disabled-feature response before resolving a Gemini key. |
-| `postiz_client.py` | Accept keyword-only normalised tags and serialize them as `settings.tags: [{"label": tag}]`; preserve current MP4/thumbnail retry and unknown-outcome logic. |
+| `postiz_client.py` | Accept keyword-only normalised tags and serialize them as `settings.tags: [{"label": tag, "value": tag}]`; preserve current MP4/thumbnail retry and unknown-outcome logic. |
 | `dashboard/src/components/ResultCard.jsx` | Add modal, request UUID handling, loading/error state, candidate hydration/selection, metadata disclosure, and mutually exclusive manual/AI thumbnail UI. Reuse the existing `geminiApiKey` prop only to create the existing `X-Gemini-Key` header when BYOK is used. |
 | `.env.example`, `config/youtube-channel-profile.example.json`, `.gitignore` | Document the new image/profile settings, provide a non-secret profile template, and ignore only the personal profile. |
 | `tests/test_clip_thumbnail.py` plus existing Postiz tests | Cover request idempotency, state recovery, input/path/image limits, profile safety, prompt bounds, tag payload, candidate selection, stale MP4s, and publish retry behavior. |
