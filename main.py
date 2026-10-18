@@ -676,7 +676,14 @@ def truncate_bytes(text, max_bytes):
 
 
 def sanitize_filename(filename):
-    """Remove invalid characters from filename and bound it for the filesystem."""
+    """Replace unsafe path/URL characters and bound the filesystem stem.
+
+    Generated clip names are also used as URL path segments. In particular,
+    ``#`` starts a browser fragment and ``?`` starts a query string, so leaving
+    either in a local upload's stem makes the preview request only part of the
+    real filename. ``%`` is replaced too so a filename cannot accidentally be
+    interpreted as a percent-encoded path.
+    """
     # "canción" has two Unicode spellings: a precomposed ó (NFC) or an o plus a
     # combining acute (NFD). yt-dlp hands over titles in either, and the name
     # becomes the clip file, the R2 key and the URL path. Measured 24-ago-2026:
@@ -685,9 +692,21 @@ def sanitize_filename(filename):
     # every clip with a Spanish title. Normalising here fixes the whole chain at
     # its source, and is a no-op for the ASCII names that already worked.
     filename = unicodedata.normalize('NFC', filename)
-    filename = re.sub(r'[<>:"/\\|?*#]', '', filename)
-    filename = filename.replace(' ', '_')
-    return truncate_bytes(filename, MAX_TITLE_BYTES)
+    filename = re.sub(r'[<>:"/\\|?*#%\x00-\x1f]', '_', filename)
+    filename = re.sub(r'\s+', '_', filename)
+    filename = re.sub(r'_+', '_', filename).strip('._ ')
+    return truncate_bytes(filename, MAX_TITLE_BYTES) or "video"
+
+
+def video_title_from_local_path(input_video):
+    """Safe output stem for a user-supplied local file.
+
+    YouTube titles already pass through ``sanitize_filename`` while being
+    downloaded. Local uploads used their basename verbatim, allowing URL
+    delimiters such as ``#`` to survive into every generated clip filename.
+    """
+    stem = os.path.splitext(os.path.basename(input_video))[0]
+    return sanitize_filename(stem)
 
 
 def is_youtube_url(url):
@@ -2805,7 +2824,7 @@ if __name__ == '__main__':
             args.url, output_dir, on_audio=_on_audio if use_early else None)
     else:
         input_video = args.input
-        video_title = os.path.splitext(os.path.basename(input_video))[0]
+        video_title = video_title_from_local_path(input_video)
         
         if args.output and not args.skip_analysis:
             # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
