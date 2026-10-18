@@ -23,6 +23,13 @@ def _jpeg_bytes():
     return output.getvalue()
 
 
+def _different_jpeg_bytes():
+    image = Image.new("RGB", (8, 8), color=(90, 80, 70))
+    output = io.BytesIO()
+    image.save(output, "JPEG")
+    return output.getvalue()
+
+
 def _request(method, path, **kwargs):
     async def send():
         transport = httpx.ASGITransport(app=app_module.app)
@@ -64,6 +71,7 @@ def thumbnail_job(tmp_path, monkeypatch):
     })
     monkeypatch.setattr(app_module, "_clip_thumbnail_locks", {})
     monkeypatch.setattr(app_module, "_clip_thumbnail_generation_gate", asyncio.BoundedSemaphore(1))
+    monkeypatch.setattr(app_module, "_clip_thumbnail_generation_gate_guard", asyncio.Lock())
     monkeypatch.setenv("GEMINI_API_KEY", "not-exposed")
     monkeypatch.setenv("CLIP_AI_THUMBNAILS_ENABLED", "1")
     return job_dir
@@ -144,3 +152,70 @@ def test_unknown_image_request_is_not_retried_automatically(thumbnail_job, monke
     second = _generate(request_id)
     assert second.status_code == 200
     assert second.json()["batchState"] == "unknown"
+
+
+def test_orphaned_running_batch_is_marked_unknown_before_a_new_request(
+    thumbnail_job, monkeypatch
+):
+    monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        clip_thumbnail_image,
+        "generate_clip_thumbnail",
+        lambda *_args, **_kwargs: _jpeg_bytes(),
+    )
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    state_path = thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    state_path.write_text(json.dumps({
+        "versions": {
+            f"{filename}:{fingerprint}": {
+                "filename": filename,
+                "sha256": fingerprint,
+                "selected_candidate_id": None,
+                "batches": {
+                    str(uuid.uuid4()): {
+                        "state": "running",
+                        "requested_count": 1,
+                        "started_at": "2026-10-18T00:00:00+00:00",
+                        "candidates": [],
+                    },
+                },
+            },
+        },
+    }), encoding="utf-8")
+
+    response = _generate()
+
+    assert response.status_code == 409
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    batch = next(iter(persisted["versions"][f"{filename}:{fingerprint}"]["batches"].values()))
+    assert batch["state"] == "unknown"
+    assert "may have reached Gemini" in batch["message"]
+
+
+def test_selection_rejects_a_candidate_whose_saved_hash_no_longer_matches(
+    thumbnail_job, monkeypatch
+):
+    monkeypatch.setattr(app_module, "_make_clip_reference_frame", lambda *_args: (None, None))
+    monkeypatch.setattr(
+        clip_thumbnail_image,
+        "generate_clip_thumbnail",
+        lambda *_args, **_kwargs: _jpeg_bytes(),
+    )
+    response = _generate()
+    assert response.status_code == 200
+    candidate = response.json()["candidates"][0]
+
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, _filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    root = thumbnail_job / "ai_thumbnails" / "0" / fingerprint
+    (root / candidate["url"].rsplit("/", 1)[-1]).write_bytes(_different_jpeg_bytes())
+
+    selected = _request(
+        "post",
+        f"/api/clip-thumbnail/{JOB_ID}/0/select",
+        headers={"Origin": ORIGIN},
+        json={"candidate_id": candidate["id"]},
+    )
+
+    assert selected.status_code == 409

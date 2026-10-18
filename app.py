@@ -5655,6 +5655,10 @@ CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS = min(
 _clip_thumbnail_generation_gate = asyncio.BoundedSemaphore(
     CLIP_THUMBNAIL_MAX_CONCURRENT_GENERATIONS
 )
+# ``asyncio.Semaphore`` has no non-blocking acquire. This short mutex makes
+# the check-and-reserve sequence atomic, so competing requests are rejected
+# rather than becoming an invisible queue of paid image work.
+_clip_thumbnail_generation_gate_guard = asyncio.Lock()
 
 
 class PostizStateError(RuntimeError):
@@ -6117,6 +6121,7 @@ def _selected_ai_thumbnail(
     if not isinstance(selected, str) or not re.fullmatch(r"[0-9a-f]{32}", selected):
         return None
     candidate_filename = None
+    candidate_sha256 = None
     if isinstance(batches, dict):
         for batch in batches.values():
             if not isinstance(batch, dict):
@@ -6124,11 +6129,14 @@ def _selected_ai_thumbnail(
             for candidate in batch.get("candidates") or []:
                 if isinstance(candidate, dict) and candidate.get("id") == selected:
                     candidate_filename = candidate.get("filename")
+                    candidate_sha256 = candidate.get("sha256")
                     break
             if candidate_filename:
                 break
     if not isinstance(candidate_filename, str) or not re.fullmatch(
         r"candidate-[0-9a-f]{32}\.jpg", candidate_filename
+    ) or not isinstance(candidate_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", candidate_sha256
     ):
         raise ClipThumbnailStateError("Selected AI thumbnail state is invalid.")
     root = _clip_thumbnail_root(job_id, clip_index, fingerprint)
@@ -6142,6 +6150,8 @@ def _selected_ai_thumbnail(
         result = _validated_postiz_thumbnail_content(content)
     except HTTPException as exc:
         raise ClipThumbnailStateError("Selected AI thumbnail file is invalid.") from exc
+    if result["sha256"] != candidate_sha256:
+        raise ClipThumbnailStateError("Selected AI thumbnail file does not match its saved state.")
     result["filename"] = f"openshorts-ai-thumbnail-{result['sha256'][:16]}.jpg"
     return result
 
@@ -6592,6 +6602,33 @@ def _set_thumbnail_batch_error(
     _write_clip_thumbnail_state(state_path, state)
 
 
+def _mark_orphaned_thumbnail_batches_unknown(record: dict) -> bool:
+    """Resolve persisted running batches after an interrupted server request.
+
+    A process restart cannot tell whether a prior Gemini call reached the
+    provider. It must never be silently replayed. The next explicit user
+    request first converts such batches to ``unknown`` and surfaces a warning;
+    a later, separate click may start a fresh paid request.
+    """
+    batches = record.get("batches")
+    if not isinstance(batches, dict):
+        return False
+    changed = False
+    completed_at = datetime.now(timezone.utc).isoformat()
+    for batch in batches.values():
+        if not isinstance(batch, dict) or batch.get("state") != "running":
+            continue
+        batch["state"] = "unknown"
+        batch["message"] = (
+            "A previous AI thumbnail request did not finish. It may have reached "
+            "Gemini and consumed quota. Review this warning, then start a new "
+            "batch only if you want another image request."
+        )
+        batch["completed_at"] = completed_at
+        changed = True
+    return changed
+
+
 @app.get("/api/clip-thumbnail/{job_id}/{clip_index}")
 async def get_clip_thumbnail_state(job_id: str, clip_index: int, request: Request):
     """Read non-secret candidate state and composed YouTube metadata for one clip."""
@@ -6630,9 +6667,6 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
         raise HTTPException(status_code=400, detail="instructions must be text.")
     if len(req.instructions.encode("utf-8", errors="ignore")) > CLIP_THUMBNAIL_MAX_INSTRUCTIONS_BYTES:
         raise HTTPException(status_code=400, detail="instructions must be at most 600 UTF-8 bytes.")
-    api_key = await resolve_gemini(request)
-    if not api_key:
-        raise gemini_missing_error()
 
     job, clip, file_path, filename, fingerprint, transcript = await _clip_thumbnail_context(
         req.job_id, req.clip_index, request
@@ -6640,6 +6674,7 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
     del job
     version_key = _thumbnail_version_key(filename, fingerprint)
     lock = await _clip_thumbnail_lock(req.job_id, req.clip_index)
+    generation_slot_reserved = False
     async with lock:
         try:
             state_path = _clip_thumbnail_state_path(req.job_id)
@@ -6666,35 +6701,52 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
                 return _thumbnail_record_view(
                     req.job_id, req.clip_index, filename, fingerprint, record, clip, transcript
                 )
-            if _clip_thumbnail_generation_gate.locked():
-                raise HTTPException(
-                    status_code=429,
-                    detail="Another AI thumbnail is generating. Wait for it to finish before starting another.",
-                )
-            record["batches"][req.request_id] = {
-                "state": "running",
-                "requested_count": req.count,
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "candidates": [],
-            }
-            await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
+            async with _clip_thumbnail_generation_gate_guard:
+                if _clip_thumbnail_generation_gate.locked():
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Another AI thumbnail is generating. Wait for it to finish before starting another.",
+                    )
+                if _mark_orphaned_thumbnail_batches_unknown(record):
+                    await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "A previous AI thumbnail request did not finish and may have "
+                            "consumed quota. Review the warning, then click Generate again "
+                            "only if you want a new image request."
+                        ),
+                    )
+            api_key = await resolve_gemini(request)
+            if not api_key:
+                raise gemini_missing_error()
+            # Reserve the global slot while holding this clip's lock. This
+            # makes a persisted ``running`` batch unambiguously active until
+            # the server process exits; a later request can safely treat one
+            # as orphaned only when this gate is unlocked.
+            async with _clip_thumbnail_generation_gate_guard:
+                if _clip_thumbnail_generation_gate.locked():
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Another AI thumbnail is generating. Wait for it to finish before starting another.",
+                    )
+                await _clip_thumbnail_generation_gate.acquire()
+                generation_slot_reserved = True
+            try:
+                record["batches"][req.request_id] = {
+                    "state": "running",
+                    "requested_count": req.count,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "candidates": [],
+                }
+                await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
+            except BaseException:
+                _clip_thumbnail_generation_gate.release()
+                generation_slot_reserved = False
+                raise
         except (ClipThumbnailStateError, PostizStateError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    # Acquire without queueing a second paid operation. The preliminary
-    # locked() check is followed by an immediate acquire in this coroutine,
-    # so a competing request sees it locked rather than entering a queue.
-    if _clip_thumbnail_generation_gate.locked():
-        await asyncio.to_thread(
-            _set_thumbnail_batch_error,
-            req.job_id, filename, fingerprint, req.request_id, "failed",
-            "Another AI thumbnail generation started first. Start a new batch when it finishes.",
-        )
-        raise HTTPException(
-            status_code=429,
-            detail="Another AI thumbnail is generating. Start a new batch when it finishes.",
-        )
-    await _clip_thumbnail_generation_gate.acquire()
     try:
         root = await asyncio.to_thread(
             _clip_thumbnail_root, req.job_id, req.clip_index, fingerprint
@@ -6900,7 +6952,8 @@ async def generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Re
             req.job_id, req.clip_index, filename, fingerprint, record, clip, transcript
         )
     finally:
-        _clip_thumbnail_generation_gate.release()
+        if generation_slot_reserved:
+            _clip_thumbnail_generation_gate.release()
 
 
 @app.post("/api/clip-thumbnail/{job_id}/{clip_index}/select")
@@ -6923,6 +6976,13 @@ async def select_clip_thumbnail(
     lock = await _clip_thumbnail_lock(job_id, clip_index)
     async with lock:
         try:
+            if await asyncio.to_thread(
+                _postiz_version_is_locked, job_id, filename, fingerprint
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This exact clip was already sent to Postiz. Update its draft in Postiz.",
+                )
             state_path = _clip_thumbnail_state_path(job_id)
             state = await asyncio.to_thread(_read_clip_thumbnail_state, state_path)
             record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
@@ -6941,21 +7001,29 @@ async def select_clip_thumbnail(
                     detail="AI thumbnail generation is still running. Wait before selecting a candidate.",
                 )
             if candidate_id is not None:
-                candidate_filename = next((
-                    candidate.get("filename")
+                candidate = next((
+                    candidate
                     for batch in record["batches"].values() if isinstance(batch, dict)
                     for candidate in (batch.get("candidates") or [])
                     if isinstance(candidate, dict) and candidate.get("id") == candidate_id
                 ), None)
+                candidate_filename = candidate.get("filename") if isinstance(candidate, dict) else None
+                candidate_sha256 = candidate.get("sha256") if isinstance(candidate, dict) else None
                 if not isinstance(candidate_filename, str) or not re.fullmatch(
                     r"candidate-[0-9a-f]{32}\.jpg", candidate_filename
+                ) or not isinstance(candidate_sha256, str) or not re.fullmatch(
+                    r"[0-9a-f]{64}", candidate_sha256
                 ):
                     raise HTTPException(status_code=404, detail="AI thumbnail candidate not found.")
                 try:
                     root = _clip_thumbnail_root(job_id, clip_index, fingerprint)
                     candidate_path = (root / candidate_filename).resolve(strict=True)
                     candidate_path.relative_to(root)
-                    _validated_postiz_thumbnail_content(candidate_path.read_bytes())
+                    checked = _validated_postiz_thumbnail_content(candidate_path.read_bytes())
+                    if checked["sha256"] != candidate_sha256:
+                        raise ClipThumbnailStateError(
+                            "AI thumbnail candidate hash does not match its state."
+                        )
                 except HTTPException as exc:
                     raise HTTPException(
                         status_code=409, detail="AI thumbnail candidate is invalid."
@@ -6966,7 +7034,7 @@ async def select_clip_thumbnail(
                     ) from exc
             record["selected_candidate_id"] = candidate_id
             await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
-        except ClipThumbnailStateError as exc:
+        except (ClipThumbnailStateError, PostizStateError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _thumbnail_record_view(
         job_id, clip_index, filename, fingerprint, record, clip, transcript

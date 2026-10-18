@@ -94,6 +94,12 @@ candidates, but must explain that every candidate is a separate image-model
 request. Generating a thumbnail failure must never fail, delete, or rerender
 the completed short.
 
+If OpenShorts is interrupted while a Gemini request is in progress, it cannot
+know whether Gemini received it. The next **Generate AI thumbnail** click does
+not silently retry: it first marks the unfinished batch as `unknown` and shows
+the quota warning. Review it, then click Generate once more to consciously
+start a new request.
+
 ## Scope
 
 ### Included
