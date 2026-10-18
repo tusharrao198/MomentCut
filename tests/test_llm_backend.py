@@ -117,6 +117,23 @@ def test_generic_format_error_does_not_trigger_response_format_fallback(
     assert calls["n"] == 1
 
 
+@pytest.mark.parametrize("payload", [
+    [],
+    {"choices": "not-a-list"},
+    {"choices": ["not-an-object"]},
+    {"choices": [{"message": "not-an-object"}]},
+])
+def test_malformed_completion_envelope_is_a_recoverable_model_error(
+    local, monkeypatch, payload
+):
+    _serve(lambda _request: httpx.Response(200, json=payload), monkeypatch)
+
+    with pytest.raises(
+        gemini_worker.ModelResponseError, match="Local LLM completion"
+    ):
+        llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+
+
 def test_code_fenced_json_is_accepted(local, monkeypatch):
     """Small models wrap the object in ```json fences even when told not to."""
     def handler(request):

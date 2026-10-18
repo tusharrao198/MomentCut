@@ -137,16 +137,37 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
             if resp.status_code >= 400:
                 raise RuntimeError(
                     f"LLM server {resp.status_code} from {url}: {resp.text[:300]}")
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise gemini_worker.ModelResponseError(
+                    "Local LLM completion response was not JSON."
+                ) from exc
             break
         else:
             raise RuntimeError(
                 f"LLM server rejected every response_format variant: {last_rejection}")
 
+    if not isinstance(data, dict):
+        raise gemini_worker.ModelResponseError(
+            "Local LLM completion response was not a JSON object."
+        )
     choices = data.get("choices") or []
+    if not isinstance(choices, list):
+        raise gemini_worker.ModelResponseError(
+            "Local LLM completion response did not contain a choices list."
+        )
     text = ""
     if choices:
+        if not isinstance(choices[0], dict):
+            raise gemini_worker.ModelResponseError(
+                "Local LLM completion choice was not a JSON object."
+            )
         msg = choices[0].get("message") or {}
+        if not isinstance(msg, dict):
+            raise gemini_worker.ModelResponseError(
+                "Local LLM completion message was not a JSON object."
+            )
         text = msg.get("content") or ""
         if isinstance(text, list):  # some servers return content parts
             text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
@@ -158,6 +179,8 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
     validated = gemini_worker.validate_local_response_items(parsed, schema)
 
     usage = data.get("usage") or {}
+    if not isinstance(usage, dict):
+        usage = {}
     cost = {
         "input_tokens": int(usage.get("prompt_tokens") or 0),
         "output_tokens": int(usage.get("completion_tokens") or 0),
