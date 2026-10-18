@@ -321,6 +321,46 @@ def test_unrelated_active_generation_does_not_hide_orphaned_batch(
     assert response.json()["hasRunningBatch"] is False
 
 
+def test_duplicate_request_id_recovers_its_orphan_before_returning(
+    thumbnail_job, monkeypatch
+):
+    provider_calls = []
+    monkeypatch.setattr(
+        clip_thumbnail_image,
+        "generate_clip_thumbnail",
+        lambda *_args, **_kwargs: provider_calls.append(True) or _jpeg_bytes(),
+    )
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    request_id = str(uuid.uuid4())
+    state_path = thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    state_path.write_text(json.dumps({
+        "versions": {
+            f"{filename}:{fingerprint}": {
+                "filename": filename,
+                "sha256": fingerprint,
+                "selected_candidate_id": None,
+                "batches": {
+                    request_id: {
+                        "state": "running",
+                        "requested_count": 1,
+                        "started_at": "2026-10-18T00:00:00+00:00",
+                        "candidates": [],
+                    },
+                },
+            },
+        },
+    }), encoding="utf-8")
+
+    response = _generate(request_id=request_id)
+
+    assert response.status_code == 409
+    assert provider_calls == []
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    batch = persisted["versions"][f"{filename}:{fingerprint}"]["batches"][request_id]
+    assert batch["state"] == "unknown"
+
+
 def test_selection_rejects_a_candidate_whose_saved_hash_no_longer_matches(
     thumbnail_job, monkeypatch
 ):
