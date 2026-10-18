@@ -5698,6 +5698,10 @@ _clip_thumbnail_generation_gate = asyncio.BoundedSemaphore(
 # the check-and-reserve sequence atomic, so competing requests are rejected
 # rather than becoming an invisible queue of paid image work.
 _clip_thumbnail_generation_gate_guard = asyncio.Lock()
+# Identity of the one request that currently owns the global generation slot.
+# A semaphore alone cannot distinguish that live request from stale ``running``
+# records left by an interrupted process or an unrelated clip.
+_clip_thumbnail_active_request: Optional[tuple[str, int, str]] = None
 
 
 def _forget_job_secondary_locks(job_id: str) -> None:
@@ -7046,7 +7050,9 @@ def _set_thumbnail_batch_error(
         print(f"⚠️ Could not persist AI thumbnail terminal state ({type(exc).__name__}).")
 
 
-def _mark_orphaned_thumbnail_batches_unknown(record: dict) -> bool:
+def _mark_orphaned_thumbnail_batches_unknown(
+    record: dict, active_request_id: Optional[str] = None
+) -> bool:
     """Resolve persisted running batches after an interrupted server request.
 
     A process restart cannot tell whether a prior Gemini call reached the
@@ -7059,8 +7065,10 @@ def _mark_orphaned_thumbnail_batches_unknown(record: dict) -> bool:
         return False
     changed = False
     completed_at = datetime.now(timezone.utc).isoformat()
-    for batch in batches.values():
+    for request_id, batch in batches.items():
         if not isinstance(batch, dict) or batch.get("state") != "running":
+            continue
+        if request_id == active_request_id:
             continue
         batch["state"] = "unknown"
         batch["message"] = (
@@ -7091,15 +7099,23 @@ async def _get_clip_thumbnail_state(
             state_path = _clip_thumbnail_state_path(job_id)
             state = await asyncio.to_thread(_read_clip_thumbnail_state, state_path)
             record = state["versions"].get(_thumbnail_version_key(filename, fingerprint))
-            # An active request holds the one global generation slot. If it is
-            # unlocked, a persisted running record belongs to an interrupted
-            # request from an earlier process and can be surfaced immediately
-            # as recoverable without charging for another image request.
-            if (
-                isinstance(record, dict)
-                and not _clip_thumbnail_generation_gate.locked()
-                and _mark_orphaned_thumbnail_batches_unknown(record)
-            ):
+            # Preserve only the exact request that owns the generation slot.
+            # A request for another clip must not keep this clip's orphaned
+            # ``running`` record alive.
+            async with _clip_thumbnail_generation_gate_guard:
+                active = _clip_thumbnail_active_request
+                active_request_id = (
+                    active[2]
+                    if active is not None and active[:2] == (job_id, clip_index)
+                    else None
+                )
+                recovered = (
+                    isinstance(record, dict)
+                    and _mark_orphaned_thumbnail_batches_unknown(
+                        record, active_request_id
+                    )
+                )
+            if recovered:
                 try:
                     await asyncio.to_thread(
                         _write_clip_thumbnail_state, state_path, state
@@ -7126,6 +7142,7 @@ async def get_clip_thumbnail_state(job_id: str, clip_index: int, request: Reques
 
 async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: Request):
     """Create explicitly requested Nano Banana candidates for the current clip only."""
+    global _clip_thumbnail_active_request
     _require_local_dashboard_origin(request)
     if not clip_ai_thumbnails_enabled():
         raise HTTPException(
@@ -7185,13 +7202,19 @@ async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: R
                     req.job_id, req.clip_index, filename, fingerprint, record, clip, transcript
                 )
             async with _clip_thumbnail_generation_gate_guard:
-                if _clip_thumbnail_generation_gate.locked():
-                    raise HTTPException(
-                        status_code=429,
-                        detail="Another AI thumbnail is generating. Wait for it to finish before starting another.",
+                active = _clip_thumbnail_active_request
+                active_request_id = (
+                    active[2]
+                    if active is not None
+                    and active[:2] == (req.job_id, req.clip_index)
+                    else None
+                )
+                if _mark_orphaned_thumbnail_batches_unknown(
+                    record, active_request_id
+                ):
+                    await asyncio.to_thread(
+                        _write_clip_thumbnail_state, state_path, state
                     )
-                if _mark_orphaned_thumbnail_batches_unknown(record):
-                    await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
                     raise HTTPException(
                         status_code=409,
                         detail=(
@@ -7199,6 +7222,11 @@ async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: R
                             "consumed quota. Review the warning, then click Generate again "
                             "only if you want a new image request."
                         ),
+                    )
+                if _clip_thumbnail_generation_gate.locked():
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Another AI thumbnail is generating. Wait for it to finish before starting another.",
                     )
             api_key = await resolve_gemini(request)
             if not api_key:
@@ -7214,6 +7242,9 @@ async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: R
                         detail="Another AI thumbnail is generating. Wait for it to finish before starting another.",
                     )
                 await _clip_thumbnail_generation_gate.acquire()
+                _clip_thumbnail_active_request = (
+                    req.job_id, req.clip_index, req.request_id
+                )
                 generation_slot_reserved = True
             try:
                 record["batches"][req.request_id] = {
@@ -7224,6 +7255,10 @@ async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: R
                 }
                 await asyncio.to_thread(_write_clip_thumbnail_state, state_path, state)
             except BaseException:
+                if _clip_thumbnail_active_request == (
+                    req.job_id, req.clip_index, req.request_id
+                ):
+                    _clip_thumbnail_active_request = None
                 _clip_thumbnail_generation_gate.release()
                 generation_slot_reserved = False
                 raise
@@ -7517,6 +7552,10 @@ async def _generate_clip_thumbnail(req: ClipThumbnailGenerateRequest, request: R
         raise
     finally:
         if generation_slot_reserved:
+            if _clip_thumbnail_active_request == (
+                req.job_id, req.clip_index, req.request_id
+            ):
+                _clip_thumbnail_active_request = None
             _clip_thumbnail_generation_gate.release()
 
 

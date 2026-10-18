@@ -73,6 +73,7 @@ def thumbnail_job(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "_clip_thumbnail_locks", {})
     monkeypatch.setattr(app_module, "_clip_thumbnail_generation_gate", asyncio.BoundedSemaphore(1))
     monkeypatch.setattr(app_module, "_clip_thumbnail_generation_gate_guard", asyncio.Lock())
+    monkeypatch.setattr(app_module, "_clip_thumbnail_active_request", None)
     monkeypatch.setenv("GEMINI_API_KEY", "not-exposed")
     monkeypatch.setenv("CLIP_AI_THUMBNAILS_ENABLED", "1")
     return job_dir
@@ -271,6 +272,53 @@ def test_orphaned_running_batch_is_recovered_by_state_read_before_a_new_request(
     response = _generate()
     assert response.status_code == 200
     assert calls == [True]
+
+
+def test_unrelated_active_generation_does_not_hide_orphaned_batch(
+    thumbnail_job, monkeypatch
+):
+    clip = app_module.jobs[JOB_ID]["result"]["clips"][0]
+    _, filename, fingerprint = app_module._resolve_postiz_clip(JOB_ID, [clip], 0)
+    request_id = str(uuid.uuid4())
+    state_path = thumbnail_job / app_module.CLIP_THUMBNAIL_STATE_FILE
+    state_path.write_text(json.dumps({
+        "versions": {
+            f"{filename}:{fingerprint}": {
+                "filename": filename,
+                "sha256": fingerprint,
+                "selected_candidate_id": None,
+                "batches": {
+                    request_id: {
+                        "state": "running",
+                        "requested_count": 1,
+                        "started_at": "2026-10-18T00:00:00+00:00",
+                        "candidates": [],
+                    },
+                },
+            },
+        },
+    }), encoding="utf-8")
+    app_module._clip_thumbnail_active_request = (
+        "87654321-4321-4321-4321-cba987654321", 0, str(uuid.uuid4())
+    )
+
+    async def hold_unrelated_slot_and_read():
+        await app_module._clip_thumbnail_generation_gate.acquire()
+        try:
+            transport = httpx.ASGITransport(app=app_module.app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                return await client.get(f"/api/clip-thumbnail/{JOB_ID}/0")
+        finally:
+            app_module._clip_thumbnail_generation_gate.release()
+            app_module._clip_thumbnail_active_request = None
+
+    response = asyncio.run(hold_unrelated_slot_and_read())
+
+    assert response.status_code == 200
+    assert response.json()["batchState"] == "unknown"
+    assert response.json()["hasRunningBatch"] is False
 
 
 def test_selection_rejects_a_candidate_whose_saved_hash_no_longer_matches(
