@@ -160,6 +160,13 @@ def test_default_hook_uses_one_translucent_panel_and_gold_impact_word(tmp_path):
                                    600, str(out), style="pill")
     img = Image.open(path).convert("RGBA")
     assert (img.width, img.height) == (w, h)
+    # create_hook_image receives the ordinary 90%-of-frame style budget; the
+    # modern default further confines its complete canvas to 82/90 of that.
+    assert w <= int(600 * (82 / 90))
+    # At 9:16 this leaves ample vertical room above captions and platform UI.
+    video_width = 600 / 0.9
+    video_height = video_width * (16 / 9)
+    assert h < video_height * 0.20
     pixels = list(img.getdata())
     assert any(a > 0 for _, _, _, a in pixels)
     assert any(r > 220 and 150 < g < 230 and b < 100 and a > 0
