@@ -6632,7 +6632,11 @@ def _mark_orphaned_thumbnail_batches_unknown(record: dict) -> bool:
 @app.get("/api/clip-thumbnail/{job_id}/{clip_index}")
 async def get_clip_thumbnail_state(job_id: str, clip_index: int, request: Request):
     """Read non-secret candidate state and composed YouTube metadata for one clip."""
-    _require_local_dashboard_origin(request)
+    # A same-origin GET sent to the Vite dashboard proxy commonly has no
+    # Origin header. Unlike generation, selection, and Postiz publishing, this
+    # endpoint makes no state change and exposes no credential; job ownership
+    # remains enforced by _clip_thumbnail_context in hosted mode. Keep the
+    # local-origin gate on every mutating thumbnail/Postiz endpoint.
     _job, clip, _file_path, filename, fingerprint, transcript = await _clip_thumbnail_context(
         job_id, clip_index, request
     )

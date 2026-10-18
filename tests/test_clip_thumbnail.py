@@ -98,6 +98,15 @@ def test_generate_requires_local_dashboard_origin(thumbnail_job):
     assert "local OpenShorts dashboard" in response.json()["detail"]
 
 
+def test_thumbnail_state_allows_originless_same_origin_get(thumbnail_job):
+    # Browsers commonly omit Origin on same-origin GET requests. The dashboard
+    # proxies this read-only endpoint through Vite, while all thumbnail writes
+    # still require an explicit trusted local Origin.
+    response = _request("get", f"/api/clip-thumbnail/{JOB_ID}/0")
+    assert response.status_code == 200
+    assert response.json()["youtube"]["title"] == "A valid YouTube title"
+
+
 def test_generate_is_idempotent_and_selected_candidate_is_confined(thumbnail_job, monkeypatch):
     calls = []
     monkeypatch.setattr(
