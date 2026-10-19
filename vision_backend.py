@@ -13,6 +13,7 @@ machine.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -270,12 +271,66 @@ def _post_with_retries(client: httpx.Client, config: VisionConfig, path: str,
     )
 
 
-def _preflight_model(client: httpx.Client, config: VisionConfig) -> None:
-    """Fail early if Ollama is unavailable or the requested model is missing."""
-    _post_with_retries(
+def _preflight_model(client: httpx.Client, config: VisionConfig) -> dict:
+    """Fail early and return Ollama's immutable model descriptor when exposed."""
+    response = _post_with_retries(
         client, config, "/api/show", {"model": config.model},
         f"Local vision model {config.model!r}",
     )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    if not isinstance(payload.get("digest"), str) or not payload["digest"].strip():
+        try:
+            tags_response = client.get(f"{config.base_url}/api/tags")
+            tags_response.raise_for_status()
+            tags = tags_response.json()
+            for entry in (
+                tags.get("models", []) if isinstance(tags, dict) else []
+            ):
+                if not isinstance(entry, dict):
+                    continue
+                if config.model in {entry.get("name"), entry.get("model")}:
+                    digest = entry.get("digest")
+                    if isinstance(digest, str) and digest.strip():
+                        payload = dict(payload)
+                        payload["digest"] = digest.strip()
+                    break
+        except Exception:
+            # Older Ollama versions or test transports may not expose tags.
+            # Model-output checkpoint reuse then remains disabled.
+            pass
+    return payload
+
+
+def configured_descriptor(max_seconds: float = 60.0) -> dict:
+    """Return configured local model identity without contacting Ollama."""
+    config = _config(float(max_seconds))
+    return {
+        "model": config.model,
+        "endpoint": config.base_url,
+        "digest": None,
+        "immutable_revision_available": False,
+    }
+
+
+def resolved_descriptor(max_seconds: float = 60.0) -> dict:
+    """Resolve the current local model content identity without sampling video."""
+    config = _config(float(max_seconds))
+    timeout = httpx.Timeout(config.timeout_seconds)
+    with _client(timeout=timeout) as client:
+        payload = _preflight_model(client, config) or {}
+    digest = payload.get("digest")
+    return {
+        "model": config.model,
+        "endpoint": config.base_url,
+        "digest": digest if isinstance(digest, str) and digest.strip() else None,
+        "immutable_revision_available": bool(
+            isinstance(digest, str) and digest.strip()
+        ),
+    }
 
 
 def _analysis_windows(duration: float, window_seconds: int,
@@ -692,7 +747,8 @@ def _unload(client: httpx.Client, config: VisionConfig) -> None:
 
 def select_clips(video_path: str, video_duration: float, language: str,
                  min_clips: int, max_clips: int, min_seconds: float,
-                 max_seconds: float) -> dict:
+                 max_seconds: float, *, checkpoint_store=None,
+                 source_scenes=None, resolved_config=None) -> dict:
     """Return OpenShorts visual clips selected by local Ollama, or raise.
 
     The function deliberately does not fall back to Gemini. Selecting
@@ -734,8 +790,21 @@ def select_clips(video_path: str, video_duration: float, language: str,
     timeout = httpx.Timeout(config.timeout_seconds)
     with _client(timeout=timeout) as client:
         try:
-            _preflight_model(client, config)
-            scene_boundaries = _scene_boundaries(video_path, duration)
+            # Older callers/tests replace the preflight with a side-effect-only
+            # stub. Treat that legacy return as an unknown (and therefore
+            # non-reusable) revision instead of failing the live analysis.
+            model_descriptor = _preflight_model(client, config) or {}
+            model_digest = model_descriptor.get("digest")
+            checkpoint_reusable = bool(
+                checkpoint_store is not None
+                and isinstance(model_digest, str)
+                and model_digest.strip()
+            )
+            scene_boundaries = (
+                list(source_scenes)
+                if source_scenes is not None
+                else _scene_boundaries(video_path, duration)
+            )
             all_candidates: list[dict] = []
             diagnostics: list[str] = []
 
@@ -774,6 +843,64 @@ def select_clips(video_path: str, video_duration: float, language: str,
                     max_clips=max_clips,
                     candidates_per_window=config.candidates_per_window,
                 )
+                window_key = None
+                if checkpoint_reusable:
+                    image_hashes = [
+                        hashlib.sha256(base64.b64decode(image)).hexdigest()
+                        for image in images
+                    ]
+                    import checkpoint_store as checkpoint_helpers
+                    window_key = checkpoint_helpers.compatibility_key(
+                        "visual-detail",
+                        {
+                            "source_content_identity": {
+                                "sha256": checkpoint_store.source_identity["sha256"],
+                                "size": checkpoint_store.source_identity["size"],
+                            },
+                            "route": "silent-local",
+                            "resolved_stage_config": {
+                                "model": config.model,
+                                "model_digest": model_digest,
+                                "endpoint": config.base_url,
+                                "window_seconds": config.window_seconds,
+                                "overlap_seconds": config.overlap_seconds,
+                                "frames_per_window": config.frames_per_window,
+                                "max_frame_width": config.max_frame_width,
+                                "num_ctx": config.num_ctx,
+                                "candidates_per_window": config.candidates_per_window,
+                                "scene_snap_seconds": config.scene_snap_seconds,
+                            },
+                            "expected_upstream_compatibility_keys": [],
+                            "semantic_input_hashes": [
+                                checkpoint_helpers.sha256_bytes(
+                                    checkpoint_helpers.canonical_json_bytes({
+                                        "window": [window_start, window_end],
+                                        "timestamps": frame_timestamps,
+                                        "images": image_hashes,
+                                        "scenes": scene_boundaries,
+                                        "language": language,
+                                        "clip_band": [min_seconds, max_seconds],
+                                    })
+                                )
+                            ],
+                        },
+                    )
+                    cached = checkpoint_store.load_keyed(
+                        "visual-detail", window_key,
+                    )
+                    if cached is not None:
+                        cached_payload = cached.get("payload") or {}
+                        if cached_payload.get("outcome") == "empty":
+                            print(f"   ♻️ {label}: reused explicit empty result.")
+                            continue
+                        cached_candidates = cached_payload.get("candidates")
+                        if isinstance(cached_candidates, list):
+                            all_candidates.extend(cached_candidates)
+                            print(
+                                f"   ♻️ {label}: reused "
+                                f"{len(cached_candidates)} candidate(s)."
+                            )
+                            continue
                 try:
                     response = _window_response(
                         client, config, prompt, images, label
@@ -783,8 +910,9 @@ def select_clips(video_path: str, video_duration: float, language: str,
                     diagnostics.append(detail)
                     print(f"   ⚠️ {detail}; skipping this window.")
                     continue
+                raw_shorts = response.get("shorts") or []
                 candidates = _normalise_window_shorts(
-                    response.get("shorts") or [],
+                    raw_shorts,
                     window_start=window_start,
                     window_end=window_end,
                     source_duration=duration,
@@ -794,6 +922,23 @@ def select_clips(video_path: str, video_duration: float, language: str,
                     snap_seconds=config.scene_snap_seconds,
                     candidates_per_window=config.candidates_per_window,
                 )
+                if checkpoint_reusable and not raw_shorts:
+                    checkpoint_store.save_keyed(
+                        "visual-detail",
+                        window_key,
+                        {"outcome": "empty"},
+                        {},
+                    )
+                elif checkpoint_reusable and candidates:
+                    checkpoint_store.save_keyed(
+                        "visual-detail",
+                        window_key,
+                        {
+                            "outcome": "candidates",
+                            "candidates": candidates,
+                        },
+                        {},
+                    )
                 if not candidates:
                     # A VLM can reasonably find no standalone moment in one
                     # particular window. Continue so later windows can still
@@ -838,6 +983,11 @@ def select_clips(video_path: str, video_duration: float, language: str,
 
     return {
         "shorts": shorts,
+        "_checkpoint_model_descriptor": {
+            "model": config.model,
+            "digest": model_digest,
+            "immutable_revision_available": bool(model_digest),
+        },
         "cost_analysis": {
             "input_tokens": 0,
             "output_tokens": 0,

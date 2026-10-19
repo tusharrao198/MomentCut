@@ -330,6 +330,72 @@ Use `docker system prune` or `docker builder prune` only when you intentionally
 want to remove unused Docker data. They are not part of ordinary startup or
 shutdown.
 
+### Verify pipeline checkpoint recovery
+
+Checkpointing is opt-in and uses strict boolean values. Add this to `.env`:
+
+```env
+PIPELINE_CHECKPOINTS_ENABLED=true
+```
+
+If the dashboard supplies a Gemini key, an authenticated LLM key, protected
+source credentials, or a webhook secret, also create the resume-secret
+encryption key once so an interrupted job can resume without asking for those
+credentials again. Without this keyring the current attempt still runs, but a
+restart pauses any route that still needs a lost request-scoped credential.
+In PowerShell:
+
+```powershell
+$bytes = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+$key = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+"RESUME_SECRET_ACTIVE_KEY_ID=v1`nRESUME_SECRET_KEYS=v1:$key"
+```
+
+Copy the two printed lines into `.env` and keep them across rebuilds. Losing
+the key does not expose credentials, but affected interrupted jobs cannot
+resume until credentials are supplied again.
+
+ASR output is checkpointed after the complete timestamped transcript/outcome
+validates for the sealed job and retained source. This works for Whisper and
+Parakeet even when their loader cannot expose immutable weights. For stronger
+provenance and fine-grained model-output compatibility, optionally set
+`WHISPER_MODEL_REVISION` to the exact 40-character Hugging Face commit SHA for
+a Hub model or alias. See the
+[`actual checkpoint code flow`](../architecture/pipeline-checkpointing-code-flow.md)
+for restart behaviour at each stage.
+
+The Compose bind mount `./output:/app/output` is the persistent project store.
+Do not replace it with a container-only path: retained sources, immutable job
+configuration, checkpoints, and completed render artifacts must survive
+container recreation. Recreate the backend after changing the flag:
+
+```powershell
+docker compose down
+docker compose up --build -d
+docker compose ps
+```
+
+Start a job, note its job ID, and run the repository verification helper from
+another PowerShell window:
+
+```powershell
+.\scripts\test_checkpoint_resume.ps1 -JobId "<job-id>"
+```
+
+The helper checks the durable job files, kills and recreates the backend, and
+confirms the same project is recovered. Backend logs should contain reuse
+messages and render only missing clips. To test the kill switch, set
+`PIPELINE_CHECKPOINTS_ENABLED=false`, recreate the backend, and confirm a new
+job writes no `.checkpoints` directory.
+
+Compatibility changes deliberately invalidate affected checkpoints. Disk use
+therefore includes the retained source and validated renders until normal
+retention cleanup removes the whole project. When manual deletion is needed,
+first confirm the job is terminal and no backend owns its lease, then delete
+the complete `output\<job-id>` directory. Do not remove individual
+`.checkpoints`, `.job-state.json`, `.resume-secrets.enc`, or lock files.
+
 ## 9. Troubleshooting
 
 | Symptom | Check / resolution |

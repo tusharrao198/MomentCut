@@ -37,6 +37,7 @@ _TN2_W, _TN2_H = 48, 27
 # inference is serialized like the other detectors in main.py.
 _TN2_LOCK = threading.Lock()
 _tn2_model = None
+_tn2_model_key = None
 
 
 @dataclass(frozen=True)
@@ -66,19 +67,53 @@ def scene_boundary(frame, fps):
     return FrameTimecode(int(frame), float(fps))
 
 
-def detect_scenes(video_path):
-    """Detect scenes. Returns (scene_list, fps) where scene_list is a list of
-    boundary pairs. Each boundary supplies ``get_frames()`` and
-    ``get_seconds()``. The active Mac TransNetV2 route returns lightweight
-    markers; all other routes retain PySceneDetect's FrameTimecode objects."""
-    engine = os.environ.get("SCENE_ENGINE", "transnetv2").strip().lower()
+def detect_scenes_with_provenance(video_path, resolved_config=None):
+    """Detect scenes and return their stable engine/model provenance."""
+    config = dict(resolved_config or {})
+    engine = str(
+        config.get("engine")
+        or os.environ.get("SCENE_ENGINE", "transnetv2")
+    ).strip().lower()
     if engine != "pyscenedetect":
         try:
-            return _detect_transnetv2(video_path)
-        except Exception as e:
+            scenes, fps = _detect_transnetv2(video_path, config)
+            return scenes, fps, {
+                "requested_engine": engine,
+                "effective_engine": "transnetv2",
+                "model_revision": config.get("model_revision"),
+                "threshold": float(
+                    config.get("threshold")
+                    or os.environ.get("TRANSNETV2_THRESHOLD", "0.5")
+                ),
+                "minimum_seconds": float(
+                    config.get("minimum_seconds")
+                    or os.environ.get("SCENE_MIN_SEC", "0.4")
+                ),
+                "fallback_reason": None,
+                "implementation_version": "source-scenes-v1",
+            }
+        except Exception as error:
             print(f"   ⚠️ TransNetV2 scene detection failed "
-                  f"({type(e).__name__}: {e}) — falling back to PySceneDetect")
-    return _detect_pyscenedetect(video_path)
+                  f"({type(error).__name__}: {error}) — falling back to PySceneDetect")
+            fallback = f"{type(error).__name__}: {error}"[:500]
+    else:
+        fallback = None
+    scenes, fps = _detect_pyscenedetect(video_path)
+    return scenes, fps, {
+        "requested_engine": engine,
+        "effective_engine": "pyscenedetect",
+        "model_revision": None,
+        "threshold": None,
+        "minimum_seconds": None,
+        "fallback_reason": fallback,
+        "implementation_version": "source-scenes-v1",
+    }
+
+
+def detect_scenes(video_path):
+    """Backward-compatible scene API without checkpoint provenance."""
+    scenes, fps, _ = detect_scenes_with_provenance(video_path)
+    return scenes, fps
 
 
 # --- legacy engine ----------------------------------------------------------
@@ -100,14 +135,17 @@ def _detect_pyscenedetect(video_path):
 
 # --- TransNetV2 engine ------------------------------------------------------
 
-def _get_tn2_model():
-    global _tn2_model
-    if _tn2_model is None:
+def _get_tn2_model(resolved_config=None):
+    global _tn2_model, _tn2_model_key
+    device = (resolved_config or {}).get("device") \
+        or os.environ.get("TRANSNETV2_DEVICE", "auto")
+    key = str(device).strip().lower()
+    if _tn2_model is None or _tn2_model_key != key:
         from transnetv2_pytorch import TransNetV2
-        device = os.environ.get("TRANSNETV2_DEVICE", "auto")
         model = TransNetV2(device=device)
         model.eval()
         _tn2_model = model
+        _tn2_model_key = key
     return _tn2_model
 
 
@@ -168,7 +206,7 @@ def _extract_frames_small(video_path):
                          dtype=np.uint8).copy().reshape(n, _TN2_H, _TN2_W, 3)
 
 
-def _detect_transnetv2(video_path):
+def _detect_transnetv2(video_path, resolved_config=None):
     import torch
 
     cap = cv2.VideoCapture(video_path)
@@ -177,8 +215,11 @@ def _detect_transnetv2(video_path):
     cap.release()
 
     frames = _extract_frames_small(video_path)
-    model = _get_tn2_model()
-    threshold = float(os.environ.get("TRANSNETV2_THRESHOLD", "0.5"))
+    model = _get_tn2_model(resolved_config)
+    threshold = float(
+        (resolved_config or {}).get("threshold")
+        or os.environ.get("TRANSNETV2_THRESHOLD", "0.5")
+    )
 
     with _TN2_LOCK, torch.no_grad():
         tensor = torch.from_numpy(frames).to(model.device)
@@ -203,7 +244,10 @@ def _detect_transnetv2(video_path):
     elif total_frames > bounds[-1][1]:
         bounds[-1] = (bounds[-1][0], total_frames)
 
-    min_sec = float(os.environ.get("SCENE_MIN_SEC", "0.4"))
+    min_sec = float(
+        (resolved_config or {}).get("minimum_seconds")
+        or os.environ.get("SCENE_MIN_SEC", "0.4")
+    )
     bounds = _merge_short_scenes(bounds, fps, min_sec)
 
     scene_list = [(scene_boundary(s, fps), scene_boundary(e, fps))

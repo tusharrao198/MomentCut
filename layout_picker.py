@@ -43,6 +43,7 @@ by hand wins: this only ever ADDS, so an explicit choice is never overridden.
 """
 import json
 import os
+import hashlib
 
 # AUTO_LAYOUT=1 decides and applies. AUTO_LAYOUT=shadow decides, logs, and
 # applies NOTHING: the render is byte-for-byte what it would have been.
@@ -81,6 +82,21 @@ VALID = set(DECISION_FLAGS)
 PER_SCENE_FLAGS = ["split_layout", "active_speaker"]
 
 
+def resolve_config(env=None):
+    source = os.environ if env is None else env
+    mode = str(source.get("AUTO_LAYOUT", "0")).strip().lower()
+    return {
+        "mode": mode,
+        "enabled": mode in {"1", "shadow"},
+        "shadow": mode == "shadow",
+        "sample_frames": int(source.get("LAYOUT_SAMPLE_FRAMES", "12")),
+        "sample_width": int(source.get("LAYOUT_SAMPLE_WIDTH", "1024")),
+        "model": source.get("GEMINI_MODEL") or "gemini-3.1-flash-lite",
+        "prompt_version": "layout-choice-v1",
+        "schema_version": "layout-choice-schema-v1",
+    }
+
+
 def _module_flags(decision):
     """Modules to enable for a decision, ignoring anything unrecognised."""
     return DECISION_FLAGS.get(str(decision or "none").strip().lower(), [])
@@ -109,6 +125,8 @@ def apply(decision):
                "screencast_layout": screencast_layout,
                "active_speaker": active_speaker}
 
+    if isinstance(decision, dict):
+        decision = decision.get("layout", "none")
     touched = []
     for name in _flags_to_enable(decision):
         module = modules.get(name)
@@ -191,20 +209,26 @@ def sample_frames(video_path, n=None, width=None):
     return out
 
 
-def pick(video_path, video_duration):
-    """The layout Gemini picks for this video, or "none" on any failure.
-
-    Never raises: a missing answer has to degrade to today's routing rather
-    than break the job.
-    """
+def _pick_with_status(video_path, video_duration, config=None, frames=None):
+    """Return ``(decision, completed, reason)`` without breaking the job."""
     from gemini_feature_flags import clip_analysis_enabled
-    if not ENABLED or not clip_analysis_enabled():
-        return "none"
+    if config is None:
+        # Preserve the long-standing public/test seam while checkpoint-aware
+        # managed runs pass a fully resolved immutable configuration.
+        config = resolve_config()
+        config["enabled"] = bool(ENABLED)
+        config["shadow"] = bool(SHADOW)
+    else:
+        config = dict(config)
+    if not config["enabled"]:
+        return "none", True, "disabled"
+    if not clip_analysis_enabled():
+        return "none", False, "analysis_disabled"
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return "none"
+        return "none", False, "missing_api_key"
 
-    model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+    model_name = config["model"]
     print("🎛️  Choosing a layout for this video…")
     try:
         # Inside the try on purpose: the contract above is that this never
@@ -213,10 +237,12 @@ def pick(video_path, video_duration):
         from google.genai import types as genai_types
         import gemini_worker
 
-        frames = sample_frames(video_path)
+        frames = frames if frames is not None else sample_frames(
+            video_path, config["sample_frames"], config["sample_width"],
+        )
         if not frames:
             print("   ⚠️ No readable frames — keeping the default layout.")
-            return "none"
+            return "none", False, "no_readable_frames"
 
         client = genai.Client(api_key=api_key)
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
@@ -232,24 +258,58 @@ def pick(video_path, video_duration):
         answer = json.loads(response.text) or {}
     except Exception as e:
         print(f"   ⚠️ Layout choice failed ({e}) — keeping the default layout.")
-        return "none"
+        return "none", False, type(e).__name__
 
     decision = str(answer.get("layout", "none")).strip().lower()
     if decision not in VALID:
         print(f"   ⚠️ Unknown layout '{decision}' — keeping the default layout.")
-        return "none"
+        return "none", False, "invalid_model_response"
 
     why = str(answer.get("why", ""))[:80]
     confidence = answer.get("confidence")
     print(f"   🎬 Layout: {decision} (confianza {confidence}) — {why}")
+    return decision, True, None
+
+
+def pick(video_path, video_duration, config=None, frames=None):
+    """The layout Gemini picks for this video, or "none" on any failure.
+
+    Never raises: a missing answer has to degrade to today's routing rather
+    than break the job.
+    """
+    decision, _completed, _reason = _pick_with_status(
+        video_path, video_duration, config, frames,
+    )
     return decision
 
 
-def pick_and_apply(video_path, video_duration):
-    """Decide, switch on (unless shadowing), report what changed."""
-    decision = pick(video_path, video_duration)
+def pick_with_provenance(video_path, video_duration, config=None, frames=None):
+    config = dict(config or resolve_config())
+    frames = frames if frames is not None else sample_frames(
+        video_path, config["sample_frames"], config["sample_width"],
+    ) if config["enabled"] else []
+    decision, completed, reason = _pick_with_status(
+        video_path, video_duration, config, frames,
+    )
+    return {
+        "outcome": "complete" if completed else "failure",
+        "reason": reason,
+        "layout": decision,
+        "applied_flags": _flags_to_enable(decision),
+        "sample_hashes": [
+            hashlib.sha256(frame).hexdigest() for frame in frames
+        ],
+        "config": config,
+        "implementation_version": "source-layout-v1",
+    }
 
-    if SHADOW:
+
+def pick_and_apply(video_path, video_duration, config=None):
+    """Decide, switch on (unless shadowing), report what changed."""
+    config = dict(config or resolve_config())
+    decision = pick(video_path, video_duration, config)
+
+    if config["shadow"]:
         # One greppable line per job. Deliberately not routed through the
         # analytics module: that one is opt-in and host-scoped, and a shadow
         # run has to work on any deployment, including self-hosted.

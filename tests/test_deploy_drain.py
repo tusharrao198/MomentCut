@@ -38,10 +38,37 @@ def out(tmp_path, monkeypatch):
 def _manifest(out, job_id, **extra):
     d = out / job_id
     d.mkdir(exist_ok=True)
-    m = {"cmd": ["python", "main.py"], "priority": 2, "user_id": None,
-         "reservation_id": f"res-{job_id}", "watermark": False, "attempts": 0}
-    m.update(extra)
-    (d / app_module._RESUME_FILE).write_text(json.dumps(m))
+    (d / "source.mp4").write_bytes(b"source")
+    config = app_module.job_state.seal_job_config({
+        "schema_version": 1,
+        "job_id": job_id,
+        "configuration_revision": 1,
+        "project_dir": str(d),
+        "source": {"kind": "upload", "retained_relative_path": "source.mp4"},
+        "pipeline": {},
+        "environment": {},
+    })
+    app_module.job_state.write_job_config(str(d), config)
+    app_module.job_state.write_job_state(str(d), {
+        "schema_version": 1,
+        "job_id": job_id,
+        "configuration_revision": 1,
+        "execution_generation": 0,
+        "status": "processing",
+    })
+    manifest = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "configuration_revision": 1,
+        "priority": 2,
+        "user_id": None,
+        "reservation_id": f"res-{job_id}",
+        "watermark": False,
+        "attempts": 0,
+        "api_caller": False,
+    }
+    manifest.update(extra)
+    app_module.job_state.write_resume_manifest(str(d), manifest)
     return d
 
 

@@ -324,6 +324,9 @@ class ProxyUsage(Base):
     __tablename__ = "proxy_usage"
     id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    # Terminal outbox event identity. Nullable for legacy probe rows; download
+    # actions supply it so replay after a crash cannot double-count bytes.
+    event_id = Column(String(64), nullable=True, unique=True)
     source = Column(String(16), nullable=False)          # download | probe
     job_id = Column(String(64), nullable=True, index=True)
     url_host = Column(String(120), nullable=True)
@@ -387,6 +390,7 @@ class AutopilotRun(Base):
     job_id = Column(Text, nullable=True, index=True)
     clips_count = Column(Integer, nullable=True)
     posted_count = Column(Integer, nullable=True)
+    completion_plan = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (

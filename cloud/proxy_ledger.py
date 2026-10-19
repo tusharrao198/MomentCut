@@ -88,17 +88,39 @@ def describe_failures(route: Optional[dict], limit: int = 3) -> str:
 
 
 async def _persist(source: str, job_id: Optional[str], url_host: Optional[str],
-                   route_label: Optional[str], paid_bytes: int, detail: Optional[dict]):
+                   route_label: Optional[str], paid_bytes: int,
+                   detail: Optional[dict],
+                   event_id: Optional[str] = None) -> Optional[bool]:
     try:
         from . import database as _db
         from .models import ProxyUsage
+        from sqlalchemy.dialects.postgresql import insert
         async with _db.session() as s:
-            s.add(ProxyUsage(source=source, job_id=job_id, url_host=url_host,
-                             route=route_label, paid_bytes=int(paid_bytes or 0),
-                             detail=detail))
+            values = {
+                "source": source,
+                "job_id": job_id,
+                "url_host": url_host,
+                "route": route_label,
+                "paid_bytes": int(paid_bytes or 0),
+                "detail": detail,
+                "event_id": event_id,
+            }
+            if event_id:
+                result = await s.execute(
+                    insert(ProxyUsage)
+                    .values(**values)
+                    .on_conflict_do_nothing()
+                    .returning(ProxyUsage.id)
+                )
+                created = result.scalar_one_or_none() is not None
+            else:
+                s.add(ProxyUsage(**values))
+                created = True
             await s.commit()
-    except Exception as e:  # accounting must never break a job
+            return created
+    except Exception as e:
         print(f"⚠️ proxy_usage row not written: {e}")
+        return None
 
 
 async def _alert(line: str, nbytes: int):
@@ -198,18 +220,32 @@ def budget_exceeded_sync() -> bool:
     return cached >= 0 and cached >= DAILY_BUDGET_MB * 1e6
 
 
-async def record_download(job_id: str, route: Optional[dict], source_url: Optional[str] = None):
+async def record_download(
+    job_id: str,
+    route: Optional[dict],
+    source_url: Optional[str] = None,
+    *,
+    event_id: Optional[str] = None,
+) -> Optional[bool]:
     """Persist a download's route; alert when the paid proxy was involved."""
     if not route:
-        return
+        return False
     nbytes = paid_bytes_of(route)
     paid = used_paid(route)
-    await _persist("download", job_id, host_of(source_url), str(route.get("winner") or "none"),
-                   nbytes if paid else 0, route)
-    if paid:
+    created = await _persist(
+        "download",
+        job_id,
+        host_of(source_url),
+        str(route.get("winner") or "none"),
+        nbytes if paid else 0,
+        route,
+        event_id,
+    )
+    if paid and created is True:
         why = describe_failures(route)
         await _alert(f"download job {job_id[:8]}: {nbytes / 1e6:.1f} MB via '{route.get('winner')}'"
                      + (f"\n{why}" if why else ""), nbytes)
+    return created
 
 
 async def record_probe(event: dict):

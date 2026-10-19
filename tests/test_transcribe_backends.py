@@ -156,7 +156,10 @@ def test_parakeet_auto_runtime_failure_falls_through_n1(monkeypatch):
     monkeypatch.setattr(
         tb, "_transcribe_with_selected_parakeet",
         lambda path: (_ for _ in ()).throw(RuntimeError("Metal failed")))
-    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_whisper_execution",
+        lambda path: (sentinel, {"engine": "faster-whisper", "force_cpu": False}),
+    )
 
     assert tb._transcribe_media("video.mp4") is sentinel
 
@@ -182,7 +185,10 @@ def test_explicit_parakeet_quality_rejection_still_falls_through_n1(
     monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
     monkeypatch.setattr(
         tb, "_transcribe_with_selected_parakeet", lambda path: rejected)
-    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_whisper_execution",
+        lambda path: (sentinel, {"engine": "faster-whisper", "force_cpu": False}),
+    )
 
     assert tb._transcribe_media("video.mp4") is sentinel
 
@@ -231,7 +237,10 @@ def test_transcribe_media_falls_back_on_parakeet_exception(monkeypatch):
     monkeypatch.setenv("PARAKEET_ENGINE", "auto")
     monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
     monkeypatch.setattr(tb, "_transcribe_with_selected_parakeet", boom)
-    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_whisper_execution",
+        lambda path: (sentinel, {"engine": "faster-whisper", "force_cpu": False}),
+    )
     assert tb.transcribe_media("video.mp4") is sentinel
 
 
@@ -242,7 +251,10 @@ def test_transcribe_media_default_is_whisper(monkeypatch):
     monkeypatch.setattr(
         tb, "_transcribe_with_parakeet",
         lambda path: (_ for _ in ()).throw(AssertionError("should not run")))
-    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_whisper_execution",
+        lambda path: (sentinel, {"engine": "faster-whisper", "force_cpu": False}),
+    )
     assert tb.transcribe_media("video.mp4") is sentinel
 
 
@@ -259,9 +271,12 @@ def fake_faster_whisper(monkeypatch):
     created = []
 
     class FakeModel:
-        def __init__(self, model_size, device=None, compute_type=None):
+        def __init__(self, model_size, device=None, compute_type=None,
+                     revision=None):
             self.model_size = model_size
             self.device = device
+            self.compute_type = compute_type
+            self.revision = revision
             created.append(self)
 
         def transcribe(self, path, **params):
@@ -291,6 +306,27 @@ def test_whisper_model_rebuilds_when_env_changes(fake_faster_whisper, monkeypatc
     b, _ = tb._get_whisper_model()
     assert a is not b
     assert b.model_size == "large-v3-turbo"
+
+
+def test_whisper_model_enforces_configured_revision(
+        fake_faster_whisper, monkeypatch):
+    revision = "a" * 40
+    monkeypatch.setenv("WHISPER_MODEL_REVISION", revision)
+
+    model, _ = tb._get_whisper_model()
+
+    assert model.revision == revision
+
+
+def test_whisper_model_rebuilds_when_revision_changes(
+        fake_faster_whisper, monkeypatch):
+    monkeypatch.setenv("WHISPER_MODEL_REVISION", "a" * 40)
+    first, _ = tb._get_whisper_model()
+    monkeypatch.setenv("WHISPER_MODEL_REVISION", "b" * 40)
+    second, _ = tb._get_whisper_model()
+
+    assert first is not second
+    assert second.revision == "b" * 40
 
 
 def test_run_whisper_transcription_materializes_segments(fake_faster_whisper, monkeypatch):
@@ -512,6 +548,30 @@ def test_transcribe_media_owns_one_host_slot(monkeypatch):
 
     assert tb.transcribe_media("video.mp4") is sentinel
     assert events == ["enter", "release", "exit"]
+def test_whisper_provenance_requires_immutable_commit_sha(monkeypatch):
+    monkeypatch.setattr(tb, "_whisper_device", lambda: "cpu")
+    monkeypatch.setenv("WHISPER_MODEL_REVISION", "main")
+    moving = tb._whisper_provenance("whisper", [])
+    assert moving["immutable_revision_available"] is False
+    assert moving["immutable_model_revision"] is None
+
+    revision = "1a" * 20
+    monkeypatch.setenv("WHISPER_MODEL_REVISION", revision)
+    pinned = tb._whisper_provenance("whisper", [])
+    assert pinned["immutable_revision_available"] is True
+    assert pinned["immutable_model_revision"] == revision
+
+
+def test_local_whisper_directory_is_not_claimed_as_revision_pinned(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(tb, "_whisper_device", lambda: "cpu")
+    monkeypatch.setenv("WHISPER_MODEL", str(tmp_path))
+    monkeypatch.setenv("WHISPER_MODEL_REVISION", "a" * 40)
+
+    provenance = tb._whisper_provenance("whisper", [])
+
+    assert provenance["immutable_revision_available"] is False
+    assert provenance["immutable_model_revision"] is None
 
 
 # --- release_models: the API process must not keep the models resident ------

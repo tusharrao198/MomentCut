@@ -79,16 +79,15 @@ def _submitted_job(resp):
 
 
 def test_handover_links_source_and_transcript(dirs, session):
-    out_root, up_root = dirs
+    out_root, _up_root = dirs
     resp = _post_process({"thumbnail_session_id": "sess1", "acknowledged": True})
     job_id, job = _submitted_job(resp)
     cmd = job["cmd"]
 
-    # Source: hardlinked under the job's name so /api/source, the clip editor
-    # and retention treat it exactly like a normal upload.
+    # Source: hardlinked into the durable project under its stable owned name.
     input_path = cmd[cmd.index("-i") + 1]
-    assert os.path.dirname(input_path) == str(up_root)
-    assert os.path.basename(input_path).startswith(job_id)
+    assert os.path.dirname(input_path) == str(out_root / job_id)
+    assert os.path.basename(input_path) == "source.mp4"
     assert os.path.exists(input_path)
     assert open(input_path, "rb").read() == b"fake-video-bytes"
     # The original session file must still exist (link, not move).
@@ -99,8 +98,27 @@ def test_handover_links_source_and_transcript(dirs, session):
     assert os.path.dirname(transcript_path) == str(out_root / job_id)
     with open(transcript_path) as f:
         assert json.load(f) == TRANSCRIPT
+    config = app_module.job_state.load_job_config(str(out_root / job_id))
+    assert config["source"]["transcript_sha256"] == \
+        app_module.checkpoint_store.sha256_file(transcript_path)
 
     assert job["attestation"]["source"] == "thumbnail_session"
+    assert os.path.isfile(out_root / job_id / ".job-config.json")
+    assert os.path.isfile(out_root / job_id / ".job-state.json")
+
+
+def test_handover_command_reconstructs_from_immutable_config(dirs, session):
+    resp = _post_process({"thumbnail_session_id": "sess1", "acknowledged": True})
+    _job_id, job = _submitted_job(resp)
+    config = app_module.job_state.load_job_config(job["output_dir"])
+    reconstructed = dict(config)
+    reconstructed["_execution_generation"] = 0
+    assert app_module.build_job_command(reconstructed) == job["cmd"]
+    rebuilt_env = app_module.build_job_child_env(
+        config, job.get("runtime_secrets") or {},
+    )
+    for name in app_module._JOB_ENV_ALLOWLIST:
+        assert rebuilt_env.get(name) == job["env"].get(name)
 
 
 def test_handover_without_ready_transcript_still_processes(dirs, session):
@@ -140,6 +158,12 @@ def test_handover_still_requires_attestation(dirs, session):
 def test_url_wins_over_session_id(dirs, session, monkeypatch):
     """A request carrying both keeps the historical URL behavior untouched."""
     monkeypatch.setattr(app_module, "QUALITY_GATE_MIN_HEIGHT", 0)
+    monkeypatch.setattr(app_module, "MIN_SOURCE_SECONDS", 0)
+
+    async def accept_url(_url):
+        return None
+
+    monkeypatch.setattr(app_module, "_validate_source_url", accept_url)
     resp = _post_process({
         "thumbnail_session_id": "sess1",
         "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
