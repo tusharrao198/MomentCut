@@ -3,6 +3,7 @@ purge after the subscription grace period.
 """
 import asyncio
 import glob
+import hashlib
 import os
 import re
 from datetime import timedelta
@@ -22,6 +23,18 @@ router = APIRouter()
 
 def _clip_title(clip) -> str:
     return clip.get("title") or clip.get("video_title_for_youtube_short") or "Short"
+
+
+def _matches_terminal_descriptor(path, descriptor) -> bool:
+    if not isinstance(descriptor, dict) or not os.path.isfile(path):
+        return False
+    if os.path.getsize(path) != descriptor.get("size"):
+        return False
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == descriptor.get("sha256")
 
 
 _HOOK_CHAIN_RE = re.compile(r'^subtitled_\d+_((?:hooked_\d+_|hook_).+)$')
@@ -174,7 +187,16 @@ async def unmark_user_library(user_id) -> int:
     return done
 
 
-async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
+async def archive_job(
+    user_id,
+    job_id,
+    clips,
+    output_dir,
+    attestation=None,
+    terminal_artifacts=None,
+    metadata_filename=None,
+    missing_clip_indices=None,
+):
     """Upload a completed managed job's clips + metadata JSON to R2 and record
     them for history. The metadata (transcript included) plus the Project row
     make the whole job re-openable and editable later, not just viewable.
@@ -185,9 +207,11 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
     so it is deleted with the account like everything else that names a user.
     """
     if not settings.r2_configured or not clips:
-        return
+        return False
     metadata_r2_key = None
-    meta_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    metadata_filename = metadata_filename or f"{job_id}_metadata.json"
+    stable_metadata = os.path.join(output_dir, metadata_filename)
+    meta_files = [stable_metadata] if os.path.isfile(stable_metadata) else []
     if meta_files:
         key = storage.job_key(user_id, job_id, os.path.basename(meta_files[0]))
         try:
@@ -195,56 +219,87 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
             metadata_r2_key = key
         except Exception as e:
             print(f"⚠️  R2 upload failed for {key}: {e}")
+            return False
+    else:
+        return False
 
-    base_name = (os.path.basename(meta_files[0]).replace("_metadata.json", "")
-                 if meta_files else None)
-    uploaded = []  # (clip_index, filename, key, title, size_bytes)
-    for i, clip in enumerate(clips):
-        video_url = clip.get("video_url") or ""
-        filename = video_url.split("/")[-1]
-        if not filename:
-            continue
+    clips_by_filename = {
+        str(clip.get("video_url") or "").split("/")[-1]: clip
+        for clip in clips
+        if isinstance(clip, dict) and clip.get("video_url")
+    }
+    uploaded = []  # (clip_index, filename, key, title, primary_size, stored_size)
+    seen_indices = set()
+    for artifact in terminal_artifacts or []:
+        if not isinstance(artifact, dict):
+            return False
+        planned_index = artifact.get("clip_index")
+        filename = artifact.get("relative_path")
+        if (
+            not isinstance(planned_index, int)
+            or planned_index < 0
+            or planned_index in seen_indices
+            or not isinstance(filename, str)
+            or not filename
+            or filename.startswith(".")
+            or os.path.basename(filename) != filename
+        ):
+            return False
+        seen_indices.add(planned_index)
         local_path = os.path.join(output_dir, filename)
-        if not os.path.exists(local_path):
-            continue
+        if not _matches_terminal_descriptor(local_path, artifact):
+            return False
         key = storage.job_key(user_id, job_id, filename)
         try:
             await asyncio.to_thread(storage.upload_file, local_path, key)
         except Exception as e:
             print(f"⚠️  R2 upload failed for {key}: {e}")
-            continue
-        uploaded.append((i, filename, key, _clip_title(clip), os.path.getsize(local_path)))
+            return False
+        stored_size = os.path.getsize(local_path)
+        for companion in artifact.get("companions", []):
+            companion_name = (
+                companion.get("relative_path")
+                if isinstance(companion, dict) else None
+            )
+            if (
+                not isinstance(companion_name, str)
+                or not companion_name
+                or companion_name.startswith(".")
+                or os.path.basename(companion_name) != companion_name
+            ):
+                return False
+            companion_path = os.path.join(output_dir, companion_name)
+            if not _matches_terminal_descriptor(companion_path, companion):
+                return False
+            companion_key = storage.job_key(
+                user_id, job_id, companion_name,
+            )
+            try:
+                await asyncio.to_thread(
+                    storage.upload_file, companion_path, companion_key,
+                )
+            except Exception as e:
+                print(f"⚠️  R2 upload failed for {companion_key}: {e}")
+                return False
+            stored_size += os.path.getsize(companion_path)
+        clip = clips_by_filename.get(filename, {})
+        uploaded.append((
+            planned_index,
+            filename,
+            key,
+            _clip_title(clip),
+            os.path.getsize(local_path),
+            stored_size,
+        ))
 
-        # Also archive the clean canonical when the served file is a derived
-        # one (captioned/recut): it is the editable master — the clip editor's
-        # fast path and /api/subtitle re-styles cut from it, so a project
-        # restored after a redeploy is only editable if it comes back too.
-        # Restore downloads every key under the job prefix, so no change is
-        # needed on that side; the free-retention purge deletes by prefix.
-        if base_name:
-            clean = f"{base_name}_clip_{i + 1}.mp4"
-            clean_path = os.path.join(output_dir, clean)
-            if clean != filename and os.path.exists(clean_path):
-                clean_key = storage.job_key(user_id, job_id, clean)
-                try:
-                    await asyncio.to_thread(storage.upload_file, clean_path, clean_key)
-                except Exception as e:
-                    print(f"⚠️  R2 upload failed for {clean_key}: {e}")
-
-        # Free plan: the served file is the wm_ copy of the final one, and the
-        # clean final rides along so an upgrade can re-point at it without a
-        # render (unmark_user_library). The canonical is handled just above.
-        for twin_name in _twins_to_archive(filename, base_name, i):
-            twin_path = os.path.join(output_dir, twin_name)
-            if os.path.exists(twin_path):
-                twin_key = storage.job_key(user_id, job_id, twin_name)
-                try:
-                    await asyncio.to_thread(storage.upload_file, twin_path, twin_key)
-                except Exception as e:
-                    print(f"⚠️  R2 upload failed for {twin_key}: {e}")
-
-    if not uploaded:
-        return
+    expected_indices = {
+        int(item.get("clip_index"))
+        for item in (terminal_artifacts or [])
+        if isinstance(item, dict)
+        and isinstance(item.get("clip_index"), int)
+    }
+    if not uploaded or {item[0] for item in uploaded} != expected_indices:
+        return False
     async with database.session() as s:
         async with s.begin():
             # Upsert per-clip history rows: re-archiving a job must repoint the
@@ -255,7 +310,7 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
                                             UserVideo.job_id == job_id)
                 )).scalars()
             }
-            for i, _filename, key, title, size in uploaded:
+            for i, _filename, key, title, size, _stored_size in uploaded:
                 row = existing.get(i)
                 if row is not None:
                     row.r2_key, row.title, row.size_bytes = key, title, size
@@ -270,7 +325,7 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
                 state = {"v": 1, "clips": [
                     {"index": i, "original_file": filename, "server_file": filename,
                      "active_layers": None}
-                    for i, filename, _key, _title, _size in uploaded
+                    for i, filename, _key, _title, _size, _stored_size in uploaded
                 ]}
                 if attestation:
                     state["rights_attestation"] = {
@@ -286,7 +341,7 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
                     prior = proj.state.get("rights_attestation")
                     if prior:
                         state["rights_attestation"] = prior
-                total = sum(u[4] for u in uploaded)
+                total = sum(u[5] for u in uploaded)
                 if proj is None:
                     s.add(Project(user_id=user_id, job_id=job_id, title=uploaded[0][3],
                                   metadata_r2_key=metadata_r2_key, state=state,
@@ -296,6 +351,7 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
                     proj.state = state
                     proj.size_bytes = total
     print(f"☁️  Archived {len(uploaded)} clip(s) to R2 for user {user_id}.")
+    return True
 
 
 async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filename):

@@ -274,6 +274,47 @@ docker exec openshorts-backend ffmpeg -hide_banner -f lavfi -i testsrc=size=256x
 ```
 The backend log on the first job reports the chosen encoder and transcription device. A CUDA error in whisper (e.g. VRAM exhausted) retries once on CPU automatically. 8 GB of VRAM is enough for `large-v3-turbo` fp16 plus the detection models.
 
+### Resume interrupted pipelines (optional)
+
+Pipeline checkpointing is disabled by default. To reuse completed ingest,
+transcription, selection, source-analysis, and render work after a process
+failure or retry, set this in `.env` and recreate the backend:
+
+```dotenv
+PIPELINE_CHECKPOINTS_ENABLED=true
+```
+
+```bash
+docker compose up -d --force-recreate backend
+```
+
+Checkpoint state, the retained source, and completed clips live under
+`./output/<job-id>/`; the existing `./output:/app/output` bind mount must remain
+persistent across `docker compose down` and `up`. Checkpoints are
+content/configuration bound: changing the source bytes, model identity, prompt,
+selection settings, layout/caption analysis, or render settings invalidates
+only the affected stage and downstream work.
+
+These projects use additional disk while resumable. Delete the complete
+`./output/<job-id>` directory only when the job is not running and you no
+longer need its clips or resume state. Never delete individual hidden files or
+`.checkpoints` entries. Set the flag back to `false` and recreate the backend
+to disable reuse; existing checkpoint files are ignored and normal processing
+continues.
+
+If request-scoped secrets must survive a restart, configure
+`RESUME_SECRET_ACTIVE_KEY_ID`/`RESUME_SECRET_KEYS` AES-256-GCM keyring described
+in `.env.example`. Losing all keys makes those jobs wait for credentials; the
+server does not substitute or expose a secret.
+
+Once Whisper or Parakeet has fully completed and its timestamped output
+validates, the ASR stage is reusable for that same sealed job and retained
+source. Optionally set `WHISPER_MODEL_REVISION` to an exact 40-character
+Hugging Face commit SHA for stronger provenance and fine-grained model-output
+compatibility. See the
+[`actual checkpoint code flow`](docs/architecture/pipeline-checkpointing-code-flow.md)
+for every completion boundary and restart condition.
+
 ---
 
 ### 6. Run without a Google key (local LLM and vision, optional)

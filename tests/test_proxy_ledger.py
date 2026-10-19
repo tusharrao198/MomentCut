@@ -185,6 +185,38 @@ def test_alert_folds_a_burst_into_one_message(monkeypatch):
     assert proxy_ledger._pending["count"] == 3
 
 
+def test_duplicate_terminal_event_does_not_count_or_alert_twice(monkeypatch):
+    persisted = []
+    alerted = []
+
+    async def fake_persist(*args, **kwargs):
+        event_id = args[-1] if len(args) > 6 else kwargs.get("event_id")
+        if event_id in persisted:
+            return False
+        persisted.append(event_id)
+        return True
+
+    async def fake_alert(line, nbytes):
+        alerted.append((line, nbytes))
+
+    monkeypatch.setattr(proxy_ledger, "_persist", fake_persist)
+    monkeypatch.setattr(proxy_ledger, "_alert", fake_alert)
+    route = _route("fallback", [
+        {"label": "fallback", "ok": True, "bytes": 10_000_000, "paid": True},
+    ])
+
+    async def go():
+        assert await proxy_ledger.record_download(
+            "job-event", route, event_id="e" * 64,
+        )
+        assert not await proxy_ledger.record_download(
+            "job-event", route, event_id="e" * 64,
+        )
+
+    asyncio.run(go())
+    assert len(alerted) == 1
+
+
 def test_host_of_strips_credentials_and_paths():
     assert proxy_ledger.host_of("https://user:pw@www.youtube.com/watch?v=1") == "www.youtube.com"
     assert proxy_ledger.host_of(None) is None

@@ -85,7 +85,9 @@ def test_put_then_process_with_upload_id_and_captions_off(dirs, monkeypatch):
     assert job["env"]["AUTO_CAPTIONS"] == "0"
     assert slot["upload_id"] not in app_module.pending_uploads
     input_path = job["cmd"][job["cmd"].index("-i") + 1]
-    assert os.path.exists(input_path) and input_path.startswith(str(up_root))
+    assert os.path.exists(input_path)
+    assert input_path == str(out_root / payload["job_id"] / "source.mp4")
+    assert not input_path.startswith(str(up_root))
 
 
 def test_captions_default_leaves_env_alone(dirs, monkeypatch):

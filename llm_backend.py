@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Optional, Tuple, Type
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel
@@ -69,6 +70,86 @@ def describe() -> Optional[dict]:
     if not active():
         return None
     return {"provider": "openai", "model": model_name(), "baseUrl": base_url()}
+
+
+def configured_descriptor() -> dict:
+    """Return the configured non-secret identity without contacting the server."""
+    raw = base_url()
+    model = model_name()
+    try:
+        parts = urlsplit(raw)
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.hostname
+            or parts.username
+            or parts.password
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError("unsafe endpoint")
+        port = f":{parts.port}" if parts.port else ""
+        path = parts.path.rstrip("/")
+        endpoint = f"{parts.scheme.lower()}://{(parts.hostname or '').lower()}{port}{path}"
+    except ValueError as error:
+        raise RuntimeError(
+            "LLM_BASE_URL must be an http(s) endpoint without embedded "
+            "credentials, query parameters, or fragments"
+        ) from error
+    descriptor = {
+        "provider": provider(),
+        "endpoint": endpoint,
+        "requested_model": model,
+        "immutable_model_revision": None,
+        "immutable_revision_available": False,
+    }
+    return descriptor
+
+
+def resolved_descriptor() -> dict:
+    """Return a non-secret endpoint/model identity, including Ollama digest.
+
+    OpenAI-compatible servers do not have a common immutable-revision API.
+    For a local Ollama `/v1` endpoint, `/api/show` exposes the content digest;
+    otherwise reuse of model-output checkpoints must remain disabled.
+    """
+    descriptor = configured_descriptor()
+    endpoint = descriptor["endpoint"]
+    model = descriptor["requested_model"]
+    parts = urlsplit(endpoint)
+    if parts and (parts.hostname or "").lower() in {
+        "localhost", "127.0.0.1", "host.docker.internal",
+    } and parts.path.rstrip("/") in ("", "/v1"):
+        ollama_root = (
+            f"{parts.scheme}://{parts.hostname}"
+            f"{':' + str(parts.port) if parts.port else ''}"
+        )
+        try:
+            with _client() as client:
+                response = client.post(
+                    f"{ollama_root}/api/show", json={"name": model}
+                )
+                response.raise_for_status()
+                data = response.json()
+            digest = data.get("digest") if isinstance(data, dict) else None
+            if not isinstance(digest, str) or not digest.strip():
+                with _client() as client:
+                    response = client.get(f"{ollama_root}/api/tags")
+                    response.raise_for_status()
+                    tags = response.json()
+                for entry in (
+                    tags.get("models", []) if isinstance(tags, dict) else []
+                ):
+                    if not isinstance(entry, dict):
+                        continue
+                    if model in {entry.get("name"), entry.get("model")}:
+                        digest = entry.get("digest")
+                        break
+            if isinstance(digest, str) and digest.strip():
+                descriptor["immutable_model_revision"] = digest.strip()
+                descriptor["immutable_revision_available"] = True
+        except Exception:
+            pass
+    return descriptor
 
 
 def _timeout() -> float:

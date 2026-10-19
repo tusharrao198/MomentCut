@@ -69,7 +69,7 @@ carry durable download links; survives redeploys via the resume manifest.
 
 Jobs sent with an `osk_` key (REST, MCP, OAuth clients) do not trigger the
 clips-ready email: the caller polls or gets the webhook. The job records
-`via_api_key` and the resume manifest carries it.
+`api_caller` and the resume manifest carries it.
 
 ## Payment-required errors
 

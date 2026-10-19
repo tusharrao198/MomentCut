@@ -679,4 +679,7 @@ def test_main_routes_silent_video_to_local_vision(monkeypatch):
         "max_clips": 15,
         "min_seconds": 15.0,
         "max_seconds": 60.0,
+        "source_scenes": [],
+        "checkpoint_store": None,
+        "resolved_config": None,
     }

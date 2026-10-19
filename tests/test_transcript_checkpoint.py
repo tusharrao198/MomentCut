@@ -1,63 +1,76 @@
-"""Transcript checkpoint: a job re-run after a container restart must not
-transcribe (the slow, paid stage) a second time, and must never reuse the
-transcript of a DIFFERENT video.
-
-app.py re-enqueues an interrupted job with the same command and the same
-output directory (resume manifest). main.py leaves the finished transcript
-there, tied to the source's name and duration, picks it up on the re-run, and
-removes it once the job completes.
-"""
+"""The legacy basename/duration transcript cache is replaced by ASR envelopes."""
 import json
-import os
 
-import pytest
-
-main = pytest.importorskip("main")  # needs cv2/mediapipe, absent in minimal CI
-
-TRANSCRIPT = {"text": "hola", "language": "es",
-              "segments": [{"start": 0.0, "end": 1.0, "text": "hola", "words": []}]}
-SRC = "/app/output/job1/video.mp4"
-DUR = 58.64
+import checkpoint_store
 
 
-def _save(d, transcript=TRANSCRIPT, src=SRC, dur=DUR):
-    main.save_transcript_checkpoint(str(d), transcript, src, dur)
+TRANSCRIPT = {
+    "text": "hola",
+    "language": "es",
+    "segments": [
+        {"start": 0.0, "end": 1.0, "text": "hola", "words": []},
+    ],
+}
 
 
-def _load(d, src=SRC, dur=DUR):
-    return main.load_transcript_checkpoint(str(d), src, dur)
+def _config():
+    return {
+        "schema_version": 1,
+        "job_id": "job-1",
+        "configuration_revision": 1,
+        "source": {"kind": "upload", "retained_relative_path": "source.mp4"},
+        "pipeline": {},
+        "asr": {
+            "requested_backend": "whisper",
+            "whisper": {"model_revision": "whisper-rev-1"},
+        },
+        "checkpointing_enabled": True,
+    }
 
 
-class TestRoundTrip:
-    def test_same_source_is_reused(self, tmp_path):
-        _save(tmp_path)
-        assert os.path.isfile(tmp_path / main.TRANSCRIPT_CHECKPOINT)
-        assert _load(tmp_path) == TRANSCRIPT
-
-    def test_resumed_cloud_job_redownloads_to_the_same_name(self, tmp_path):
-        # The re-run's file lives at the same path; a slightly different
-        # duration reading (container decoders differ by a frame) still matches.
-        _save(tmp_path)
-        assert _load(tmp_path, dur=DUR + 0.3) == TRANSCRIPT
-
-    def test_missing_checkpoint_is_none(self, tmp_path):
-        assert _load(tmp_path) is None
+def _identity(data):
+    return {
+        "sha256": checkpoint_store.sha256_bytes(data),
+        "size": len(data),
+        "duration_ms": 58640,
+        "fps": 30.0,
+    }
 
 
-class TestNeverTheWrongTranscript:
-    def test_another_file_in_the_same_directory_is_ignored(self, tmp_path):
-        # THE RISK: CLI run on A dies after transcribing, then B is processed
-        # in the same directory without -o. B must get its own transcript.
-        _save(tmp_path, src="/videos/A.mp4")
-        assert _load(tmp_path, src="/videos/B.mp4") is None
-
-    def test_same_name_but_different_length_is_ignored(self, tmp_path):
-        _save(tmp_path, dur=600.0)
-        assert _load(tmp_path, dur=58.6) is None
-
-    def test_legacy_shape_without_source_is_ignored(self, tmp_path):
-        (tmp_path / main.TRANSCRIPT_CHECKPOINT).write_text(json.dumps(TRANSCRIPT))
-        assert _load(tmp_path) is None
+def test_speech_no_audio_and_sparse_speech_are_completed_outcomes(tmp_path):
+    config = _config()
+    source = _identity(b"video")
+    store = checkpoint_store.CheckpointStore(
+        str(tmp_path), config, True, 1, source,
+    )
+    for outcome, transcript, route in (
+        ("speech", TRANSCRIPT, "whisper-cpu"),
+        ("no_audio", None, "no-audio"),
+        (
+            "sparse_speech",
+            {"text": "", "language": "en", "segments": []},
+            "whisper-cpu",
+        ),
+    ):
+        key = checkpoint_store.expected_asr_key(
+            config, source, route,
+        )
+        backend = {
+            "effective_route": route,
+            "effective_backend": "none" if route == "no-audio" else "whisper",
+        }
+        if route != "no-audio":
+            backend.update({
+                "immutable_revision_available": True,
+                "immutable_model_revision": "whisper-rev-1",
+            })
+        assert store.save_fixed(
+            "asr",
+            key,
+            {"outcome": outcome, "transcript": transcript},
+            {"route_context": route, "backend": backend},
+        )
+        assert store.load_fixed("asr", key)["payload"]["outcome"] == outcome
 
     def test_different_whisper_engine_is_ignored(self, tmp_path, monkeypatch):
         monkeypatch.setenv("WHISPER_ENGINE", "faster-whisper")
@@ -73,27 +86,114 @@ class TestNeverTheWrongTranscript:
         assert _load(tmp_path) is None
 
 
-class TestRobustness:
-    def test_empty_transcript_is_ignored(self, tmp_path):
-        _save(tmp_path, transcript={"segments": []})
-        assert _load(tmp_path) is None
+def test_same_name_and_duration_cannot_substitute_different_bytes(tmp_path):
+    config = _config()
+    source_a = _identity(b"AAAA")
+    source_b = _identity(b"BBBB")
+    first = checkpoint_store.CheckpointStore(
+        str(tmp_path), config, True, 1, source_a,
+    )
+    key = checkpoint_store.expected_asr_key(
+        config, source_a, "whisper-cpu",
+    )
+    first.save_fixed(
+        "asr",
+        key,
+        {"outcome": "speech", "transcript": TRANSCRIPT},
+        {
+            "route_context": "whisper-cpu",
+            "backend": {
+                "effective_route": "whisper-cpu",
+                "effective_backend": "whisper",
+                "immutable_revision_available": True,
+                "immutable_model_revision": "whisper-rev-1",
+            },
+        },
+    )
+    resumed = checkpoint_store.CheckpointStore(
+        str(tmp_path), config, True, 2, source_b,
+    )
+    assert resumed.load_fixed("asr", key) is None
 
-    def test_truncated_file_is_ignored(self, tmp_path):
-        (tmp_path / main.TRANSCRIPT_CHECKPOINT).write_text('{"source": {"name": "vi')
-        assert _load(tmp_path) is None
 
-    def test_unwritable_directory_does_not_raise(self, tmp_path):
-        main.save_transcript_checkpoint(str(tmp_path / "missing" / "dir"), TRANSCRIPT, SRC, DUR)
+def test_small_adjacent_segment_overlap_is_a_complete_asr_stage(tmp_path):
+    config = _config()
+    config["asr"]["whisper"]["model_revision"] = None
+    source = _identity(b"overlap-video")
+    store = checkpoint_store.CheckpointStore(
+        str(tmp_path), config, True, 1, source,
+    )
+    transcript = {
+        "language": "en",
+        "segments": [
+            {"start": 0.0, "end": 10.0, "text": "first", "words": []},
+            {"start": 9.8, "end": 20.0, "text": "second", "words": []},
+        ],
+    }
+    key = checkpoint_store.expected_asr_key(
+        config, source, "whisper-cpu",
+    )
 
-    def test_clear_is_idempotent(self, tmp_path):
-        _save(tmp_path)
-        main.clear_transcript_checkpoint(str(tmp_path))
-        main.clear_transcript_checkpoint(str(tmp_path))
-        assert _load(tmp_path) is None
+    assert store.save_fixed(
+        "asr",
+        key,
+        {"outcome": "speech", "transcript": transcript},
+        {
+            "route_context": "whisper-cpu",
+            "backend": {
+                "effective_route": "whisper-cpu",
+                "effective_backend": "whisper",
+                "immutable_revision_available": False,
+                "immutable_model_revision": None,
+            },
+        },
+    )
 
-    def test_checkpoint_is_hidden_from_job_listings(self):
-        # app.py globs *_metadata.json and *.mp4 in the job dir; a dotfile
-        # named unlike either can never be mistaken for a deliverable.
-        assert main.TRANSCRIPT_CHECKPOINT.startswith(".")
-        assert not main.TRANSCRIPT_CHECKPOINT.endswith("_metadata.json")
-        assert not main.TRANSCRIPT_CHECKPOINT.endswith(".mp4")
+
+def test_materially_backwards_asr_segments_are_not_checkpointed(tmp_path):
+    config = _config()
+    config["asr"]["whisper"]["model_revision"] = None
+    source = _identity(b"backwards-video")
+    store = checkpoint_store.CheckpointStore(
+        str(tmp_path), config, True, 1, source,
+    )
+    transcript = {
+        "language": "en",
+        "segments": [
+            {"start": 0.0, "end": 10.0, "text": "first", "words": []},
+            {"start": 8.0, "end": 20.0, "text": "second", "words": []},
+        ],
+    }
+    key = checkpoint_store.expected_asr_key(
+        config, source, "whisper-cpu",
+    )
+
+    assert not store.save_fixed(
+        "asr",
+        key,
+        {"outcome": "speech", "transcript": transcript},
+        {
+            "route_context": "whisper-cpu",
+            "backend": {
+                "effective_route": "whisper-cpu",
+                "effective_backend": "whisper",
+                "immutable_revision_available": False,
+                "immutable_model_revision": None,
+            },
+        },
+    )
+
+
+def test_legacy_transcript_checkpoint_is_ignored(tmp_path):
+    legacy = tmp_path / ".transcript_checkpoint.json"
+    legacy.write_text(json.dumps({
+        "source": {"name": "video.mp4", "duration": 58.6},
+        "transcript": TRANSCRIPT,
+    }))
+    store = checkpoint_store.CheckpointStore(
+        str(tmp_path), _config(), True, 1, _identity(b"video"),
+    )
+    key = checkpoint_store.expected_asr_key(
+        store.job_config, store.source_identity, "whisper-cpu",
+    )
+    assert store.load_fixed("asr", key) is None

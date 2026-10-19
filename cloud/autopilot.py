@@ -31,6 +31,8 @@ Guard rails, each one a cost that would otherwise scale with the channel:
 - YouTube Shorts are skipped: they already are short-form.
 """
 import asyncio
+import hashlib
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -135,6 +137,33 @@ def rank_clips(clips: List[dict], n: int) -> List[int]:
 
     order = sorted(range(len(clips)), key=lambda i: (-score(i), i))
     return order[:n]
+
+
+def delivered_clip_rows(clips: List[dict], terminal_artifacts: Iterable[dict]) -> List[dict]:
+    """Map compact delivered results back to immutable planned clip indices."""
+    artifacts_by_name = {
+        os.path.basename(str(item.get("relative_path") or "")): item
+        for item in terminal_artifacts or []
+        if isinstance(item, dict)
+        and isinstance(item.get("clip_index"), int)
+        and item.get("relative_path")
+    }
+    delivered = []
+    for clip in clips or []:
+        if not isinstance(clip, dict):
+            continue
+        filename = os.path.basename(
+            str(clip.get("video_url") or "").split("?", 1)[0]
+        )
+        artifact = artifacts_by_name.get(filename)
+        if artifact is None:
+            continue
+        delivered.append({
+            "clip_index": int(artifact["clip_index"]),
+            "clip": clip,
+            "artifact": artifact,
+        })
+    return delivered
 
 
 def schedule_slots(now: datetime, n: int, hour: int = DEFAULT_PUBLISH_HOUR,
@@ -582,64 +611,205 @@ def start(app, is_active=None):
 # --------------------------------------------------------------------------- #
 # Job completion (called from app.run_job_wrapper)
 # --------------------------------------------------------------------------- #
-async def on_job_finished(job_id: str, job: dict, failure_reason: Optional[str] = None):
-    """Settle the run for ``job_id`` if Autopilot started it; no-op otherwise.
+def _plan_id(payload: dict) -> str:
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
 
-    Runs on the instance that ran the job. The status flip is a guarded
-    UPDATE, so a second call for the same job does nothing.
-    """
+
+async def finalize_job(
+    job_id: str,
+    job: dict,
+    terminal_artifacts: list,
+    *,
+    email_event_id: str,
+    publish_event_id: str,
+    failure_reason: Optional[str] = None,
+) -> dict:
+    """Persist/reload the deterministic Autopilot completion action plan."""
     if not job_id or not isinstance(job, dict):
-        return
-    ok = job.get("status") == "completed"
+        return {"is_autopilot": False, "email": None, "publish_items": []}
+    ok = job.get("status") in {"completed", "partial"}
     clips = ((job.get("result") or {}).get("clips")) or []
+    artifacts = {
+        int(item["clip_index"]): item
+        for item in (terminal_artifacts or [])
+        if isinstance(item, dict) and isinstance(item.get("clip_index"), int)
+    }
+    delivered = delivered_clip_rows(clips, artifacts.values())
     async with database.session() as s:
         async with s.begin():
-            row = (await s.execute(
-                update(AutopilotRun)
-                .where(and_(AutopilotRun.job_id == job_id,
-                            AutopilotRun.status == PROCESSING))
-                .values(status=COMPLETED if ok else FAILED,
-                        reason=None if ok else (failure_reason or "processing_failed"),
-                        clips_count=len(clips) if ok else 0)
-                .returning(AutopilotRun.id, AutopilotRun.user_id, AutopilotRun.video_title)
-            )).first()
-    if row is None or not ok or not clips:
+            run = (await s.execute(
+                select(AutopilotRun)
+                .where(AutopilotRun.job_id == job_id)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if run is None:
+                return {
+                    "is_autopilot": False,
+                    "email": None,
+                    "publish_items": [],
+                }
+            if isinstance(run.completion_plan, dict):
+                return run.completion_plan
+
+            prefs = await s.get(AutopilotSettings, run.user_id)
+            user = await s.get(User, run.user_id)
+            profile_row = await s.get(UploadPostProfile, run.user_id)
+            profile = profile_row.profile_username if profile_row else None
+            platforms = clean_platforms(
+                prefs.publish_platforms if prefs else []
+            )
+            to_post = []
+            if ok and prefs and prefs.autopublish and platforms:
+                n = max(
+                    0,
+                    min(
+                        MAX_CLIPS_TO_PUBLISH,
+                        prefs.clips_to_publish or DEFAULT_CLIPS_TO_PUBLISH,
+                    ),
+                )
+                ranked_positions = rank_clips(
+                    [item["clip"] for item in delivered], n,
+                )
+                to_post = [delivered[position] for position in ranked_positions]
+
+            slots = schedule_slots(
+                datetime.now(timezone.utc),
+                len(to_post),
+                prefs.publish_hour
+                if prefs and prefs.publish_hour is not None
+                else DEFAULT_PUBLISH_HOUR,
+                prefs.timezone if prefs else None,
+            )
+            publish_items = []
+            for delivered_item, scheduled_at in zip(to_post, slots):
+                if not profile:
+                    continue
+                clip_index = delivered_item["clip_index"]
+                artifact = delivered_item["artifact"]
+                clip = delivered_item["clip"]
+                relative_path = os.path.basename(
+                    str(artifact.get("relative_path") or "")
+                )
+                if not relative_path:
+                    continue
+                identity = {
+                    "parent_event_id": publish_event_id,
+                    "clip_key": (
+                        artifact.get("clip_plan_identity")
+                        or artifact.get("sha256")
+                    ),
+                    "clip_index": clip_index,
+                    "profile_id": profile,
+                    "platforms": platforms,
+                    "scheduled_at": scheduled_at,
+                }
+                item_id = _plan_id(identity)
+                publish_items.append({
+                    **identity,
+                    "item_id": item_id,
+                    "event_id": _plan_id({
+                        "namespace": "openshorts-autopilot-publish-v1",
+                        "item_id": item_id,
+                    }),
+                    "run_id": str(run.id),
+                    "relative_path": relative_path,
+                    "timezone": prefs.timezone or "UTC",
+                    "clip": {
+                        key: clip.get(key) for key in (
+                            "title",
+                            "video_title_for_youtube_short",
+                            "video_description_for_youtube",
+                            "video_description_for_instagram",
+                            "video_description_for_tiktok",
+                        )
+                    },
+                })
+            email = None
+            if ok and delivered and user and user.email:
+                email = {
+                    "event_id": email_event_id,
+                    "email": user.email,
+                    "video_title": run.video_title,
+                    "clips_count": len(delivered),
+                    "publish_count": len(publish_items),
+                    "dashboard_url": (
+                        f"{settings.frontend_url}/#app?tab=autopilot"
+                    ),
+                }
+            plan = {
+                "version": 1,
+                "is_autopilot": True,
+                "run_id": str(run.id),
+                "email": email,
+                "publish_items": publish_items,
+            }
+            run.status = COMPLETED if ok else FAILED
+            run.reason = None if ok else (
+                failure_reason or "processing_failed"
+            )
+            run.clips_count = len(delivered) if ok else 0
+            run.completion_plan = plan
+            job["autopilot_run_id"] = str(run.id)
+            return plan
+
+
+async def send_completion_email(plan: dict) -> None:
+    email = (plan or {}).get("email")
+    if not isinstance(email, dict):
         return
-    run_id, user_id, video_title = row
+    from .emails import send_autopilot_clips_email
+    await send_autopilot_clips_email(
+        email["email"],
+        email.get("video_title"),
+        int(email.get("clips_count") or 0),
+        int(email.get("publish_count") or 0),
+        email["dashboard_url"],
+    )
 
-    prefs = await _get_settings(user_id)
-    platforms = clean_platforms(prefs.publish_platforms if prefs else [])
-    to_post = []
-    if prefs and prefs.autopublish and platforms:
-        n = max(0, min(MAX_CLIPS_TO_PUBLISH, prefs.clips_to_publish or DEFAULT_CLIPS_TO_PUBLISH))
-        to_post = rank_clips(clips, n)
 
-    # Our own email replaces the generic "clips ready" one for this job.
-    job["email_sent"] = True
-    try:
-        from .emails import send_autopilot_clips_email
-        async with database.session() as s:
-            user = await s.get(User, user_id)
-        if user and user.email:
-            await send_autopilot_clips_email(
-                user.email, video_title, len(clips), len(to_post),
-                f"{settings.frontend_url}/#app?tab=autopilot")
-    except Exception as e:
-        print(f"⚠️  Autopilot email failed for {job_id}: {e}")
+async def publish_one(plan_item: dict, output_dir: str) -> bool:
+    relative = os.path.basename(str((plan_item or {}).get("relative_path") or ""))
+    if not relative:
+        raise RuntimeError("Autopilot publish item has no media artifact")
+    path = os.path.realpath(os.path.join(output_dir, relative))
+    root = os.path.realpath(output_dir)
+    if os.path.commonpath([root, path]) != root or not os.path.isfile(path):
+        raise RuntimeError("Autopilot publish media artifact is unavailable")
+    return await _upload_clip(
+        plan_item["profile_id"],
+        path,
+        plan_item.get("clip") or {},
+        clean_platforms(plan_item.get("platforms") or []),
+        plan_item["scheduled_at"],
+        plan_item.get("timezone") or "UTC",
+    )
 
-    if to_post:
-        profile = await _profile_for(user_id)
-        output_dir = job.get("output_dir") or ""
-        items = []
-        for i in to_post:
-            rel = clips[i].get("video_url") or ""
-            path = os.path.join(output_dir, os.path.basename(rel))
-            if rel and os.path.exists(path):
-                items.append((clips[i], path))
-        if profile and items:
-            task = asyncio.create_task(_publish(run_id, profile, items, platforms, prefs))
-            _bg_tasks.add(task)
-            task.add_done_callback(_bg_tasks.discard)
+
+async def record_publish_progress(run_id: str, posted_count: int) -> None:
+    await _update_run(uuid.UUID(str(run_id)), posted_count=int(posted_count))
+
+
+async def on_job_finished(job_id: str, job: dict, failure_reason: Optional[str] = None):
+    """Backward-compatible synchronous wrapper for non-outbox callers."""
+    seed = _plan_id({"job_id": job_id, "namespace": "legacy-autopilot"})
+    plan = await finalize_job(
+        job_id,
+        job,
+        [],
+        email_event_id=seed,
+        publish_event_id=seed,
+        failure_reason=failure_reason,
+    )
+    if not plan.get("is_autopilot"):
+        return
+    await send_completion_email(plan)
+    posted = 0
+    for item in plan.get("publish_items") or []:
+        if await publish_one(item, job.get("output_dir") or ""):
+            posted += 1
+    await record_publish_progress(plan["run_id"], posted)
 
 
 async def _publish(run_id, profile, items, platforms, prefs):

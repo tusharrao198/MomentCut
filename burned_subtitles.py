@@ -24,6 +24,7 @@ renders exactly as it did before this module existed.
 """
 import json
 import os
+import hashlib
 
 ENABLED = os.environ.get("SUBTITLE_BAND_CHECK", "1").strip() != "0"
 
@@ -60,6 +61,21 @@ part of the scene (signs, slides, screens, product labels).
 """
 
 
+def resolve_config(env=None):
+    source = os.environ if env is None else env
+    return {
+        "enabled": str(source.get("SUBTITLE_BAND_CHECK", "1")).strip() != "0",
+        "model": source.get("GEMINI_MODEL") or "gemini-3.1-flash-lite",
+        "minimum_presence": MIN_PRESENCE,
+        "highest_band": HIGHEST_BAND,
+        "lowest_band": LOWEST_BAND,
+        "margin": MARGIN,
+        "sample_frames": int(source.get("LAYOUT_SAMPLE_FRAMES", "12")),
+        "sample_width": int(source.get("LAYOUT_SAMPLE_WIDTH", "1024")),
+        "prompt_version": "burned-subtitles-v1",
+    }
+
+
 def band_top(answers):
     """Where to cut, as a fraction of the height, from per-frame answers.
 
@@ -93,18 +109,50 @@ def crop_filter(band):
     return f"crop=iw:trunc(ih*{float(band):.4f}/2)*2:0:0"
 
 
-def detect(video_path, frames=None):
+def detect_with_provenance(video_path, frames=None, config=None):
     """Top of the source's burned-in subtitle band (0..1), or None.
 
     Never raises: like the layout picker, a missing answer degrades to today's
     render.
     """
-    if not ENABLED:
-        return None
+    if config is None:
+        # Keep the public compatibility wrapper responsive to callers that
+        # temporarily override the historical module flag. Managed pipeline
+        # runs pass their immutable resolved config explicitly.
+        config = resolve_config()
+        config["enabled"] = bool(ENABLED)
+    else:
+        config = dict(config)
+    if not config["enabled"]:
+        return {
+            "outcome": "none",
+            "band": None,
+            "sample_hashes": [],
+            "config": config,
+            "implementation_version": "source-subtitles-v1",
+        }
+    from gemini_feature_flags import clip_analysis_enabled
+    if not clip_analysis_enabled():
+        return {
+            "outcome": "failure",
+            "band": None,
+            "reason": "analysis_disabled",
+            "sample_hashes": [],
+            "config": config,
+            "implementation_version": "source-subtitles-v1",
+        }
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return None
-    model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
+        return {
+            "outcome": "failure",
+            "band": None,
+            "reason": "missing_api_key",
+            "sample_hashes": [],
+            "config": config,
+            "implementation_version": "source-subtitles-v1",
+        }
+    model_name = config["model"]
+    sample_hashes = []
     try:
         from google import genai
         from google.genai import types as genai_types
@@ -120,9 +168,19 @@ def detect(video_path, frames=None):
         class SubtitleAnswer(BaseModel):
             frames: list[FrameSubtitle]
 
-        frames = frames if frames is not None else layout_picker.sample_frames(video_path)
+        frames = frames if frames is not None else layout_picker.sample_frames(
+            video_path, config["sample_frames"], config["sample_width"],
+        )
         if not frames:
-            return None
+            return {
+                "outcome": "failure",
+                "band": None,
+                "reason": "no_readable_frames",
+                "sample_hashes": [],
+                "config": config,
+                "implementation_version": "source-subtitles-v1",
+            }
+        sample_hashes = [hashlib.sha256(frame).hexdigest() for frame in frames]
         client = genai.Client(api_key=api_key)
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
                  for b in frames]
@@ -137,7 +195,14 @@ def detect(video_path, frames=None):
         answer = json.loads(response.text) or {}
     except Exception as e:
         print(f"   ⚠️ Burned-in subtitle check failed ({e}) — captions as usual.")
-        return None
+        return {
+            "outcome": "failure",
+            "band": None,
+            "reason": type(e).__name__,
+            "sample_hashes": sample_hashes,
+            "config": config,
+            "implementation_version": "source-subtitles-v1",
+        }
 
     per_frame = [f.get("subtitle_top") for f in answer.get("frames", [])
                  if isinstance(f, dict)][:len(frames)]
@@ -148,4 +213,14 @@ def detect(video_path, frames=None):
     else:
         print(f"   💬 Source has burned-in subtitles ({seen}/{len(per_frame)} frames) — "
               f"trimming below {band:.0%} so only our captions show.")
-    return band
+    return {
+        "outcome": "band" if band is not None else "none",
+        "band": band,
+        "sample_hashes": sample_hashes,
+        "config": config,
+        "implementation_version": "source-subtitles-v1",
+    }
+
+
+def detect(video_path, frames=None, config=None):
+    return detect_with_provenance(video_path, frames, config).get("band")

@@ -32,6 +32,8 @@ import sys
 import tempfile
 import threading
 import time
+import hashlib
+import json
 
 from subtitles import (
     get_whisper_config,
@@ -39,7 +41,9 @@ from subtitles import (
     merge_continuation_words,
 )
 
-PARAKEET_MODEL_ID = "nemo-parakeet-tdt-0.6b-v3"
+PARAKEET_MODEL_ID = os.environ.get(
+    "PARAKEET_MODEL_ID", "nemo-parakeet-tdt-0.6b-v3"
+).strip()
 
 # The 25 European languages parakeet-tdt-0.6b-v3 supports (ISO 639-1).
 PARAKEET_LANGS = {
@@ -157,6 +161,24 @@ _whisper_lock = threading.Lock()
 # Set after a CUDA failure (e.g. VRAM exhausted by other models on the GPU)
 # so every later transcription goes straight to CPU instead of re-failing.
 _whisper_force_cpu = False
+_HF_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def _configured_model_revision(name):
+    value = (os.environ.get(name) or "").strip()
+    return value or None
+
+
+def _immutable_hf_revision(name, model_name=None):
+    """Return a revision only when it is an immutable Hugging Face commit."""
+    value = _configured_model_revision(name)
+    if not value or not _HF_COMMIT_SHA_RE.fullmatch(value):
+        return None
+    # faster-whisper accepts either a Hub model/alias or a local CTranslate2
+    # directory. The revision argument cannot freeze mutable local bytes.
+    if model_name and os.path.isdir(os.path.expanduser(str(model_name))):
+        return None
+    return value
 
 
 def _get_whisper_model(force_cpu=False):
@@ -170,11 +192,18 @@ def _get_whisper_model(force_cpu=False):
     if _whisper_force_cpu or force_cpu:
         cfg["device"] = "cpu"
         cfg["compute_type"] = "int8"
-    key = (cfg["model_size"], cfg["device"], cfg["compute_type"])
+    requested_revision = _configured_model_revision("WHISPER_MODEL_REVISION")
+    key = (
+        cfg["model_size"], cfg["device"], cfg["compute_type"],
+        requested_revision,
+    )
     with _whisper_lock:
         if _whisper_model is None or _whisper_key != key:
             from faster_whisper import WhisperModel
-            _whisper_model = WhisperModel(key[0], device=key[1], compute_type=key[2])
+            kwargs = {"device": key[1], "compute_type": key[2]}
+            if requested_revision:
+                kwargs["revision"] = requested_revision
+            _whisper_model = WhisperModel(key[0], **kwargs)
             _whisper_key = key
     return _whisper_model, cfg["device"]
 
@@ -314,9 +343,17 @@ def _requested_whisper_engine():
     return os.environ.get("WHISPER_ENGINE", "auto").strip().lower() or "auto"
 
 
+
+def _has_explicit_mlx_whisper_config():
+    return any(
+        os.environ.get(name, "").strip()
+        for name in ("WHISPER_MLX_MODEL", "WHISPER_MLX_MODEL_REVISION")
+    )
+
+
 def whisper_config_identity():
-    """Stable requested N1 identity for transcript checkpoint validation."""
-    from accelerator_runtime import resolve_whisper_engine
+    """Stable N1 identity, matching the actual auto-fallback policy."""
+    from accelerator_runtime import AcceleratorConfigurationError, resolve_whisper_engine
 
     requested = _requested_whisper_engine()
     engine = resolve_whisper_engine(requested)
@@ -326,11 +363,20 @@ def whisper_config_identity():
         "params": dict(WHISPER_TRANSCRIBE_PARAMS),
     }
     if engine == "mlx":
-        repository, revision = _mac_asr().resolve_whisper_model()
-        identity.update({"model": repository, "revision": revision})
+        try:
+            repository, revision = _mac_asr().resolve_whisper_model()
+        except AcceleratorConfigurationError:
+            if requested != "auto" or _has_explicit_mlx_whisper_config():
+                raise
+            engine = "faster-whisper"
+            identity["resolved_whisper_engine"] = engine
+            identity.update(get_whisper_config())
+        else:
+            identity.update({"model": repository, "revision": revision})
     else:
         identity.update(get_whisper_config())
     return identity
+
 
 
 def _requested_parakeet_engine():
@@ -363,8 +409,45 @@ def parakeet_config_identity():
     return identity
 
 
-def _transcribe_with_whisper(media_path):
-    """Use MLX on Apple Silicon and preserve faster-whisper everywhere else."""
+def checkpoint_asr_config():
+    """Resolved non-secret ASR configuration persisted with a checkpointed job."""
+    whisper = whisper_config_identity()
+    parakeet = parakeet_config_identity()
+    whisper_engine = whisper["resolved_whisper_engine"]
+    parakeet_engine = parakeet["resolved_parakeet_engine"]
+    return {
+        "requested_backend": os.environ.get(
+            "TRANSCRIBE_BACKEND", "whisper"
+        ).strip().lower(),
+        "fallback_policy": "parakeet-to-whisper-route-v1",
+        "whisper": {
+            "engine": whisper_engine,
+            "model": whisper["model"] if whisper_engine == "mlx"
+            else whisper["model_size"],
+            "model_revision": whisper.get("revision") if whisper_engine == "mlx"
+            else _configured_model_revision("WHISPER_MODEL_REVISION"),
+            "device": "mlx" if whisper_engine == "mlx"
+            else whisper["device"],
+            "compute": "mlx" if whisper_engine == "mlx"
+            else whisper["compute_type"],
+        },
+        "parakeet": {
+            "engine": parakeet_engine,
+            "model": parakeet["model"],
+            "model_revision": parakeet.get("revision") if parakeet_engine == "mlx"
+            else _configured_model_revision("PARAKEET_MODEL_REVISION"),
+            "vad_batch": str(parakeet.get("vad_batch", PARAKEET_VAD_BATCH)),
+        },
+        "sparse_policy": {
+            "min_words": os.environ.get("MIN_SPEECH_WORDS", "8"),
+            "min_words_per_minute": os.environ.get("MIN_SPEECH_WORDS_PER_MIN", "5"),
+        },
+    }
+
+
+
+def _transcribe_with_whisper_execution(media_path):
+    """Return the transcript plus the engine that actually completed it."""
     from accelerator_runtime import (
         AcceleratorConfigurationError,
         resolve_whisper_engine,
@@ -373,35 +456,38 @@ def _transcribe_with_whisper(media_path):
     requested = _requested_whisper_engine()
     engine = resolve_whisper_engine(requested)
     if engine == "faster-whisper":
-        return _transcribe_with_faster_whisper(media_path)
+        return _transcribe_with_faster_whisper(media_path), {
+            "engine": engine,
+            "force_cpu": False,
+        }
 
     try:
         transcript = _run_mlx_whisper(
             media_path, WHISPER_TRANSCRIBE_PARAMS, show_progress=True)
         print(f"🎙️ [ASR] mlx-whisper ok: lang={transcript['language']} "
               f"segments={len(transcript['segments'])}")
-        return transcript
+        return transcript, {"engine": "mlx", "force_cpu": False}
     except AcceleratorConfigurationError as error:
-        # ``auto`` keeps a portable faster-whisper route available for normal
-        # model aliases (for example ``base``) without a tested MLX mapping.
-        # An explicit MLX repository/revision is deliberate operator input, so
-        # leave those configuration errors visible instead of ignoring them.
-        explicit_mlx_model = any(
-            os.environ.get(name, "").strip()
-            for name in ("WHISPER_MLX_MODEL", "WHISPER_MLX_MODEL_REVISION")
-        )
-        if requested != "auto" or explicit_mlx_model:
+        if requested != "auto" or _has_explicit_mlx_whisper_config():
             raise
         print(f"⚠️ [ASR] mlx-whisper configuration unavailable "
               f"({type(error).__name__}: {error}) — "
               "falling back to faster-whisper on CPU")
-        return _transcribe_with_faster_whisper(media_path, force_cpu=True)
-    except Exception as e:
+    except Exception as error:
         if requested == "mlx":
             raise
-        print(f"⚠️ [ASR] mlx-whisper failed ({type(e).__name__}: {e}) — "
+        print(f"⚠️ [ASR] mlx-whisper failed ({type(error).__name__}: {error}) — "
               "falling back to faster-whisper on CPU")
-        return _transcribe_with_faster_whisper(media_path, force_cpu=True)
+
+    return _transcribe_with_faster_whisper(media_path, force_cpu=True), {
+        "engine": "faster-whisper",
+        "force_cpu": True,
+    }
+
+
+def _transcribe_with_whisper(media_path):
+    """Backward-compatible transcript-only Whisper helper."""
+    return _transcribe_with_whisper_execution(media_path)[0]
 
 
 # --- parakeet ---------------------------------------------------------------
@@ -471,30 +557,26 @@ def vad_load_kwargs():
     return {"sess_options": opts, "providers": ["CPUExecutionProvider"]}
 
 
+
 def _get_parakeet_model():
     global _parakeet_model
     with _parakeet_lock:
         if _parakeet_model is None:
             import onnx_asr
-            model = onnx_asr.load_model(PARAKEET_MODEL_ID, providers=parakeet_providers(),
-                                        sess_options=parakeet_session_options())
+            model = onnx_asr.load_model(
+                PARAKEET_MODEL_ID,
+                providers=parakeet_providers(),
+                sess_options=parakeet_session_options(),
+            )
             vad = onnx_asr.load_vad("silero", **vad_load_kwargs())
             _parakeet_model = model.with_vad(
-                vad, batch_size=PARAKEET_VAD_BATCH).with_timestamps()
+                vad, batch_size=PARAKEET_VAD_BATCH
+            ).with_timestamps()
     return _parakeet_model
 
 
 def release_models():
-    """Drop the resident ASR models and hand their VRAM back to the GPU.
-
-    ``transcribe_media`` calls this before releasing its host-wide slot, for
-    both short-lived workers and the long-lived API process.  That prevents
-    CTranslate2, ONNX Runtime or MLX state from remaining resident while a
-    render or another admitted transcription starts.
-
-    Drains every gate slot first, so no transcription is mid-decode on the
-    model being dropped, and both loaders fetch their model inside the gate.
-    """
+    """Drop resident ASR and scene models after a completed transcription."""
     global _whisper_model, _whisper_key, _parakeet_model
     mlx_released = False
     for _ in range(_ASR_SLOTS):
@@ -510,14 +592,11 @@ def release_models():
             _ASR_GATE.release()
     if whisper is not None:
         try:
-            # ctranslate2 frees the weights on unload, not on garbage
-            # collection: the Python wrapper can outlive the last reference.
             whisper.model.unload_model()
-        except Exception as e:
-            print(f"⚠️ [ASR] whisper unload failed ({type(e).__name__}: {e})")
+        except Exception as error:
+            print(f"⚠️ [ASR] whisper unload failed ({type(error).__name__}: {error})")
     del whisper, parakeet
-    # TransNetV2 is the other torch tenant an in-process pipeline leaves
-    # behind (scene_detection keeps it as a module singleton too).
+    # TransNetV2 is the other torch tenant retained by the pipeline.
     tn2 = sys.modules.get("scene_detection")
     if tn2 is not None:
         try:
@@ -526,11 +605,10 @@ def release_models():
                 release_tn2()
             else:
                 tn2._tn2_model = None
-        except Exception as e:
-            # This is a best-effort allocator release. Never turn successful
-            # transcription into a failed job because cleanup was unavailable.
+                tn2._tn2_model_key = None
+        except Exception as error:
             print(f"⚠️ [ASR] TransNetV2 cleanup failed "
-                  f"({type(e).__name__}: {e})")
+                  f"({type(error).__name__}: {error})")
     import gc
     gc.collect()
     try:
@@ -871,9 +949,9 @@ class NoAudioError(Exception):
     """The media has no audio track — nothing to transcribe."""
 
 
+
 def _has_audio_stream(media_path) -> bool:
     """True if the file has at least one audio stream (ffprobe)."""
-    import subprocess
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a",
@@ -885,50 +963,251 @@ def _has_audio_stream(media_path) -> bool:
         return True  # probe failed — don't block, let the backend try
 
 
-def _transcribe_media(media_path):
-    # Silent videos (AI-generated clips, muted screen recordings) have no audio
-    # stream; every ASR backend then crashes deep inside libav with an opaque
-    # "tuple index out of range". Detect it up front and fail with a clear,
-    # actionable reason instead.
+def _parameters_hash(payload):
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _parakeet_reason_code(reason):
+    text = str(reason or "").lower()
+    if "outside parakeet" in text:
+        return "parakeet_unsupported_language"
+    if "no words" in text:
+        return "parakeet_no_words"
+    if "words in" in text:
+        return "parakeet_sparse_result"
+    return "parakeet_failed"
+
+
+def _whisper_provenance(requested_backend, attempts, execution=None,
+                        fallback_reason_code=None, fallback_reason_detail=None):
+    """Record the ASR route that completed, including MLX fallback details."""
+    execution = execution or {"engine": "faster-whisper", "force_cpu": False}
+    engine = execution["engine"]
+    force_cpu = bool(execution.get("force_cpu"))
+    if engine == "mlx":
+        model, revision = _mac_asr().resolve_whisper_model()
+        device = compute_type = "mlx"
+        immutable_revision = revision
+        params = {
+            "engine": engine,
+            "model": model,
+            "revision": revision,
+            "transcribe": WHISPER_TRANSCRIBE_PARAMS,
+        }
+        route_device = "mlx"
+    else:
+        cfg = get_whisper_config()
+        device = _whisper_device(force_cpu) if force_cpu else _whisper_device()
+        route_device = "cpu" if device == "cpu" else "gpu"
+        compute_type = (
+            "int8" if device == "cpu" and (_whisper_force_cpu or force_cpu)
+            else cfg["compute_type"]
+        )
+        model = cfg["model_size"]
+        immutable_revision = _immutable_hf_revision(
+            "WHISPER_MODEL_REVISION", model,
+        )
+        params = {
+            "engine": engine,
+            "model": model,
+            "configured_model_revision": _configured_model_revision(
+                "WHISPER_MODEL_REVISION"
+            ),
+            "device": device,
+            "compute_type": compute_type,
+            "transcribe": WHISPER_TRANSCRIBE_PARAMS,
+        }
+    prefix = "parakeet-to-whisper" if requested_backend == "parakeet" else "whisper"
+    route = f"{prefix}-{route_device}"
+    attempts.append({
+        "backend": "whisper",
+        "engine": engine,
+        "device": device,
+        "outcome": "success",
+    })
+    return {
+        "requested_backend": requested_backend,
+        "effective_route": route,
+        "effective_backend": "whisper",
+        "effective_model": model,
+        "immutable_model_revision": immutable_revision,
+        "immutable_revision_available": bool(immutable_revision),
+        "device": device,
+        "compute_type": compute_type,
+        "fallback_reason_code": fallback_reason_code,
+        "fallback_reason_detail": (
+            str(fallback_reason_detail or "")[:500] or None
+        ),
+        "attempts": attempts,
+        "parameters_hash": _parameters_hash(params),
+        "implementation_version": "asr-backend-v1",
+    }
+
+
+def _parakeet_provenance(attempts, engine):
+    if engine == "mlx":
+        model, revision = _mac_asr().resolve_parakeet_model()
+        params = {
+            "engine": engine,
+            "model": model,
+            "revision": revision,
+            "chunk_seconds": 120,
+            "overlap_seconds": 15,
+        }
+        return {
+            "effective_route": "parakeet-mlx",
+            "effective_model": model,
+            "immutable_model_revision": revision,
+            "immutable_revision_available": True,
+            "device": "mlx",
+            "compute_type": "mlx",
+            "parameters_hash": _parameters_hash(params),
+        }
+    configured_revision = _configured_model_revision("PARAKEET_MODEL_REVISION")
+    params = {
+        "engine": engine,
+        "model": PARAKEET_MODEL_ID,
+        "configured_model_revision": configured_revision,
+        "vad_batch": PARAKEET_VAD_BATCH,
+        "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    }
+    return {
+        "effective_route": "parakeet",
+        "effective_model": PARAKEET_MODEL_ID,
+        "immutable_model_revision": None,
+        "immutable_revision_available": False,
+        "device": "cuda-or-cpu-provider",
+        "compute_type": "model-default",
+        "parameters_hash": _parameters_hash(params),
+    }
+
+
+def transcribe_media_with_provenance(media_path):
+    """Return a completed ASR outcome plus the route that produced it."""
     if not _has_audio_stream(media_path):
-        raise NoAudioError(
+        detail = (
             "This video has no audio track. OpenShorts finds viral moments from "
-            "speech, so it needs a video with audio.")
+            "speech, so it needs a video with audio."
+        )
+        return {
+            "outcome": "no_audio",
+            "transcript": None,
+            "provenance": {
+                "requested_backend": os.environ.get(
+                    "TRANSCRIBE_BACKEND", "whisper"
+                ).strip().lower(),
+                "effective_route": "no-audio",
+                "effective_backend": "none",
+                "effective_model": None,
+                "immutable_model_revision": None,
+                "immutable_revision_available": True,
+                "device": None,
+                "compute_type": None,
+                "fallback_reason_code": "no_audio_stream",
+                "fallback_reason_detail": detail,
+                "attempts": [],
+                "parameters_hash": _parameters_hash({"audio_stream": False}),
+                "implementation_version": "asr-backend-v1",
+            },
+        }
 
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
+    if backend not in {"whisper", "parakeet"}:
+        backend = "whisper"
+    attempts = []
+    reason_code = None
+    reason_detail = None
 
     if backend == "parakeet":
-        from accelerator_runtime import AcceleratorConfigurationError
+        from accelerator_runtime import AcceleratorConfigurationError, resolve_parakeet_engine
 
         requested = _requested_parakeet_engine()
         try:
+            engine = resolve_parakeet_engine(requested)
             transcript = _transcribe_with_selected_parakeet(media_path)
             reason = _parakeet_fallback_reason(transcript)
             if reason is None:
                 print(f"🎙️ [ASR] parakeet ok: lang={transcript['language']} "
                       f"segments={len(transcript['segments'])}")
-                return transcript
+                attempts.append({
+                    "backend": "parakeet", "engine": engine, "outcome": "success",
+                })
+                provenance = _parakeet_provenance(attempts, engine)
+                return {
+                    "outcome": "speech",
+                    "transcript": transcript,
+                    "provenance": {
+                        "requested_backend": backend,
+                        "effective_backend": "parakeet",
+                        "fallback_reason_code": None,
+                        "fallback_reason_detail": None,
+                        "attempts": attempts,
+                        "implementation_version": "asr-backend-v1",
+                        **provenance,
+                    },
+                }
+            attempts.append({"backend": "parakeet", "engine": engine, "outcome": "rejected"})
+            reason_code = _parakeet_reason_code(reason)
+            reason_detail = reason
             print(f"⚠️ [ASR] parakeet result rejected ({reason}) — "
-                  f"falling back to whisper")
+                  "falling back to whisper")
         except AcceleratorConfigurationError:
             raise
-        except Exception as e:
+        except Exception as error:
             if requested != "auto":
                 raise
-            print(f"⚠️ [ASR] parakeet failed ({type(e).__name__}: {e}) — "
-                  f"falling back to whisper")
+            attempts.append({"backend": "parakeet", "outcome": "failed"})
+            reason_code = "parakeet_failed"
+            reason_detail = f"{type(error).__name__}: {error}"
+            print(f"⚠️ [ASR] parakeet failed ({type(error).__name__}: {error}) — "
+                  "falling back to whisper")
 
-    return _transcribe_with_whisper(media_path)
+    requested_device = _whisper_device()
+    try:
+        transcript, execution = _transcribe_with_whisper_execution(media_path)
+    except Exception:
+        attempts.append({
+            "backend": "whisper",
+            "device": requested_device,
+            "outcome": "failed",
+        })
+        raise
+    final_device = _whisper_device(True) if execution.get("force_cpu") else _whisper_device()
+    if execution["engine"] == "faster-whisper" and requested_device != final_device:
+        attempts.append({
+            "backend": "whisper",
+            "device": requested_device,
+            "outcome": "cuda_failed",
+        })
+    return {
+        "outcome": "speech",
+        "transcript": transcript,
+        "provenance": _whisper_provenance(
+            backend, attempts, execution, reason_code, reason_detail,
+        ),
+    }
+
+
+def _transcribe_media(media_path):
+    """Legacy transcript-only private entry point used by existing callers/tests."""
+    result = transcribe_media_with_provenance(media_path)
+    if result["outcome"] == "no_audio":
+        raise NoAudioError(result["provenance"]["fallback_reason_detail"])
+    return result["transcript"]
+
 
 
 def transcribe_media(media_path):
-    """Transcribe and clean up through exactly one host-wide ASR slot."""
+    """Transcribe and release models through exactly one host-wide ASR slot."""
     with host_asr_slot():
         try:
             return _transcribe_media(media_path)
         finally:
             try:
                 release_models()
-            except Exception as e:
+            except Exception as error:
                 print(f"⚠️ [ASR] could not release models "
-                      f"({type(e).__name__}: {e})")
+                      f"({type(error).__name__}: {error})")
