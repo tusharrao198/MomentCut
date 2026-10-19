@@ -158,11 +158,36 @@ def test_resumed_job_keeps_its_safety_cap(dirs, monkeypatch):
     for name, cap in (("capped", 12), ("plain", None)):
         d = dirs / name
         d.mkdir()
-        (d / app_module._RESUME_FILE).write_text(json.dumps({
-            "cmd": ["python", "main.py"], "priority": 2, "user_id": None,
-            "reservation_id": f"res-{name}", "watermark": False, "attempts": 0,
+        (d / "source.mp4").write_bytes(b"source")
+        config = app_module.job_state.seal_job_config({
+            "schema_version": 1,
+            "job_id": name,
+            "configuration_revision": 1,
+            "project_dir": str(d),
+            "source": {"kind": "upload", "retained_relative_path": "source.mp4"},
+            "pipeline": {},
+            "environment": {} if cap is None else {"SOURCE_CAP_MINUTES": str(cap)},
+        })
+        app_module.job_state.write_job_config(str(d), config)
+        app_module.job_state.write_job_state(str(d), {
+            "schema_version": 1,
+            "job_id": name,
+            "configuration_revision": 1,
+            "execution_generation": 0,
+            "status": "processing",
+        })
+        app_module.job_state.write_resume_manifest(str(d), {
+            "schema_version": 1,
+            "job_id": name,
+            "configuration_revision": 1,
+            "priority": 2,
+            "user_id": None,
+            "reservation_id": f"res-{name}",
+            "watermark": False,
+            "attempts": 0,
             "source_cap_minutes": cap,
-        }))
+            "api_caller": False,
+        })
     monkeypatch.setenv("SOURCE_CAP_MINUTES", "3")  # a stale value must not leak in
     app_module._resume_interrupted_jobs()
     assert app_module.jobs["capped"]["env"]["SOURCE_CAP_MINUTES"] == "12"
@@ -177,23 +202,26 @@ def test_child_env_drops_server_secrets(monkeypatch):
                  "TELEGRAM_BOT_TOKEN", "AGENTLEDGER_API_KEY", "R2_SECRET_ACCESS_KEY",
                  "MANAGED_UPLOAD_POST_API_KEY", "GOOGLE_CLIENT_SECRET", "POSTIZ_API_KEY"):
         monkeypatch.setenv(name, "secret")
-    for name in ("YOUTUBE_COOKIES", "PROXY_URL", "STATIC_PROXY_URLS", "GEMINI_API_KEY",
+    for name in ("YOUTUBE_COOKIES", "PROXY_URL", "STATIC_PROXY_URLS",
                  "BGUTIL_SCRIPT_PATH", "FFMPEG_ENCODER", "WHISPER_MODEL"):
         monkeypatch.setenv(name, "keep")
     env = app_module.child_env()
     for name in app_module.CHILD_ENV_DENYLIST:
         assert name not in env
-    for name in ("YOUTUBE_COOKIES", "PROXY_URL", "STATIC_PROXY_URLS", "GEMINI_API_KEY",
+    for name in ("YOUTUBE_COOKIES", "PROXY_URL", "STATIC_PROXY_URLS",
                  "BGUTIL_SCRIPT_PATH", "FFMPEG_ENCODER", "WHISPER_MODEL"):
         assert env[name] == "keep"
 
 
-def test_pipeline_code_reads_none_of_the_dropped_secrets():
-    """If main.py (or anything it imports) ever needs one of these, the
-    denylist would silently break jobs: fail here instead."""
+def test_pipeline_code_reads_none_of_the_server_only_secrets():
+    """Pipeline credentials are deliberately reintroduced by the job boundary;
+    server-only credentials must never be read by main.py or its imports."""
     import ast
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     local = {f[:-3] for f in os.listdir(root) if f.endswith(".py")}
+    server_only = app_module.CHILD_ENV_DENYLIST - {
+        "GEMINI_API_KEY", "LLM_API_KEY",
+    }
     seen, stack = set(), ["main", "quality_probe"]
     while stack:
         mod = stack.pop()
@@ -201,7 +229,7 @@ def test_pipeline_code_reads_none_of_the_dropped_secrets():
             continue
         seen.add(mod)
         src = open(os.path.join(root, mod + ".py"), encoding="utf-8").read()
-        for name in app_module.CHILD_ENV_DENYLIST:
+        for name in server_only:
             assert f'"{name}"' not in src and f"'{name}'" not in src, (mod, name)
         for node in ast.walk(ast.parse(src)):
             names = []
@@ -209,10 +237,10 @@ def test_pipeline_code_reads_none_of_the_dropped_secrets():
                 names = [a.name.split(".")[0] for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module:
                 names = [node.module.split(".")[0]]
-            for n in names:
-                assert n != "cloud", f"{mod} imports cloud/, which reads server secrets"
-                if n in local:
-                    stack.append(n)
+            for name in names:
+                assert name != "cloud", f"{mod} imports cloud/, which reads server secrets"
+                if name in local:
+                    stack.append(name)
 
 
 def test_job_env_has_no_server_secrets(dirs, calls, monkeypatch):

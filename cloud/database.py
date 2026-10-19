@@ -22,6 +22,10 @@ _ADDITIVE_COLUMNS = (
     "CREATE INDEX IF NOT EXISTS ix_usage_job_id ON usage_ledger (job_id)",
     # cancellation_feedback shipped without it; rows before it are all cancels.
     "ALTER TABLE cancellation_feedback ADD COLUMN IF NOT EXISTS outcome VARCHAR(16)",
+    "ALTER TABLE proxy_usage ADD COLUMN IF NOT EXISTS event_id VARCHAR(64)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_proxy_usage_event_id "
+    "ON proxy_usage (event_id) WHERE event_id IS NOT NULL",
+    "ALTER TABLE autopilot_runs ADD COLUMN IF NOT EXISTS completion_plan JSONB",
 )
 
 

@@ -66,6 +66,19 @@ class TestRankClips:
     def test_zero(self):
         assert ap.rank_clips([{"predicted_score": 1}], 0) == []
 
+    def test_partial_results_keep_planned_clip_indices(self):
+        clips = [
+            {"video_url": "/videos/job/clip-0.mp4", "predicted_score": 50},
+            {"video_url": "/videos/job/clip-2.mp4", "predicted_score": 90},
+        ]
+        rows = ap.delivered_clip_rows(clips, [
+            {"clip_index": 0, "relative_path": "clip-0.mp4"},
+            {"clip_index": 2, "relative_path": "clip-2.mp4"},
+        ])
+        assert [row["clip_index"] for row in rows] == [0, 2]
+        ranked = ap.rank_clips([row["clip"] for row in rows], 1)
+        assert rows[ranked[0]]["clip_index"] == 2
+
 
 class TestScheduleSlots:
     def test_one_a_day_at_the_hour(self):

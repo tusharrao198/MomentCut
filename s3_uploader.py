@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 import boto3
+import hashlib
 from botocore.exceptions import ClientError
 import logging
 
@@ -427,20 +428,61 @@ def list_video_gallery(limit=50, force_refresh=False):
     return videos[:limit] if limit else videos
 
 
-def upload_job_artifacts(directory, job_id):
-    """
-    Upload all generated clips and metadata for a job to S3.
-    """
+def upload_job_artifacts(
+    directory,
+    job_id,
+    terminal_artifacts,
+    metadata_filename,
+):
+    """Upload only the terminal ledger's media plus stable metadata."""
     bucket_name = os.environ.get('AWS_S3_BUCKET', 'my-clips-bucket')
     
     if not os.path.exists(directory):
-        return
-
-    for filename in os.listdir(directory):
-        # Upload .mp4 clips and the metadata JSON
-        if (filename.endswith(".mp4") or filename.endswith(".json")) and not filename.startswith("temp_"):
-            file_path = os.path.join(directory, filename)
-            s3_key = f"{job_id}/{filename}"
-            upload_file_to_s3(file_path, bucket_name, s3_key)
+        return False
+    allowed = [(metadata_filename, None)]
+    for artifact in terminal_artifacts or []:
+        if isinstance(artifact, dict):
+            allowed.append((artifact.get("relative_path"), artifact))
+            allowed.extend(
+                (companion.get("relative_path"), companion)
+                for companion in artifact.get("companions", [])
+                if isinstance(companion, dict)
+            )
+    root = os.path.realpath(directory)
+    attempted = 0
+    uploaded = 0
+    unique_allowed = {}
+    for filename, descriptor in allowed:
+        if filename in unique_allowed:
+            if unique_allowed[filename] != descriptor:
+                return False
+            continue
+        unique_allowed[filename] = descriptor
+    for filename, descriptor in unique_allowed.items():
+        if not isinstance(filename, str) or not filename:
+            return False
+        if filename.startswith(".") or os.path.basename(filename) != filename:
+            return False
+        if filename != metadata_filename and not filename.endswith(".mp4"):
+            return False
+        file_path = os.path.realpath(os.path.join(root, filename))
+        if os.path.commonpath([root, file_path]) != root \
+                or not os.path.isfile(file_path):
+            return False
+        if descriptor is not None:
+            digest = hashlib.sha256()
+            with open(file_path, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if (
+                os.path.getsize(file_path) != descriptor.get("size")
+                or digest.hexdigest() != descriptor.get("sha256")
+            ):
+                return False
+        s3_key = f"{job_id}/{filename}"
+        attempted += 1
+        if upload_file_to_s3(file_path, bucket_name, s3_key):
+            uploaded += 1
+    return attempted == len(unique_allowed) and uploaded == attempted
 
 

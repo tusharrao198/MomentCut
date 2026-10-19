@@ -1,10 +1,18 @@
 import os
+from dotenv import load_dotenv
+
+# Provider modules read model/layout configuration during import. Load the
+# deployment environment first so the immutable job snapshot describes the
+# values the child will actually use.
+load_dotenv()
+
 import copy
 import accelerator_runtime
 import clip_packaging
 import clip_thumbnail_image
 import llm_backend
 import postiz_client
+import vision_backend
 import re
 import sys
 import uuid
@@ -25,9 +33,8 @@ import io
 import signal
 import socket
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
@@ -43,9 +50,24 @@ import layout_ranges
 import watermarked
 import media_auth
 import worker_failure
-from gemini_feature_flags import clip_ai_thumbnails_enabled
+import checkpoint_store
+import job_state
+from gemini_feature_flags import clip_ai_thumbnails_enabled, clip_analysis_enabled
 
-load_dotenv()
+PIPELINE_CHECKPOINTS_ENABLED = checkpoint_store.pipeline_checkpoints_enabled()
+
+
+class MissingTerminalCredentials(RuntimeError):
+    """A terminal action must wait rather than run with weaker credentials."""
+
+
+TERMINAL_ACTION_MAX_ATTEMPTS = max(
+    1, int(os.environ.get("TERMINAL_ACTION_MAX_ATTEMPTS", "3"))
+)
+TERMINAL_ACTION_RETRY_SECONDS = max(
+    5.0, float(os.environ.get("TERMINAL_ACTION_RETRY_SECONDS", "30"))
+)
+
 
 # Constants
 UPLOAD_DIR = "uploads"
@@ -101,6 +123,7 @@ CHILD_ENV_DENYLIST = frozenset({
     "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
     "OPENPANEL_CLIENT_SECRET", "ELEVENLABS_API_KEY",
+    "GEMINI_API_KEY", "LLM_API_KEY",
 })
 
 
@@ -111,6 +134,298 @@ def child_env(base=None):
     for name in CHILD_ENV_DENYLIST:
         env.pop(name, None)
     return env
+
+
+_JOB_ENV_ALLOWLIST = checkpoint_store.PIPELINE_ENV_NAMES
+
+
+def build_job_child_env(job_config: dict, runtime_secrets: dict) -> dict[str, str]:
+    """Rebuild a child's environment from immutable non-secret configuration."""
+    env = child_env()
+    for name in _JOB_ENV_ALLOWLIST:
+        value = (job_config.get("environment") or {}).get(name)
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = str(value)
+    # This is an operational kill switch, not immutable job configuration.
+    # A deployment can turn checkpointing off immediately, while turning it
+    # back on must not retroactively checkpoint jobs accepted with it disabled.
+    effective_checkpointing = (
+        PIPELINE_CHECKPOINTS_ENABLED
+        and bool(job_config.get("checkpointing_enabled"))
+    )
+    env["PIPELINE_CHECKPOINTS_ENABLED"] = (
+        "true" if effective_checkpointing else "false"
+    )
+    # Privacy-sensitive model enablement follows the same kill-switch rule:
+    # current deployment disablement wins, while a restart cannot turn Gemini
+    # analysis on for a job accepted with it disabled.
+    accepted_gemini_analysis = str(
+        (job_config.get("environment") or {}).get(
+            "GEMINI_CLIP_ANALYSIS_ENABLED", "1"
+        )
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    env["GEMINI_CLIP_ANALYSIS_ENABLED"] = (
+        "1" if accepted_gemini_analysis and clip_analysis_enabled() else "0"
+    )
+    for name, value in (runtime_secrets or {}).items():
+        if name not in {"GEMINI_API_KEY", "LLM_API_KEY", "YOUTUBE_COOKIES", "PROXY_URL"}:
+            raise ValueError(f"Unsupported runtime secret capability: {name}")
+        if value:
+            env[name] = str(value)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def _retained_source_is_usable(job_config: dict) -> bool:
+    """Validate retained bytes once a completed source checkpoint exists."""
+    project_dir = job_config["project_dir"]
+    source = job_config["source"]
+    retained = os.path.join(project_dir, source["retained_relative_path"])
+    if not os.path.isfile(retained):
+        return False
+    try:
+        if os.path.getsize(retained) <= 0:
+            return False
+    except OSError:
+        return False
+    source_checkpoint = os.path.join(
+        project_dir, ".checkpoints", "v1", "source.json",
+    )
+    if not os.path.exists(source_checkpoint):
+        # Uploaded files are fully staged before durable job state is created.
+        # URL downloads happen inside main.py and may leave a playable partial
+        # file if that process dies before the source checkpoint is committed.
+        # This safety decision is independent of the live checkpoint kill
+        # switch: turning reuse off must never make an unverified URL file more
+        # trustworthy.
+        return source.get("kind") != "url"
+    try:
+        store = checkpoint_store.CheckpointStore(
+            project_dir,
+            job_config,
+            # Validate a source checkpoint even when compute checkpoint reuse is
+            # currently disabled. The child can then safely reuse only the
+            # retained input bytes while recomputing every downstream stage.
+            enabled=True,
+            execution_generation=0,
+        )
+        return store.load_source(
+            checkpoint_store.expected_source_request_key(job_config)
+        ) is not None
+    except Exception:
+        return False
+
+
+def build_job_command(job_config: dict) -> list[str]:
+    """Reconstruct main.py invocation from validated structured job config."""
+    project_dir = job_config["project_dir"]
+    source = job_config["source"]
+    retained = os.path.join(project_dir, source["retained_relative_path"])
+    command = [sys.executable, "-u", "main.py"]
+    if _retained_source_is_usable(job_config):
+        command.extend(["-i", retained])
+    elif source.get("canonical_public_url"):
+        command.extend(["-u", source["canonical_public_url"], "--keep-original"])
+    else:
+        raise job_state.JobStateError(
+            "The retained source is unavailable and cannot be reacquired"
+        )
+    transcript = source.get("transcript_relative_path")
+    if transcript:
+        transcript_path = os.path.join(project_dir, transcript)
+        expected_hash = source.get("transcript_sha256")
+        transcript_usable = os.path.isfile(transcript_path) and not (
+            expected_hash
+            and checkpoint_store.sha256_file(transcript_path) != expected_hash
+        )
+        if transcript_usable:
+            command.extend(["--transcript", transcript_path])
+        elif _checkpointed_selection_route(job_config) not in {
+            "complete", "speech", "silent",
+        }:
+            raise job_state.JobStateError(
+                "The precomputed transcript is unavailable or changed"
+            )
+    command.extend([
+        "-o", project_dir,
+        "--project-dir", project_dir,
+        "--job-id", job_config["job_id"],
+        "--managed-job",
+        "--execution-generation",
+        str(job_config.get("_execution_generation", 0)),
+    ])
+    output_format = (job_config.get("pipeline") or {}).get("output_format")
+    if output_format and output_format != "auto":
+        command.extend(["--format", output_format])
+    return command
+
+
+def _resolved_job_config(
+    job_id: str,
+    project_dir: str,
+    source: dict,
+    env: dict,
+    output_format: str,
+    layouts: list,
+    *,
+    auto_hook,
+    auto_hook_style,
+    captions,
+    target_clips,
+    clip_min_seconds,
+    clip_max_seconds,
+    checkpointing_enabled: bool,
+) -> dict:
+    from transcribe_backends import checkpoint_asr_config
+
+    selected_env = {
+        name: env[name] for name in _JOB_ENV_ALLOWLIST if name in env
+    }
+    text_descriptor = (
+        llm_backend.resolved_descriptor()
+        if checkpointing_enabled else llm_backend.configured_descriptor()
+    ) \
+        if llm_backend.active() else {
+            "provider": "gemini",
+            "endpoint": None,
+            "requested_model": env.get("GEMINI_MODEL"),
+            "immutable_model_revision": None,
+            "immutable_revision_available": False,
+        }
+    if vision_backend.active():
+        try:
+            requested_max_seconds = float(
+                env.get("CLIP_MAX_SECONDS") or clip_max_seconds or 60
+            )
+        except (TypeError, ValueError):
+            requested_max_seconds = 60.0
+        descriptor_reader = (
+            vision_backend.resolved_descriptor
+            if checkpointing_enabled else vision_backend.configured_descriptor
+        )
+        raw_vision_descriptor = descriptor_reader(requested_max_seconds)
+        vision_descriptor = {
+            "provider": "ollama",
+            "endpoint": raw_vision_descriptor.get("endpoint"),
+            "model": raw_vision_descriptor.get("model"),
+            "immutable_model_revision": raw_vision_descriptor.get("digest"),
+            "immutable_revision_available": bool(
+                raw_vision_descriptor.get("immutable_revision_available")
+            ),
+        }
+    else:
+        vision_descriptor = {
+            "provider": "gemini",
+            "endpoint": None,
+            "model": env.get("GEMINI_MODEL"),
+            "immutable_model_revision": None,
+            "immutable_revision_available": False,
+        }
+    config = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "project_dir": os.path.abspath(project_dir),
+        "configuration_revision": 1,
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source": source,
+        "pipeline": {
+            "output_format": output_format,
+            "layouts": sorted(layouts or []),
+            "auto_hook": (
+                str(env.get("AUTO_HOOK", auto_hook or "0")).lower()
+                in ("1", "true", "yes")
+            ),
+            "auto_hook_style": env.get("AUTO_HOOK_STYLE") or auto_hook_style,
+            "auto_hook_seconds": env.get("AUTO_HOOK_SECONDS"),
+            "captions": str(
+                env.get(
+                    "AUTO_CAPTIONS",
+                    "1" if captions is None else captions,
+                )
+            ).lower() not in ("0", "false", "no"),
+            "watermark": env.get("WATERMARK") == "1",
+        },
+        "selection": {
+            "target_min": env.get("CLIP_TARGET_MIN") or target_clips,
+            "target_max": env.get("CLIP_TARGET_MAX") or target_clips,
+            "clip_min_seconds": env.get("CLIP_MIN_SECONDS") or clip_min_seconds,
+            "clip_max_seconds": env.get("CLIP_MAX_SECONDS") or clip_max_seconds,
+            "score_batch": env.get("LLM_SCORE_BATCH"),
+            "detail_fallback_windows": env.get("LLM_DETAIL_FALLBACK_WINDOWS"),
+            "implementation_version": "selection-v1",
+        },
+        "asr": checkpoint_asr_config(),
+        "scene_detection": {
+            "engine": env.get("SCENE_ENGINE", "transnetv2"),
+            "device": env.get("TRANSNETV2_DEVICE"),
+            "model_revision": env.get("TRANSNETV2_MODEL_REVISION"),
+            "threshold": env.get("TRANSNETV2_THRESHOLD"),
+            "minimum_seconds": env.get("SCENE_MIN_SEC"),
+        },
+        "text_selection": text_descriptor,
+        "vision_selection": {
+            **vision_descriptor,
+            "window_seconds": env.get("VISION_WINDOW_SECONDS"),
+            "overlap_seconds": env.get("VISION_WINDOW_OVERLAP_SECONDS"),
+            "frame_count": env.get("VISION_FRAMES_PER_WINDOW"),
+            "sample_width": env.get("VISION_MAX_FRAME_WIDTH"),
+            "context_size": env.get("VISION_NUM_CTX"),
+            "candidates_per_window": env.get("VISION_CANDIDATES_PER_WINDOW"),
+            "scene_snap_seconds": env.get("VISION_SCENE_SNAP_SECONDS"),
+        },
+        "render": {
+            "encoder": env.get("FFMPEG_ENCODER", "libx264"),
+            "gpu_cut": env.get("FFMPEG_GPU_CUT") == "1",
+            "audio_normalize": env.get("AUDIO_NORMALIZE") == "1",
+            "video_decode_backend": env.get("VIDEO_DECODE_BACKEND", "auto"),
+            "reframe_engine": env.get("REFRAME_ENGINE"),
+            "detect_stride": env.get("DETECT_STRIDE"),
+            "jump_confirm_frames": env.get("JUMP_CONFIRM_FRAMES", "3"),
+            "scene_cut_reset": env.get("SCENE_CUT_RESET", "1"),
+            "yolo_model_path": env.get("YOLO_MODEL_PATH", "yolov8n.pt"),
+            "clip_workers": env.get("CLIP_WORKERS", "6"),
+            "implementation_version": "render-v1",
+        },
+        "environment": selected_env,
+        "checkpointing_enabled": bool(checkpointing_enabled),
+        "credential_requirements": {
+            "gemini_speech": not llm_backend.active(),
+            "gemini_silent": not vision_backend.active(),
+            "llm_authentication": bool(
+                llm_backend.active()
+                and (env.get("LLM_API_KEY") or os.environ.get("LLM_API_KEY"))
+            ),
+            "source_authorization": bool(env.get("YOUTUBE_COOKIES")),
+        },
+    }
+    return job_state.seal_job_config(config)
+
+
+def _canonical_public_source_url(url: str | None) -> str | None:
+    """Persist only a non-secret public identity that can be reacquired."""
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.username or parts.password or parts.fragment:
+        return None
+    host = (parts.hostname or "").lower()
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        video_id = (parse_qs(parts.query).get("v") or [None])[0]
+        if video_id and re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
+            return f"https://www.youtube.com/watch?v={video_id}"
+    if host == "youtu.be":
+        video_id = parts.path.strip("/").split("/", 1)[0]
+        if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id or ""):
+            return f"https://www.youtube.com/watch?v={video_id}"
+    if not parts.query and parts.scheme in {"http", "https"} and host:
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme.lower()}://{host}{port}{parts.path}"
+    return None
 
 
 DISABLE_YOUTUBE_URL = os.environ.get("DISABLE_YOUTUBE_URL", "false").lower() in ("1", "true", "yes")
@@ -808,13 +1123,28 @@ def _clips_actually_rendered(job_id, output_dir, base_name, clips):
     # chain). Prefer it over rebuilding the name: the marker is what the file
     # IS, _canonical_clip_file is a guess from the naming convention.
     ready_files = (jobs.get(job_id) or {}).get('ready_files') or {}
+    checkpoint_aware = os.path.exists(
+        os.path.join(output_dir, ".job-config.json")
+    )
     kept = []
     for i, clip in enumerate(clips):
-        clip_filename = (ready_files.get(i)
-                         or _canonical_clip_file(output_dir, base_name, i))
-        clip_path = os.path.join(output_dir, clip_filename)
+        clip_filename = ready_files.get(i)
+        if not clip_filename and not checkpoint_aware:
+            clip_filename = _canonical_clip_file(output_dir, base_name, i)
+        if not clip_filename:
+            print(
+                f"⚠️  Clip {i + 1} of {job_id} has no completion marker "
+                "or validated checkpoint — dropping it from the result."
+            )
+            continue
+        clip_filename = os.path.basename(str(clip_filename))
+        clip_path = _safe_under(output_dir, clip_filename)
         try:
-            present = os.path.getsize(clip_path) > 0
+            present = (
+                bool(clip_path)
+                and os.path.getsize(clip_path) > 0
+                and _media_duration_seconds(clip_path) > 0
+            )
         except OSError:
             present = False
         if not present:
@@ -824,6 +1154,15 @@ def _clips_actually_rendered(job_id, output_dir, base_name, clips):
         clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
         kept.append(clip)
     return kept, len(clips) - len(kept)
+
+
+def _job_metadata_files(job_id, output_dir):
+    stable = os.path.join(output_dir, f"{job_id}_metadata.json")
+    if os.path.isfile(stable):
+        return [stable]
+    if os.path.exists(os.path.join(output_dir, ".job-config.json")):
+        return []
+    return glob.glob(os.path.join(output_dir, "*_metadata.json"))
 
 
 def _strip_watermark_copy(output_dir, filename):
@@ -1110,10 +1449,141 @@ def _recover_jobs_from_disk():
         job_path = os.path.join(OUTPUT_DIR, job_id)
         if not os.path.isdir(job_path) or job_id in jobs:
             continue
+        config_path = os.path.join(job_path, ".job-config.json")
+        state_path = os.path.join(job_path, ".job-state.json")
+        has_config = os.path.exists(config_path)
+        has_state = os.path.exists(state_path)
+        if has_config != has_state:
+            print(
+                f"⚠️ Refusing legacy recovery for incomplete durable job "
+                f"{job_id}: config/state pair is incomplete"
+            )
+            continue
+        state = None
+        if has_state:
+            try:
+                state = job_state.load_job_state(job_path)
+            except job_state.JobStateError as error:
+                print(
+                    f"⚠️ Refusing legacy recovery for corrupt durable job "
+                    f"{job_id}: {error}"
+                )
+                continue
+        if state and state.get("status") in {"completed", "partial", "failed"}:
+            try:
+                config = job_state.load_job_config(job_path)
+                if (
+                    state["job_id"] != job_id
+                    or config["job_id"] != job_id
+                    or state["configuration_revision"]
+                    != config["configuration_revision"]
+                ):
+                    raise job_state.StateFileInvalid("terminal job identity mismatch")
+                owner = state.get("owner_id")
+                owner_path = os.path.join(job_path, ".owner")
+                if os.path.exists(owner_path):
+                    with open(owner_path, encoding="utf-8") as source:
+                        projected_owner = source.read().strip() or None
+                    if str(projected_owner) != str(owner):
+                        raise job_state.StateFileInvalid(
+                            "authoritative owner and legacy projection differ"
+                        )
+                metadata_path = os.path.join(
+                    job_path, f"{job_id}_metadata.json",
+                )
+                metadata = job_state.read_json(metadata_path) or {}
+                planned = metadata.get("shorts") or []
+                clips = []
+                artifact_rows = []
+                for raw_index, descriptor in (
+                    state.get("terminal_artifacts") or {}
+                ).items():
+                    try:
+                        artifact_rows.append((int(raw_index), descriptor))
+                    except (TypeError, ValueError):
+                        continue
+                for index, descriptor in sorted(artifact_rows):
+                    relative = descriptor.get("relative_path")
+                    path = _safe_under(job_path, relative or "")
+                    if not path or not os.path.isfile(path):
+                        continue
+                    if os.path.getsize(path) != descriptor.get("size") \
+                            or checkpoint_store.sha256_file(path) != descriptor.get(
+                                "sha256"
+                            ) or _media_duration_seconds(path) <= 0:
+                        continue
+                    clip = dict(planned[index]) if index < len(planned) else {}
+                    clip["video_url"] = f"/videos/{job_id}/{relative}"
+                    clips.append(clip)
+                recovered_context = dict(
+                    state.get("terminal_action_context") or {}
+                )
+                jobs[job_id] = {
+                    **recovered_context,
+                    "status": state["status"],
+                    "logs": _TimedLog([
+                        "♻️ Job recovered from durable terminal state."
+                    ]),
+                    "output_dir": job_path,
+                    "user_id": owner,
+                    "result": {
+                        "clips": clips,
+                        "cost_analysis": metadata.get("cost_analysis"),
+                    },
+                    "missing_clip_indices": state.get(
+                        "missing_clip_indices", []
+                    ),
+                    "terminal_revision": state.get("terminal_revision"),
+                    "terminal_event_ids": {
+                        name: item.get("event_id")
+                        for name, item in (
+                            state.get("terminal_actions") or {}
+                        ).items()
+                    },
+                }
+                encrypted = None
+                try:
+                    encrypted = job_state.load_resume_secrets(
+                        job_path,
+                        job_id,
+                        config["configuration_revision"],
+                        "job-runtime",
+                        job_state.load_resume_secret_keyring(),
+                    )
+                except job_state.JobStateError as error:
+                    print(
+                        f"⚠️ Terminal credentials unavailable for {job_id}: "
+                        f"{error}"
+                    )
+                if encrypted:
+                    jobs[job_id]["webhook_secret"] = encrypted.get(
+                        "webhook_secret"
+                    )
+                recovered += 1
+                continue
+            except Exception as error:
+                print(f"⚠️ Could not recover terminal job {job_id}: {error}")
+                continue
+        if state is not None:
+            # A durable nonterminal job is either resumable through its
+            # manifest or intentionally paused. It must never fall through to
+            # permissive legacy metadata recovery.
+            if not os.path.isfile(os.path.join(job_path, _RESUME_FILE)):
+                print(
+                    f"⚠️ Durable nonterminal job {job_id} has no resume "
+                    "manifest; leaving it paused for explicit recovery"
+                )
+                continue
         if os.path.isfile(os.path.join(job_path, _RESUME_FILE)):
             continue  # in flight (interrupted or on the other instance): resume, not recover
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
+            continue
+        if len(json_files) != 1:
+            print(
+                f"⚠️ Refusing ambiguous legacy recovery for {job_id}: "
+                f"found {len(json_files)} metadata files"
+            )
             continue
         try:
             with open(json_files[0], 'r') as f:
@@ -1174,6 +1644,7 @@ HEARTBEAT_EVERY = 10                 # seconds between manifest heartbeats
 HEARTBEAT_STALE_AFTER = 60           # no heartbeat for this long = nobody has it
 RESUME_SCAN_INTERVAL = 30            # seconds between looks for stale manifests
 HANDOVER_CHECK_INTERVAL = 5          # seconds between looks at the marker
+LOG_DRAIN_TIMEOUT_SECONDS = 30
 DRAIN_TIMEOUT_SECONDS = int(os.environ.get("DRAIN_TIMEOUT_SECONDS", "840"))
 # After the jobs are drained, keep SERVING this long with /health/ready at 503
 # before closing the socket: the proxy only drops a container once its Docker
@@ -1203,26 +1674,39 @@ def _manifest_path(job_id):
 
 def _read_manifest(job_id):
     try:
-        with open(_manifest_path(job_id)) as f:
-            return json.load(f)
-    except FileNotFoundError:
+        return job_state.load_resume_manifest(
+            os.path.join(OUTPUT_DIR, job_id)
+        )
+    except job_state.StateFileMissing:
+        return None
+    except job_state.StateFileInvalid as e:
+        print(f"⚠️ Bad resume manifest for {job_id}: {e}")
         return None
     except Exception as e:
         print(f"⚠️ Bad resume manifest for {job_id}: {e}")
         return None
 
 
-def _touch_manifest(job_id, now=None):
+def _touch_manifest(job_id, now=None, *, strict=False):
     """Stamp 'this instance is running it, as of now' into the manifest."""
     m = _read_manifest(job_id)
     if m is None:
+        if strict:
+            raise job_state.StateFileInvalid(
+                f"Job {job_id} has no valid resume manifest"
+            )
         return
     m["heartbeat"] = now if now is not None else time.time()
     m["instance"] = INSTANCE_ID
     try:
-        with open(_manifest_path(job_id), "w") as f:
-            json.dump(m, f)
+        job_state.write_resume_manifest(
+            os.path.join(OUTPUT_DIR, job_id), m,
+        )
     except Exception as e:
+        if strict:
+            raise job_state.JobStateError(
+                f"Could not heartbeat manifest for {job_id}: {e}"
+            ) from e
         print(f"⚠️ Could not heartbeat manifest for {job_id}: {e}")
 
 
@@ -1547,33 +2031,28 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                            webhook_url=None, webhook_secret=None, base_url=None,
                            partial=None, source_cap_minutes=None, skip_statics=False,
                            via_api_key=False):
-    try:
-        path = os.path.join(OUTPUT_DIR, job_id, _RESUME_FILE)
-        with open(path, "w") as f:
-            json.dump({
-                "cmd": cmd, "priority": priority,
-                "user_id": None if user_id is None else str(user_id),
-                "reservation_id": reservation_id,
-                "watermark": bool(watermark), "attempts": 0,
-                # The caller's webhook must survive a redeploy: a pipeline that
-                # relies on the callback would otherwise hang forever on a job
-                # that resumed fine. The secret is the caller's own HMAC value,
-                # stored next to their video on the same disk — not a server
-                # credential (those are rebuilt from os.environ on resume).
-                "webhook_url": webhook_url,
-                "webhook_secret": webhook_secret,
-                "base_url": base_url,
-                # A resumed job downloads the source again, so the cut must
-                # travel with it: only these minutes were reserved.
-                "partial": partial,
-                # Same reason for the whole-video jobs' safety cap.
-                "source_cap_minutes": source_cap_minutes,
-                # The probe's "statics bot-checked for this video" verdict.
-                "skip_statics": bool(skip_statics),
-                "via_api_key": bool(via_api_key),
-            }, f)
-    except Exception as e:
-        print(f"⚠️ Could not write resume manifest for {job_id}: {e}")
+    project_dir = os.path.join(OUTPUT_DIR, job_id)
+    config = job_state.load_job_config(project_dir)
+    manifest = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "configuration_revision": config["configuration_revision"],
+        "priority": priority,
+        "user_id": None if user_id is None else str(user_id),
+        "reservation_id": reservation_id,
+        "watermark": bool(watermark),
+        "attempts": 0,
+        "webhook_url": webhook_url,
+        "resume_secret_purpose": "job-runtime" if webhook_secret else None,
+        "base_url": base_url,
+        "partial": partial,
+        "source_cap_minutes": source_cap_minutes,
+        "skip_statics": bool(skip_statics),
+        "api_caller": bool(via_api_key),
+        "heartbeat": None,
+        "instance": None,
+    }
+    job_state.write_resume_manifest(project_dir, manifest)
 
 
 def _clear_resume_manifest(job_id):
@@ -1585,6 +2064,39 @@ def _clear_resume_manifest(job_id):
         pass
     except Exception as e:
         print(f"⚠️ Could not clear resume manifest for {job_id}: {e}")
+
+
+def _checkpointed_selection_route(config: dict) -> str | None:
+    return checkpoint_store.completed_selection_boundary(
+        config,
+        current_enablement=PIPELINE_CHECKPOINTS_ENABLED,
+    )
+
+
+def _selection_credentials_missing(
+    requirements: dict,
+    runtime_secrets: dict,
+    checkpointed_route: str | None,
+) -> bool:
+    """Fail closed when an interrupted job may still need a provider secret."""
+    if checkpointed_route == "complete":
+        return False
+    route_unknown = checkpointed_route is None
+    speech_possible = route_unknown or checkpointed_route == "speech"
+    silent_possible = route_unknown or checkpointed_route == "silent"
+    gemini_needed = bool(
+        requirements.get("gemini")
+        or (speech_possible and requirements.get("gemini_speech"))
+        or (silent_possible and requirements.get("gemini_silent"))
+    )
+    llm_key_needed = bool(
+        speech_possible and requirements.get("llm_authentication")
+    )
+    return (
+        gemini_needed and not runtime_secrets.get("GEMINI_API_KEY")
+    ) or (
+        llm_key_needed and not runtime_secrets.get("LLM_API_KEY")
+    )
 
 
 def _resume_interrupted_jobs() -> set:
@@ -1617,11 +2129,8 @@ def _resume_interrupted_jobs() -> set:
         # A manifest outlives only an interrupted run (the job wrapper drops it
         # at every terminal state), so a metadata file next to it means the job
         # was stopped mid-render, not that it finished: resume it too.
-        try:
-            with open(manifest_path) as f:
-                m = json.load(f)
-        except Exception as e:
-            print(f"⚠️ Bad resume manifest for {job_id}: {e}")
+        m = _read_manifest(job_id)
+        if m is None:
             continue
 
         if m.get("reservation_id"):
@@ -1643,59 +2152,116 @@ def _resume_interrupted_jobs() -> set:
                 keep_reservations.discard(str(reservation_id))  # let the sweep refund it
             continue
 
-        # Rebuild env from scratch — the manifest holds no secrets. Managed
-        # (cloud) jobs get the server key; self-host falls back to its env key.
-        env = child_env()
+        try:
+            config = job_state.load_job_config(job_path)
+            state = job_state.load_job_state(job_path)
+        except job_state.JobStateError as error:
+            print(f"⚠️ Cannot resume {job_id}: {error}")
+            continue
+        if (
+            config.get("job_id") != job_id
+            or state.get("job_id") != job_id
+            or config.get("configuration_revision")
+            != state.get("configuration_revision")
+            or config.get("configuration_revision")
+            != m.get("configuration_revision")
+        ):
+            print(f"⚠️ Cannot resume {job_id}: durable identity/revision mismatch")
+            continue
+        try:
+            probe_lease = job_state.JobLease.acquire(job_path, job_id)
+        except job_state.JobLeaseBusy:
+            continue
+        else:
+            probe_lease.release()
+
+        runtime_secrets = {}
         try:
             from cloud import proxy_ledger as _pl
-            if BILLING_ENABLED and _pl.budget_exceeded_sync():
-                env.pop("PROXY_URL", None)  # daily paid-proxy budget hit
+            paid_proxy_blocked = BILLING_ENABLED and _pl.budget_exceeded_sync()
         except Exception:
-            pass
+            paid_proxy_blocked = False
         if BILLING_ENABLED and user_id is not None:
             try:
-                env["GEMINI_API_KEY"] = managed_keys.gemini_key()
+                runtime_secrets["GEMINI_API_KEY"] = managed_keys.gemini_key()
             except Exception:
                 pass
-        if m.get("watermark"):
-            env["WATERMARK"] = "1"
-        else:
-            env.pop("WATERMARK", None)
+        try:
+            keyring = job_state.load_resume_secret_keyring()
+            encrypted = job_state.load_resume_secrets(
+                job_path,
+                job_id,
+                config["configuration_revision"],
+                "job-runtime",
+                keyring,
+            ) or {}
+            runtime_secrets.update({
+                key: value for key, value in encrypted.items()
+                if key in {
+                    "GEMINI_API_KEY", "LLM_API_KEY",
+                    "YOUTUBE_COOKIES", "PROXY_URL",
+                }
+            })
+        except job_state.JobStateError:
+            encrypted = {}
+        credential_requirements = config.get("credential_requirements") or {}
+        checkpointed_route = _checkpointed_selection_route(config)
+        credentials_missing = _selection_credentials_missing(
+            credential_requirements,
+            runtime_secrets,
+            checkpointed_route,
+        )
+        retained_source_available = _retained_source_is_usable(config)
+        source_authorization_missing = (
+            credential_requirements.get("source_authorization")
+            and not retained_source_available
+            and not runtime_secrets.get("YOUTUBE_COOKIES")
+        )
+        if credentials_missing or source_authorization_missing:
+            state = dict(state)
+            state["status"] = "waiting_for_credentials"
+            job_state.write_job_state(job_path, state)
+            continue
+        env = build_job_child_env(config, runtime_secrets)
+        if paid_proxy_blocked:
+            env.pop("PROXY_URL", None)
         partial = m.get("partial")
-        if partial and partial.get("processed_minutes"):
-            env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
-        else:
-            env.pop("MAX_SOURCE_MINUTES", None)
-        if m.get("source_cap_minutes"):
-            env["SOURCE_CAP_MINUTES"] = str(m["source_cap_minutes"])
-        else:
-            env.pop("SOURCE_CAP_MINUTES", None)
-        if m.get("skip_statics"):
-            env["DOWNLOAD_SKIP_STATICS"] = "1"
-        else:
-            env.pop("DOWNLOAD_SKIP_STATICS", None)
 
+        runtime_config = dict(config)
+        runtime_config["_execution_generation"] = state["execution_generation"]
+        try:
+            cmd = build_job_command(runtime_config)
+        except job_state.JobStateError:
+            state = dict(state)
+            state["status"] = "waiting_for_source"
+            job_state.write_job_state(job_path, state)
+            continue
+        # Consume the bounded resume budget only after credentials and source
+        # preflight have succeeded. A paused job must not age out merely
+        # because the recovery scanner revisits it every few seconds.
         m["attempts"] = attempts
         try:
-            with open(manifest_path, "w") as f:
-                json.dump(m, f)
+            job_state.write_resume_manifest(job_path, m)
         except Exception:
-            pass
+            print(f"⚠️ Cannot resume {job_id}: failed to persist attempt count")
+            continue
 
         jobs[job_id] = {
             'status': 'queued',
             'logs': _TimedLog([f"♻️ Resuming your video after a server update (attempt {attempts})."]),
-            'cmd': m.get("cmd"),
+            'cmd': cmd,
             'env': env,
+            'job_config': config,
+            'runtime_secrets': runtime_secrets,
             'output_dir': job_path,
             'user_id': None if user_id is None else user_id,
             'reservation_id': reservation_id,
             'watermark': bool(m.get("watermark")),
             'partial': partial or None,
             'webhook_url': m.get("webhook_url"),
-            'webhook_secret': m.get("webhook_secret"),
+            'webhook_secret': encrypted.get("webhook_secret"),
             'base_url': m.get("base_url"),
-            'via_api_key': bool(m.get("via_api_key")),
+            'via_api_key': bool(m.get("api_caller")),
         }
         _enqueue_job(job_id, int(m.get("priority", 2)))
         resumed += 1
@@ -1768,6 +2334,18 @@ def _job_is_active(job_id, now=None) -> bool:
         return True
     if (jobs.get(job_id) or {}).get('status') in ('queued', 'processing'):
         return True
+    project = os.path.join(OUTPUT_DIR, job_id)
+    if os.path.isfile(os.path.join(project, ".job-state.json")):
+        try:
+            probe = job_state.JobLease.acquire(project, job_id)
+        except job_state.JobLeaseBusy:
+            return True
+        except job_state.JobStateError:
+            # An invalid lease target is not evidence of a live worker; the
+            # retention code still applies its normal age checks.
+            pass
+        else:
+            probe.release()
     try:
         age = (time.time() if now is None else now) - os.path.getmtime(_manifest_path(job_id))
     except OSError:
@@ -2031,14 +2609,28 @@ def _job_source_url(job) -> Optional[str]:
 
 async def _track_proxy_usage(job_id):
     job = jobs.get(job_id) or {}
+    newly_recorded = True
     # Durable trail + Telegram page whenever the per-GB proxy carried bytes
     # (cloud mode only: self-host has no DB and pays nobody per GB).
     if BILLING_ENABLED and job.get('proxy_route'):
         try:
             from cloud import proxy_ledger as _pl
-            await _pl.record_download(job_id, job.get('proxy_route'), _job_source_url(job))
+            newly_recorded = await _pl.record_download(
+                job_id,
+                job.get('proxy_route'),
+                _job_source_url(job),
+                event_id=(job.get("terminal_event_ids") or {}).get(
+                    "proxy_usage"
+                ),
+            )
         except Exception as e:
-            print(f"⚠️ proxy ledger failed for {job_id}: {e}")
+            raise RuntimeError(
+                f"proxy ledger failed for {job_id}: {e}"
+            ) from e
+        if newly_recorded is None:
+            raise RuntimeError(f"proxy ledger persistence failed for {job_id}")
+    if not newly_recorded:
+        return
     nbytes = job.get('proxy_bytes') or 0
     if not nbytes:
         return
@@ -2059,6 +2651,467 @@ async def _track_proxy_usage(job_id):
             print(f"⚠️ Proxy alert failed: {e}")
 
 
+def claim_job_execution(job_id: str, job: dict) -> tuple[job_state.JobLease, int]:
+    """Acquire the project lease, allocate a generation, and rebuild runtime."""
+    project_dir = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    lease = job_state.JobLease.acquire(project_dir, job_id)
+    try:
+        config_path = os.path.join(project_dir, ".job-config.json")
+        state_path = os.path.join(project_dir, ".job-state.json")
+        has_config = os.path.exists(config_path)
+        has_state = os.path.exists(state_path)
+        if has_config != has_state:
+            raise job_state.StateFileInvalid(
+                "Durable job config/state pair is incomplete"
+            )
+        try:
+            state = job_state.load_job_state(project_dir)
+            config = job_state.load_job_config(project_dir)
+        except job_state.StateFileMissing:
+            if has_config or has_state:
+                raise
+            # Legacy resumable jobs predate durable generation state. They
+            # still receive exclusive ownership, but retain their old command.
+            generation = 0
+        else:
+            if (
+                state["job_id"] != job_id
+                or config["job_id"] != job_id
+                or state["configuration_revision"]
+                != config["configuration_revision"]
+            ):
+                raise job_state.JobStateError("Job state identity mismatch")
+            state = dict(state)
+            state["execution_generation"] += 1
+            state["status"] = "processing"
+            # The marker is an app/main handoff for one process attempt. The
+            # durable clip-plan checkpoint remains reusable, but a marker from
+            # the previous generation must not be projected into the new one.
+            state.pop("live_plan", None)
+            state["started_at"] = datetime.now(
+                timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+            job_state.write_job_state(project_dir, state)
+            generation = state["execution_generation"]
+            runtime_config = dict(config)
+            runtime_config["_execution_generation"] = generation
+            job["job_config"] = config
+            try:
+                job["cmd"] = build_job_command(runtime_config)
+            except job_state.JobStateError:
+                if not job.get("ephemeral_source_authorization"):
+                    raise
+                command = list(job.get("cmd") or [])
+                marker = command.index("--execution-generation")
+                command[marker + 1] = str(generation)
+                job["cmd"] = command
+            job["env"] = build_job_child_env(
+                config, job.get("runtime_secrets") or {},
+            )
+        _touch_manifest(job_id, strict=True)
+        job["execution_generation"] = generation
+        return lease, generation
+    except Exception:
+        lease.release()
+        raise
+
+
+def _terminal_companion_names(filename: str) -> list[str]:
+    """Return the bounded, editor-relevant derivation chain for a clip."""
+    primary = os.path.basename(str(filename or ""))
+    names = []
+    current = watermarked.clean_name(primary)
+    if current != primary:
+        names.append(current)
+    # Captions and hooks are derived MP4s. Archive their validated ancestors
+    # too so a restored project can remove/restyle a layer without scanning the
+    # working directory or trusting filename guesses at archive time.
+    for _ in range(3):
+        match = re.fullmatch(
+            r"(?:subtitled_\d+_|hooked_\d+_|hook_)(.+\.mp4)",
+            current,
+        )
+        if not match:
+            break
+        current = os.path.basename(match.group(1))
+        if current != primary and current not in names:
+            names.append(current)
+    return names
+
+
+def _terminal_artifact_ledger(job_id: str, job: dict) -> dict:
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    ledger = {}
+    ready_files = dict(job.get("ready_files") or {})
+    if not ready_files:
+        # Legacy jobs do not carry planned-index markers. Their result order is
+        # the only available identity and retains the pre-checkpoint behavior.
+        ready_files = {
+            index: os.path.basename(
+                str(clip.get("video_url") or "").rsplit("/", 1)[-1]
+            )
+            for index, clip in enumerate(
+                (job.get("result") or {}).get("clips") or []
+            )
+        }
+    for raw_index, filename in ready_files.items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        filename = os.path.basename(str(filename or ""))
+        path = _safe_under(project, filename)
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            duration = _media_duration_seconds(path)
+            if duration <= 0:
+                continue
+            companions = []
+            for companion_name in _terminal_companion_names(filename):
+                if companion_name == filename:
+                    continue
+                companion_path = _safe_under(project, companion_name)
+                if not companion_path or not os.path.isfile(companion_path):
+                    continue
+                companion_duration = _media_duration_seconds(companion_path)
+                if companion_duration <= 0:
+                    continue
+                companions.append({
+                    "relative_path": companion_name,
+                    "size": os.path.getsize(companion_path),
+                    "sha256": checkpoint_store.sha256_file(companion_path),
+                    "duration_ms": int(round(companion_duration * 1000)),
+                    "probe": {"playable": True},
+                })
+            ledger[str(index)] = {
+                "clip_index": index,
+                "relative_path": filename,
+                "size": os.path.getsize(path),
+                "sha256": checkpoint_store.sha256_file(path),
+                "duration_ms": int(round(duration * 1000)),
+                "probe": {"playable": duration > 0},
+                "clip_plan_identity": (
+                    (job.get("live_plan") or {}).get("plan_hash")
+                ),
+                "companions": companions,
+            }
+        except OSError:
+            continue
+    return ledger
+
+
+def _validated_live_plan(job_id: str, job: dict) -> dict | None:
+    """Validate the stable metadata handoff before committing terminal state."""
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.exists(os.path.join(project, ".job-config.json")):
+        return None
+    state = job_state.load_job_state(project)
+    live_plan = dict(job.get("live_plan") or state.get("live_plan") or {})
+    expected_generation = int(job.get("execution_generation") or 0)
+    expected_name = f"{job_id}_metadata.json"
+    if (
+        live_plan.get("execution_generation") != expected_generation
+        or live_plan.get("metadata_filename") != expected_name
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(live_plan.get("plan_hash") or "")
+        )
+        or not isinstance(live_plan.get("count"), int)
+        or live_plan["count"] <= 0
+    ):
+        raise job_state.StateFileInvalid(
+            "Stable clip-plan handoff is missing or belongs to another execution"
+        )
+    metadata = job_state.read_required_json(
+        os.path.join(project, expected_name),
+        lambda value: (
+            value.get("job_id") == job_id
+            and value.get("execution_generation") == expected_generation
+            and value.get("planned_clip_count") == live_plan["count"]
+            and isinstance(value.get("shorts"), list)
+            and len(value["shorts"]) == live_plan["count"]
+            and value.get("plan_hash") == live_plan["plan_hash"]
+        ),
+    )
+    calculated = checkpoint_store.sha256_bytes(
+        checkpoint_store.canonical_json_bytes(metadata["shorts"])
+    )
+    if calculated != live_plan["plan_hash"]:
+        raise job_state.StateFileInvalid("Stable clip-plan metadata hash changed")
+    return live_plan
+
+
+def _commit_job_terminal_state(job_id: str, job: dict) -> dict | None:
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.exists(os.path.join(project, ".job-state.json")):
+        return None
+    status = job.get("status")
+    if status not in {"completed", "partial", "failed"}:
+        status = "failed"
+        job["status"] = status
+    if status in {"completed", "partial"}:
+        live_plan = _validated_live_plan(job_id, job)
+        if live_plan is not None:
+            # Recovery may have loaded the handoff only from durable state. Keep
+            # the in-memory job aligned before deriving artifact identities.
+            job["live_plan"] = live_plan
+        terminal_artifacts = _terminal_artifact_ledger(job_id, job)
+        expected_count = live_plan["count"] if live_plan is not None else len(
+            (job.get("result") or {}).get("clips") or []
+        )
+        if not terminal_artifacts:
+            raise job_state.StateFileInvalid(
+                "No validated rendered artifacts are available for terminal commit"
+            )
+        if status == "completed" and len(terminal_artifacts) != expected_count:
+            raise job_state.StateFileInvalid(
+                "Completed job is missing one or more validated rendered artifacts"
+            )
+        artifact_indices = {int(index) for index in terminal_artifacts}
+        if any(index < 0 or index >= expected_count for index in artifact_indices):
+            raise job_state.StateFileInvalid(
+                "Rendered artifact index is outside the committed clip plan"
+            )
+        derived_missing = sorted(set(range(expected_count)) - artifact_indices)
+        if status == "partial" and not derived_missing:
+            status = "completed"
+            job["status"] = status
+        job["missing_clip_indices"] = derived_missing
+    else:
+        terminal_artifacts = {}
+    self_host_s3 = bool(
+        os.environ.get("AWS_ACCESS_KEY_ID")
+        and os.environ.get("AWS_SECRET_ACCESS_KEY")
+        and os.environ.get("AWS_S3_BUCKET")
+    )
+    actions = {
+        "reservation": bool(BILLING_ENABLED and job.get("reservation_id")),
+        "archive": bool(
+            (job.get("result") or {}).get("clips")
+            and (BILLING_ENABLED or self_host_s3)
+        ),
+        # Autopilot identifies its run by job_id in the database; ordinary
+        # managed jobs safely no-op. Persist the action for all managed jobs
+        # so a restart cannot skip an Autopilot completion.
+        "autopilot_finalize": bool(BILLING_ENABLED),
+        "autopilot_email": False,
+        "autopilot_publish": False,
+        "webhook": bool(job.get("webhook_url")),
+        "alert": bool(BILLING_ENABLED and job.get("user_id")),
+        "proxy_usage": bool(job.get("proxy_route") or job.get("proxy_bytes")),
+        "clips_ready_email": bool(BILLING_ENABLED and job.get("user_id")),
+        "clip_activity": bool(BILLING_ENABLED and job.get("user_id")),
+    }
+    committed = job_state.commit_terminal_state(
+        project,
+        int(job.get("execution_generation") or 0),
+        status,
+        terminal_artifacts,
+        list(job.get("missing_clip_indices") or []),
+        {
+            "actions": actions,
+            "reservation_id": (
+                None if job.get("reservation_id") is None
+                else str(job.get("reservation_id"))
+            ),
+            "user_id": (
+                None if job.get("user_id") is None
+                else str(job.get("user_id"))
+            ),
+            "webhook_url": job.get("webhook_url"),
+            "webhook_secret_required": bool(job.get("webhook_secret")),
+            "base_url": job.get("base_url"),
+            "api_caller": bool(job.get("via_api_key")),
+            "watermark": bool(job.get("watermark")),
+            "user_plan": job.get("user_plan"),
+            "proxy_route": job.get("proxy_route"),
+            "proxy_bytes": job.get("proxy_bytes"),
+            "autopilot_run_id": (
+                None if job.get("autopilot_run_id") is None
+                else str(job.get("autopilot_run_id"))
+            ),
+        },
+    )
+    job["terminal_revision"] = committed["terminal_revision"]
+    job["terminal_event_ids"] = {
+        name: record["event_id"]
+        for name, record in committed["terminal_actions"].items()
+    }
+    return committed
+
+
+async def _run_terminal_effect(job_id, action, callback, *, ambiguous=False):
+    job = jobs.get(job_id) or {}
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    try:
+        state = job_state.load_job_state(project)
+        record = (state.get("terminal_actions") or {}).get(action) or {}
+    except job_state.StateFileMissing:
+        # Legacy jobs have no durable outbox and retain their old behavior.
+        await callback()
+        return
+    except job_state.JobStateError:
+        # A present-but-invalid durable state must never bypass idempotency.
+        raise
+    current = record.get("state")
+    if current in {"done", "not_required", "permanent_failure", "manual_review"}:
+        return
+    attempts_before = int(record.get("attempts") or 0)
+    if current in {"pending", "running"} \
+            and attempts_before >= TERMINAL_ACTION_MAX_ATTEMPTS:
+        job_state.transition_terminal_action(
+            project, action, current, "permanent_failure",
+            {"last_error_code": "retry_budget_exhausted"},
+        )
+        return
+    if ambiguous and current == "dispatching":
+        job_state.transition_terminal_action(
+            project, action, "dispatching", "manual_review",
+            {"last_error_code": "ambiguous_after_restart"},
+        )
+        return
+    if current == "dispatching":
+        job_state.transition_terminal_action(
+            project, action, "dispatching", "manual_review",
+            {"last_error_code": "unexpected_dispatching_state"},
+        )
+        return
+    dispatch_state = "dispatching" if ambiguous else "running"
+    if current in {"pending", "running"}:
+        state = job_state.transition_terminal_action(
+            project, action, current, dispatch_state,
+        )
+    try:
+        await callback()
+    except MissingTerminalCredentials as error:
+        job_state.transition_terminal_action(
+            project, action, dispatch_state, "pending",
+            {
+                "last_error_code": "waiting_for_credentials",
+                # Waiting for a key is not a failed provider attempt and must
+                # not consume the bounded delivery retry budget.
+                "attempts": attempts_before,
+            },
+        )
+        print(f"⚠️ Terminal action {action} is waiting for credentials: {error}")
+        return
+    except Exception as error:
+        attempts = int(
+            ((state.get("terminal_actions") or {}).get(action) or {}).get(
+                "attempts", 0
+            )
+        )
+        final_state = (
+            "manual_review"
+            if ambiguous
+            else (
+                "permanent_failure"
+                if attempts >= TERMINAL_ACTION_MAX_ATTEMPTS
+                else "pending"
+            )
+        )
+        job_state.transition_terminal_action(
+            project, action, dispatch_state, final_state,
+            {"last_error_code": type(error).__name__},
+        )
+        raise
+    job_state.transition_terminal_action(
+        project, action, dispatch_state, "done",
+    )
+
+
+async def run_terminal_actions(job_id: str, *, held_lease=None) -> None:
+    """Run the durable terminal outbox without occupying a compute slot."""
+    job = jobs.get(job_id)
+    if not job:
+        return
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    lease = held_lease
+    if lease is None:
+        try:
+            lease = job_state.JobLease.acquire(project, job_id)
+        except job_state.JobLeaseBusy:
+            return
+    try:
+        effects = (
+            ("reservation", lambda: _settle_reservation(job_id, job), False),
+            ("archive", lambda: _archive_managed_job(job_id), False),
+            (
+                "autopilot_finalize",
+                lambda: _autopilot_finalize_and_prepare(job_id, job),
+                False,
+            ),
+            (
+                "autopilot_email",
+                lambda: _send_autopilot_completion_email(job_id),
+                True,
+            ),
+            ("autopilot_publish", None, False),
+            ("webhook", lambda: _notify_job_webhook(job_id), False),
+            ("alert", lambda: _record_job_alert(job_id), True),
+            ("proxy_usage", lambda: _track_proxy_usage(job_id), False),
+            (
+                "clips_ready_email",
+                lambda: _notify_clips_ready(job_id),
+                True,
+            ),
+            (
+                "clip_activity",
+                lambda: _notify_clip_activity(job_id),
+                True,
+            ),
+        )
+        for action, callback, ambiguous in effects:
+            try:
+                if action == "autopilot_publish":
+                    await _run_autopilot_publish_items(job_id)
+                else:
+                    await _run_terminal_effect(
+                        job_id, action, callback, ambiguous=ambiguous,
+                    )
+            except Exception as error:
+                # Every transition is already durable. Continue independent
+                # actions and leave the failed record visible for operations.
+                print(
+                    f"⚠️ Terminal action {action} failed for {job_id}: {error}"
+                )
+    finally:
+        if held_lease is None and lease is not None:
+            lease.release()
+
+
+async def recover_pending_terminal_actions() -> None:
+    """Resume outboxes discovered by durable terminal-state recovery."""
+    for job_id, job in tuple(jobs.items()):
+        if job.get("status") not in {"completed", "partial", "failed"}:
+            continue
+        project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+        try:
+            state = job_state.load_job_state(project)
+        except job_state.JobStateError:
+            continue
+        if any(
+            record.get("state") in {"pending", "running", "dispatching"}
+            for record in (state.get("terminal_actions") or {}).values()
+        ):
+            await run_terminal_actions(job_id)
+
+
+async def terminal_action_retry_loop() -> None:
+    """Continuously recover durable side effects without delaying API startup."""
+    while True:
+        try:
+            await recover_pending_terminal_actions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(
+                "⚠️ Terminal-action recovery scan failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        await asyncio.sleep(TERMINAL_ACTION_RETRY_SECONDS)
+
+
 async def run_job_wrapper(job_id):
     """Wrapper to run job and release semaphore"""
     # Keep the record itself: run_job writes its status into this same dict,
@@ -2067,11 +3120,20 @@ async def run_job_wrapper(job_id):
     job = jobs.get(job_id)
     interrupted = False
     started = time.monotonic()
+    execution_lease = None
+    ownership_unavailable = False
+    execution_claimed = False
     try:
         if job:
+            execution_lease, _generation = claim_job_execution(job_id, job)
+            execution_claimed = True
+            _running_jobs.add(job_id)
             await run_job(job_id, job)
             if job.get('status') == 'completed':
                 _record_job_duration(time.monotonic() - started)
+    except job_state.JobLeaseBusy as e:
+        ownership_unavailable = True
+        print(f"⏳ Job ownership is held elsewhere for {job_id}: {e}")
     except asyncio.CancelledError:
         # The server is shutting down (drain timeout of a deploy) and took this
         # task with it. Not a failure: the manifest stays on disk and the next
@@ -2081,8 +3143,17 @@ async def run_job_wrapper(job_id):
     except Exception as e:
          print(f"❌ Job wrapper error {job_id}: {e}")
     finally:
+        if ownership_unavailable or (job is not None and not execution_claimed):
+            _running_jobs.discard(job_id)
+            if jobs.get(job_id) is job:
+                jobs.pop(job_id, None)
+            concurrency_semaphore.release()
+            job_queue.task_done()
+            return
         if interrupted or (_stopping and job and job.get('status') != 'completed'):
             _running_jobs.discard(job_id)
+            if execution_lease is not None:
+                execution_lease.release()
             concurrency_semaphore.release()
             job_queue.task_done()
             print(f"♻️ Server stopping: leaving {job_id} for the next instance.")
@@ -2092,37 +3163,40 @@ async def run_job_wrapper(job_id):
         if _should_auto_retry(job):
             _schedule_auto_retry(job_id, job)
             _running_jobs.discard(job_id)
+            if execution_lease is not None:
+                execution_lease.release()
             concurrency_semaphore.release()
             job_queue.task_done()
             print(f"🔁 Released slot for job {job_id} (auto-retry scheduled).")
             return
-        # The subprocess returned (success or genuine failure) — a terminal
-        # state, so drop the resume manifest. It only survives if the container
-        # was killed mid-run, which is exactly when we want to resume.
+        try:
+            _commit_job_terminal_state(job_id, job)
+        except Exception as error:
+            # Without the atomic terminal decision+outbox, this is still a
+            # resumable compute job. Keep its manifest for another process and
+            # release local resources; never run a side effect from memory only.
+            print(
+                f"⚠️ Could not durably commit terminal state for {job_id}: "
+                f"{type(error).__name__}: {error}"
+            )
+            _running_jobs.discard(job_id)
+            concurrency_semaphore.release()
+            job_queue.task_done()
+            if execution_lease is not None:
+                execution_lease.release()
+            return
         _clear_resume_manifest(job_id)
-        # Settle the minute reservation (managed jobs only): commit on success,
-        # release otherwise so the minutes go back to the user.
-        await _settle_reservation(job_id, job)
-        # Archive the completed clips to the user's durable R2 library (history).
-        await _archive_managed_job(job_id)
-        # Autopilot bookkeeping + autopublish (before the generic clips-ready
-        # email, which it replaces for its own jobs).
-        await _autopilot_job_finished(job_id, job)
-        # Fire the caller's webhook (after archive, so durable links exist).
-        await _notify_job_webhook(job_id)
-        # Operational alerting for managed jobs (proxy out of credits / failures).
-        await _record_job_alert(job_id)
-        # Accumulate proxy bandwidth for the monthly cost alert.
-        await _track_proxy_usage(job_id)
-        # Tell the owner their clips are ready (managed jobs, once per job).
-        await _notify_clips_ready(job_id)
-        # Telegram pulse for high-signal activity (first clip / paid user).
-        await _notify_clip_activity(job_id)
-        # Always release semaphore and mark queue task done
+        # Compute is finished once the terminal decision and outbox are
+        # durable. Network effects run without occupying a GPU queue slot.
         _running_jobs.discard(job_id)
         concurrency_semaphore.release()
         job_queue.task_done()
-        print(f"✅ Released slot for job: {job_id}")
+        try:
+            await run_terminal_actions(job_id, held_lease=execution_lease)
+        finally:
+            print(f"✅ Released slot for job: {job_id}")
+            if execution_lease is not None:
+                execution_lease.release()
 
 
 # --- Automatic retry of transient failures ----------------------------------
@@ -2137,6 +3211,7 @@ _TRANSIENT_MARKERS = (
     "out of memory", "outofmemory", "cuda", "cublas", "cudnn", "nvenc",
     "generic error in an external library", "exit code 187", "broken pipe",
     "no clips could be rendered", "resource_exhausted", "resource exhausted",
+    "missing planned clips",
     "503", "502", "500 internal", "overloaded", "deadline exceeded",
     "exit code -9", "exit code -15", "killed",
 )
@@ -2198,15 +3273,59 @@ def _read_worker_failure(job, identity):
     return worker_failure.read_record(job['output_dir'], identity)
 
 
-def _clean_for_retry(output_dir):
-    """Drop the half-made outputs of a failed run; keep the source, the
-    transcript checkpoint (the retry skips transcription), owner and manifest."""
+def _clean_for_retry(job_id, job):
+    """Remove incomplete outputs while preserving compatible render artifacts."""
+    output_dir = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    preserved = {
+        ".job-config.json", ".job-state.json", ".resume.json",
+        ".resume-secrets.enc", ".run.lock", ".owner",
+        f"{job_id}_metadata.json",
+    }
+    try:
+        config = job_state.load_job_config(output_dir)
+        store = checkpoint_store.CheckpointStore.open_existing_project(
+            output_dir,
+            current_enablement=PIPELINE_CHECKPOINTS_ENABLED,
+        )
+        plan = store.load_current_clip_plan(
+            lambda route: checkpoint_store.expected_clip_plan_key(
+                config, store.source_identity, route,
+            )
+        )
+        if plan is not None:
+            for envelope in store.valid_render_artifacts(plan).values():
+                artifact = (envelope.get("payload") or {}).get("artifact") or {}
+                relative = artifact.get("relative_path")
+                if isinstance(relative, str):
+                    preserved.add(os.path.basename(relative))
+        retained = (config.get("source") or {}).get("retained_relative_path")
+        if retained:
+            preserved.add(os.path.basename(retained))
+    except Exception:
+        # Legacy/disabled jobs keep their source and hidden state. Their
+        # unvalidated generated files retain the old cleanup policy.
+        for name in os.listdir(output_dir) if os.path.isdir(output_dir) else []:
+            if name.startswith(".") or name.startswith("source"):
+                preserved.add(name)
+            elif (
+                name.lower().endswith(".mp4")
+                and "_clip_" not in name
+                and not name.startswith(
+                    ("temp_", "hooked_", "autosubs_", "clip-")
+                )
+            ):
+                # Before stable source.<ext> ownership, uploads lived under
+                # their display name in the project. Preserve only files that
+                # cannot be legacy/generated clip outputs.
+                preserved.add(name)
     try:
         names = os.listdir(output_dir)
     except OSError:
         return
     for name in names:
-        if ("_clip_" in name or name.endswith("_metadata.json")
+        if name in preserved or name == ".checkpoints":
+            continue
+        if (name.endswith(".mp4") or name.endswith("_metadata.json")
                 or name.startswith(("temp_", "hooked_", "autosubs_"))):
             try:
                 os.remove(os.path.join(output_dir, name))
@@ -2221,7 +3340,16 @@ def _schedule_auto_retry(job_id, job):
     job['ready_files'] = {}
     job['logs'].append("🔁 A temporary server problem interrupted your video. "
                        "Retrying it automatically, no minutes are charged twice.")
-    _clean_for_retry(job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id))
+    _clean_for_retry(job_id, job)
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    try:
+        state = job_state.load_job_state(project)
+        state = dict(state)
+        state["status"] = "queued"
+        state["retry_count"] = job["auto_retries"]
+        job_state.write_job_state(project, state)
+    except job_state.JobStateError:
+        pass
     m = _read_manifest(job_id) or {}
     priority = int(m.get("priority", 1))
     print(f"🔁 Auto-retry {job['auto_retries']}/{AUTO_RETRY_LIMIT} for {job_id} "
@@ -2236,18 +3364,69 @@ def _schedule_auto_retry(job_id, job):
 
 
 async def _archive_managed_job(job_id):
-    if not BILLING_ENABLED:
-        return
     job = jobs.get(job_id) or {}
-    if not job.get('user_id') or job.get('status') != 'completed':
+    if job.get('status') not in ('completed', 'partial'):
         return
     clips = (job.get('result') or {}).get('clips') or []
     if not clips:
+        raise RuntimeError(
+            "terminal archive has no recovered clip metadata"
+        )
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    state = job_state.load_job_state(project)
+    terminal = state.get("terminal_artifacts") or {}
+    if not isinstance(terminal, dict) or not terminal:
+        raise RuntimeError("terminal artifact ledger is missing")
+    terminal_artifacts = []
+    seen_paths = set()
+    for raw_index, descriptor in sorted(
+        terminal.items(), key=lambda item: int(item[0])
+    ):
+        if not isinstance(descriptor, dict) \
+                or descriptor.get("clip_index") != int(raw_index):
+            raise RuntimeError("terminal artifact ledger index is invalid")
+        verified = dict(descriptor)
+        for artifact in [verified, *list(verified.get("companions") or [])]:
+            relative = artifact.get("relative_path") \
+                if isinstance(artifact, dict) else None
+            path = _safe_under(project, relative or "")
+            if (
+                not path
+                or relative in seen_paths
+                or not os.path.isfile(path)
+                or os.path.getsize(path) != artifact.get("size")
+                or checkpoint_store.sha256_file(path) != artifact.get("sha256")
+                or _media_duration_seconds(path) <= 0
+            ):
+                raise RuntimeError(
+                    "terminal archive artifact no longer matches its ledger"
+                )
+            seen_paths.add(relative)
+        terminal_artifacts.append(verified)
+    if not BILLING_ENABLED:
+        uploaded = await asyncio.to_thread(
+            upload_job_artifacts,
+            job["output_dir"],
+            job_id,
+            terminal_artifacts,
+            f"{job_id}_metadata.json",
+        )
+        if not uploaded:
+            raise RuntimeError("self-host S3 archive did not complete")
         return
-    try:
-        await cloud.videos.archive_job(job['user_id'], job_id, clips, job['output_dir'])
-    except Exception as e:
-        print(f"⚠️  R2 archive error for {job_id}: {e}")
+    if not job.get('user_id'):
+        return
+    archived = await cloud.videos.archive_job(
+        job['user_id'],
+        job_id,
+        clips,
+        job['output_dir'],
+        terminal_artifacts=terminal_artifacts,
+        metadata_filename=f"{job_id}_metadata.json",
+        missing_clip_indices=job.get("missing_clip_indices") or [],
+    )
+    if archived is not True:
+        raise RuntimeError("managed R2 archive did not complete")
 
 
 def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
@@ -2271,16 +3450,212 @@ def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
     asyncio.create_task(_run())
 
 
-async def _autopilot_job_finished(job_id, job):
+async def _autopilot_finalize_and_prepare(job_id, job):
     if not BILLING_ENABLED or not job or not job.get('user_id'):
         return
-    try:
-        reason = None
-        if job.get('status') != 'completed':
-            reason = _alerts._classify_failure(_job_error_text(job.get('logs', [])))
-        await cloud.autopilot.on_job_finished(job_id, job, reason)
-    except Exception as e:
-        print(f"⚠️  Autopilot completion error for {job_id}: {e}")
+    reason = None
+    if job.get('status') not in ('completed', 'partial'):
+        reason = _alerts._classify_failure(_job_error_text(job.get('logs', [])))
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    state = job_state.load_job_state(project)
+    actions = state.get("terminal_actions") or {}
+    terminal_artifacts = [
+        descriptor
+        for descriptor in (state.get("terminal_artifacts") or {}).values()
+        if isinstance(descriptor, dict)
+    ]
+    plan = await cloud.autopilot.finalize_job(
+        job_id,
+        job,
+        terminal_artifacts,
+        email_event_id=(
+            (actions.get("autopilot_email") or {}).get("event_id")
+        ),
+        publish_event_id=(
+            (actions.get("autopilot_publish") or {}).get("event_id")
+        ),
+        failure_reason=reason,
+    )
+    job_state.configure_autopilot_actions(project, plan)
+    if plan.get("is_autopilot"):
+        # Its dedicated email action replaces the ordinary clips-ready email.
+        job["email_sent"] = True
+
+
+async def _send_autopilot_completion_email(job_id):
+    project = (jobs.get(job_id) or {}).get("output_dir") \
+        or os.path.join(OUTPUT_DIR, job_id)
+    state = job_state.load_job_state(project)
+    record = (state.get("terminal_actions") or {}).get(
+        "autopilot_email"
+    ) or {}
+    await cloud.autopilot.send_completion_email({
+        "email": record.get("plan"),
+    })
+
+
+async def _run_autopilot_publish_items(job_id):
+    if not BILLING_ENABLED:
+        return
+    job = jobs.get(job_id) or {}
+    project = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    state = job_state.load_job_state(project)
+    parent = (state.get("terminal_actions") or {}).get(
+        "autopilot_publish"
+    ) or {}
+    if parent.get("state") == "not_required":
+        return
+    for item in list(parent.get("items") or []):
+        item_id = item.get("item_id")
+        current = item.get("state")
+        if current in {"done", "not_required", "permanent_failure", "manual_review"}:
+            continue
+        if current in {"pending", "running"} and int(
+            item.get("attempts") or 0
+        ) >= TERMINAL_ACTION_MAX_ATTEMPTS:
+            job_state.transition_terminal_action_item(
+                project,
+                "autopilot_publish",
+                item_id,
+                current,
+                "permanent_failure",
+                {"last_error_code": "retry_budget_exhausted"},
+            )
+            continue
+        if current == "dispatching":
+            job_state.transition_terminal_action_item(
+                project,
+                "autopilot_publish",
+                item_id,
+                "dispatching",
+                "manual_review",
+                {"last_error_code": "ambiguous_after_restart"},
+            )
+            continue
+        media_path = _safe_under(project, item.get("relative_path") or "")
+        if not media_path or not os.path.isfile(media_path):
+            state = job_state.transition_terminal_action_item(
+                project,
+                "autopilot_publish",
+                item_id,
+                current,
+                "running",
+            )
+            latest = next(
+                entry for entry in (
+                    (state.get("terminal_actions") or {})
+                    .get("autopilot_publish", {})
+                    .get("items", [])
+                )
+                if entry.get("item_id") == item_id
+            )
+            attempts = int(latest.get("attempts") or 0)
+            job_state.transition_terminal_action_item(
+                project,
+                "autopilot_publish",
+                item_id,
+                "running",
+                (
+                    "permanent_failure"
+                    if attempts >= TERMINAL_ACTION_MAX_ATTEMPTS
+                    else "pending"
+                ),
+                {"last_error_code": "media_artifact_unavailable"},
+            )
+            continue
+        state = job_state.transition_terminal_action_item(
+            project,
+            "autopilot_publish",
+            item_id,
+            current,
+            "dispatching",
+        )
+        latest = next(
+            entry for entry in (
+                (state.get("terminal_actions") or {})
+                .get("autopilot_publish", {})
+                .get("items", [])
+            )
+            if entry.get("item_id") == item_id
+        )
+        try:
+            accepted = await cloud.autopilot.publish_one(
+                latest, project,
+            )
+        except Exception as error:
+            job_state.transition_terminal_action_item(
+                project,
+                "autopilot_publish",
+                item_id,
+                "dispatching",
+                "manual_review",
+                {"last_error_code": type(error).__name__},
+            )
+            continue
+        if accepted:
+            job_state.transition_terminal_action_item(
+                project,
+                "autopilot_publish",
+                item_id,
+                "dispatching",
+                "done",
+            )
+        else:
+            attempts = int(latest.get("attempts") or 0)
+            job_state.transition_terminal_action_item(
+                project,
+                "autopilot_publish",
+                item_id,
+                "dispatching",
+                (
+                    "permanent_failure"
+                    if attempts >= TERMINAL_ACTION_MAX_ATTEMPTS
+                    else "pending"
+                ),
+                {"last_error_code": "provider_rejected"},
+            )
+    state = job_state.load_job_state(project)
+    items = (
+        (state.get("terminal_actions") or {})
+        .get("autopilot_publish", {})
+        .get("items", [])
+    )
+    run_id = next(
+        (item.get("run_id") for item in items if item.get("run_id")),
+        None,
+    )
+    if run_id:
+        try:
+            await cloud.autopilot.record_publish_progress(
+                run_id,
+                sum(1 for item in items if item.get("state") == "done"),
+            )
+        except Exception:
+            latest_parent = (
+                job_state.load_job_state(project)
+                .get("terminal_actions", {})
+                .get("autopilot_publish", {})
+            )
+            if latest_parent.get("state") == "done":
+                job_state.transition_terminal_action(
+                    project,
+                    "autopilot_publish",
+                    "done",
+                    "pending",
+                    {"last_error_code": "publish_progress_persistence"},
+                )
+            raise
+        latest_parent = (
+            job_state.load_job_state(project)
+            .get("terminal_actions", {})
+            .get("autopilot_publish", {})
+        )
+        if latest_parent.get("state") == "pending" and all(
+            item.get("state") in {"done", "not_required"} for item in items
+        ):
+            job_state.transition_terminal_action(
+                project, "autopilot_publish", "pending", "done",
+            )
 
 
 async def _notify_clips_ready(job_id):
@@ -2291,14 +3666,13 @@ async def _notify_clips_ready(job_id):
     if not BILLING_ENABLED:
         return
     job = jobs.get(job_id) or {}
-    if not job.get('user_id') or job.get('status') != 'completed' or job.get('email_sent'):
+    if not job.get('user_id') or job.get('status') not in ('completed', 'partial') or job.get('email_sent'):
         return
     if job.get('via_api_key'):
         return
     clips = (job.get('result') or {}).get('clips') or []
     if not clips:
         return
-    job['email_sent'] = True
     try:
         from cloud.database import session as cloud_session
         from cloud.models import User
@@ -2313,8 +3687,10 @@ async def _notify_clips_ready(job_id):
         # which is the wrong page for someone clicking "View my clips".
         await send_clips_ready_email(user.email, title, len(clips),
                                      f"{_cloud_config.settings.frontend_url}/#app")
+        job['email_sent'] = True
     except Exception as e:
         print(f"⚠️  Clips-ready email error for {job_id}: {e}")
+        raise
 
 
 async def _notify_clip_activity(job_id):
@@ -2325,7 +3701,7 @@ async def _notify_clip_activity(job_id):
     if not BILLING_ENABLED:
         return
     job = jobs.get(job_id) or {}
-    if not job.get('user_id') or job.get('status') != 'completed':
+    if not job.get('user_id') or job.get('status') not in ('completed', 'partial'):
         return
     clips = (job.get('result') or {}).get('clips') or []
     if not clips:
@@ -2347,6 +3723,7 @@ async def _notify_clip_activity(job_id):
             f"🎬 Clips created\n{user.email} ({sub.plan}) — “{title}” ({n} clip{'s' if n != 1 else ''})")
     except Exception as e:
         print(f"⚠️  Clip-activity notify error for {job_id}: {e}")
+        raise
 
 
 # Markers that identify a line as an actual error rather than progress noise.
@@ -2394,13 +3771,17 @@ async def _record_job_alert(job_id):
     job = jobs.get(job_id) or {}
     if not job.get('user_id'):
         return  # only track managed jobs
-    ok = job.get('status') == 'completed'
+    ok = job.get('status') in ('completed', 'partial')
     err = "" if ok else _job_error_text(job.get('logs', []))
+    alert_error = None
     try:
         await _alerts.record_job_outcome(ok, err)
     except Exception as e:
         print(f"⚠️  Alert recording error for {job_id}: {e}")
+        alert_error = e
     await _track_job_outcome(job, ok, err)
+    if alert_error is not None:
+        raise alert_error
 
 
 async def _track_job_outcome(job, ok, err):
@@ -2490,8 +3871,10 @@ async def _webhook_clip_entries(job_id, job):
     return entries
 
 
-async def _deliver_webhook(url, body: bytes, secret):
+async def _deliver_webhook(url, body: bytes, secret, event_id=None):
     headers = {"Content-Type": "application/json", "User-Agent": "OpenShorts-Webhook/1.0"}
+    if event_id:
+        headers["X-OpenShorts-Event-ID"] = event_id
     if secret:
         headers["X-OpenShorts-Signature"] = _sign_webhook(body, secret)
     from security_utils import assert_public_url, UnsafeURLError
@@ -2507,14 +3890,15 @@ async def _deliver_webhook(url, body: bytes, secret):
                 resp = await client.post(url, content=body, headers=headers)
             if resp.status_code < 300:
                 print(f"🪝 Webhook delivered to {url} (attempt {attempt})")
-                return
+                return True
             print(f"⚠️ Webhook attempt {attempt} to {url}: HTTP {resp.status_code}")
         except UnsafeURLError as e:
             print(f"🛑 Webhook URL no longer safe, dropping: {e}")
-            return
+            return False
         except Exception as e:
             print(f"⚠️ Webhook attempt {attempt} to {url} failed: {e}")
     print(f"❌ Webhook to {url} gave up after {len(WEBHOOK_RETRY_DELAYS)} attempts.")
+    return False
 
 
 async def _notify_job_webhook(job_id):
@@ -2523,20 +3907,37 @@ async def _notify_job_webhook(job_id):
     (with its retry sleeps) is detached so the worker slot frees immediately."""
     job = jobs.get(job_id) or {}
     url = job.get('webhook_url')
-    if not url or job.get('webhook_sent'):
+    if not url:
         return
-    job['webhook_sent'] = True
-    completed = job.get('status') == 'completed'
+    if job.get("webhook_secret_required") and not job.get("webhook_secret"):
+        raise MissingTerminalCredentials(
+            "the webhook signing key could not be decrypted"
+        )
+    completed = job.get('status') in ('completed', 'partial')
+    event_id = (job.get("terminal_event_ids") or {}).get("webhook")
+    event_name = (
+        "job.partial" if job.get("status") == "partial"
+        else "job.completed" if completed else "job.failed"
+    )
     payload = {
-        "event": "job.completed" if completed else "job.failed",
+        "event": event_name,
+        "event_id": event_id,
         "job_id": job_id,
         "status": job.get('status'),
         "clips": (await _webhook_clip_entries(job_id, job)) if completed else [],
     }
+    if job.get("status") == "partial":
+        payload["missing_clip_indices"] = list(
+            job.get("missing_clip_indices") or []
+        )
     if not completed:
         payload["error"] = _job_error_text(job.get('logs', []))[-500:]
     body = json.dumps(payload).encode()
-    asyncio.create_task(_deliver_webhook(url, body, job.get('webhook_secret')))
+    delivered = await _deliver_webhook(
+        url, body, job.get('webhook_secret'), event_id,
+    )
+    if not delivered:
+        raise RuntimeError("webhook delivery did not succeed")
 
 
 async def _settle_reservation(job_id, job=None):
@@ -2546,13 +3947,10 @@ async def _settle_reservation(job_id, job=None):
     reservation_id = job.get('reservation_id')
     if not reservation_id:
         return
-    try:
-        if job.get('status') == 'completed':
-            await cloud.metering.commit_reservation(reservation_id)
-        else:
-            await cloud.metering.release_reservation(reservation_id)
-    except Exception as e:
-        print(f"⚠️  Reservation settle error for {job_id}: {e}")
+    if job.get('status') in ('completed', 'partial'):
+        await cloud.metering.commit_reservation(reservation_id)
+    else:
+        await cloud.metering.release_reservation(reservation_id)
 
 def _owned_by(record, uid: str) -> bool:
     owner = record.get('user_id') if isinstance(record, dict) else None
@@ -2685,7 +4083,15 @@ async def lifespan(app: FastAPI):
         # a single job-failure alert is easy to miss and ingest stays broken
         # until someone tops the balance up.
         asyncio.create_task(_alerts.proxy_watch_loop())
-    yield
+    terminal_action_task = asyncio.create_task(terminal_action_retry_loop())
+    try:
+        yield
+    finally:
+        terminal_action_task.cancel()
+        try:
+            await terminal_action_task
+        except asyncio.CancelledError:
+            pass
     # Cleanup (optional: cancel worker)
 
 app = FastAPI(lifespan=lifespan)
@@ -2839,6 +4245,31 @@ def enqueue_output(out, job_id):
                 # Internal marker: a clip finished its whole chain and this is
                 # the file to serve for it. Consumed here like PROXY_BYTES so it
                 # never reaches the user's log.
+                if decoded_line.startswith("CLIP_PLAN_READY "):
+                    try:
+                        _, generation, filename, plan_hash, count = (
+                            decoded_line.split(" ", 4)
+                        )
+                        live_plan = {
+                            "execution_generation": int(generation),
+                            "metadata_filename": filename,
+                            "plan_hash": plan_hash,
+                            "count": int(count),
+                        }
+                        if job_id in jobs:
+                            jobs[job_id]["live_plan"] = live_plan
+                            project = jobs[job_id].get("output_dir")
+                            if project and os.path.exists(
+                                os.path.join(project, ".job-state.json")
+                            ):
+                                state = job_state.load_job_state(project)
+                                if state["execution_generation"] == int(generation):
+                                    state = dict(state)
+                                    state["live_plan"] = live_plan
+                                    job_state.write_job_state(project, state)
+                    except (ValueError, job_state.JobStateError):
+                        pass
+                    continue
                 if decoded_line.startswith("CLIP_READY "):
                     try:
                         _, index, filename = decoded_line.split(" ", 2)
@@ -2943,7 +4374,7 @@ async def run_job(job_id, job_data):
             # Check for partial results every 2 seconds
             # Look for metadata file
             try:
-                json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+                json_files = _job_metadata_files(job_id, output_dir)
                 if json_files:
                     target_json = json_files[0]
                     # Read metadata (it might be being written to, so simple try/except or just read)
@@ -2981,6 +4412,10 @@ async def run_job(job_id, job_data):
                 # Ignore read errors during processing
                 pass
 
+        await asyncio.to_thread(t_log.join, LOG_DRAIN_TIMEOUT_SECONDS)
+        if t_log.is_alive():
+            raise RuntimeError("pipeline output reader did not drain")
+
         returncode = process.returncode
         worker_record = _read_worker_failure(job_data, failure_identity)
         if worker_record is not None:
@@ -3000,18 +4435,12 @@ async def run_job(job_id, job_data):
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
             
-            # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
-            # (see _archive_managed_job), so skip the redundant/paid AWS upload.
-            if not BILLING_ENABLED:
-                loop = asyncio.get_event_loop()
-                loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
-            
             # Find result JSON
-            json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+            json_files = _job_metadata_files(job_id, output_dir)
             if not json_files:
                 # Backward-compat rescue if outputs were written to OUTPUT_DIR root
                 if _relocate_root_job_artifacts(job_id, output_dir):
-                    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+                    json_files = _job_metadata_files(job_id, output_dir)
             if json_files:
                 target_json = json_files[0] 
                 with open(target_json, 'r') as f:
@@ -3034,6 +4463,19 @@ async def run_job(job_id, job_data):
                     if missing:
                         jobs[job_id]['logs'].append(
                             f"⚠️ {missing} of {len(clips)} clips failed to render.")
+                        if int(job_data.get("auto_retries", 0)) < AUTO_RETRY_LIMIT:
+                            jobs[job_id]["status"] = "failed"
+                            jobs[job_id]["logs"].append(
+                                "Missing planned clips after render."
+                            )
+                        else:
+                            jobs[job_id]["status"] = "partial"
+                            jobs[job_id]["missing_clip_indices"] = [
+                                index for index in range(len(clips))
+                                if index not in (
+                                    jobs[job_id].get("ready_files") or {}
+                                )
+                            ]
                     jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
             else:
                  jobs[job_id]['status'] = 'failed'
@@ -3579,7 +5021,8 @@ async def process_endpoint(
         if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
             shutil.rmtree(job_output_dir, ignore_errors=True)
             _reject_short_source(src_duration)
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{os.path.basename(src)}")
+        extension = os.path.splitext(src)[1].lower() or ".mp4"
+        input_path = os.path.join(job_output_dir, f"source{extension}")
         try:
             os.link(src, input_path)
         except OSError:
@@ -3589,8 +5032,9 @@ async def process_endpoint(
         # forwarding: main.py would reject it and retranscribe anyway.
         if thumb_session.get("transcript_ready") and (thumb_session.get("transcript") or {}).get("segments"):
             transcript_path = os.path.join(job_output_dir, "source_transcript.json")
-            with open(transcript_path, "w") as f:
-                json.dump(thumb_session["transcript"], f)
+            job_state.atomic_write_json(
+                transcript_path, thumb_session["transcript"],
+            )
             cmd.extend(["--transcript", transcript_path])
     elif upload_slot:
         # Move the pre-uploaded file under the job's name so it is cleaned up
@@ -3600,7 +5044,8 @@ async def process_endpoint(
         if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
             shutil.rmtree(job_output_dir, ignore_errors=True)
             _reject_short_source(src_duration)
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{upload_slot['filename']}")
+        extension = os.path.splitext(upload_slot["filename"])[1].lower() or ".mp4"
+        input_path = os.path.join(job_output_dir, f"source{extension}")
         os.replace(src, input_path)
         pending_uploads.pop(upload_id, None)
         cmd.extend(["-i", input_path])
@@ -3609,7 +5054,8 @@ async def process_endpoint(
         # basename() strips any path components from the client-supplied
         # filename so a name like "../../main.py" can't escape UPLOAD_DIR.
         safe_name = os.path.basename(file.filename or "upload") or "upload"
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{safe_name}")
+        extension = os.path.splitext(safe_name)[1].lower() or ".mp4"
+        input_path = os.path.join(job_output_dir, f"source{extension}")
 
         # Read file in chunks to check size
         size = 0
@@ -3689,12 +5135,135 @@ async def process_endpoint(
     # caller connected to.
     api_base = os.environ.get("PUBLIC_API_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
 
+    retained_relative_path = (
+        os.path.basename(input_path) if input_path else "source.mp4"
+    )
+    source_config = {
+        "kind": (
+            "url" if url else "thumbnail_session" if thumb_session
+            else "upload_slot" if upload_slot else "upload"
+        ),
+        "original_name": (
+            None if url else os.path.basename(
+                (thumb_session or {}).get("video_path")
+                or (upload_slot or {}).get("filename")
+                or getattr(file, "filename", "")
+                or "upload"
+            )
+        ),
+        "retained_relative_path": retained_relative_path,
+        "canonical_public_url": _canonical_public_source_url(url),
+        "input_url_hash": hashlib.sha256(url.encode("utf-8")).hexdigest()
+        if url else None,
+        "max_source_minutes": (
+            (partial or {}).get("processed_minutes") if partial else None
+        ),
+        "source_cap_minutes": source_cap,
+        "download_skip_statics": skip_statics,
+        "downloader_policy": "yt-dlp-v1",
+        "transcript_relative_path": (
+            os.path.relpath(transcript_path, job_output_dir)
+            if "transcript_path" in locals() else None
+        ),
+        "transcript_sha256": (
+            checkpoint_store.sha256_file(transcript_path)
+            if "transcript_path" in locals() else None
+        ),
+    }
+    durable_config = _resolved_job_config(
+        job_id,
+        job_output_dir,
+        source_config,
+        env,
+        output_format,
+        layouts,
+        auto_hook=auto_hook,
+        auto_hook_style=auto_hook_style,
+        captions=captions,
+        target_clips=n_clips,
+        clip_min_seconds=min_secs,
+        clip_max_seconds=max_secs,
+        checkpointing_enabled=PIPELINE_CHECKPOINTS_ENABLED,
+    )
+    durable_state = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "configuration_revision": 1,
+        "execution_generation": 0,
+        "status": "accepted",
+        "owner_id": None if user_id is None else str(user_id),
+        "accepted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "retry_count": 0,
+    }
+    runtime_secrets = {}
+    if api_key:
+        runtime_secrets["GEMINI_API_KEY"] = api_key
+    for secret_name in ("LLM_API_KEY", "YOUTUBE_COOKIES", "PROXY_URL"):
+        secret_value = env.get(secret_name)
+        if secret_name == "LLM_API_KEY" and not secret_value:
+            secret_value = os.environ.get(secret_name)
+        if secret_value:
+            runtime_secrets[secret_name] = secret_value
+    encrypted_secrets = dict(runtime_secrets)
+    if webhook_secret:
+        encrypted_secrets["webhook_secret"] = webhook_secret
+    try:
+        job_state.write_job_config(job_output_dir, durable_config)
+        job_state.write_job_state(job_output_dir, durable_state)
+        if user_id is not None:
+            job_state.atomic_write_bytes(
+                os.path.join(job_output_dir, ".owner"),
+                str(user_id).encode("utf-8"),
+            )
+        if encrypted_secrets:
+            resume_keyring = job_state.load_resume_secret_keyring()
+            if resume_keyring.get("active_key_id"):
+                job_state.write_resume_secrets(
+                    job_output_dir,
+                    job_id,
+                    1,
+                    "job-runtime",
+                    encrypted_secrets,
+                    resume_keyring,
+                )
+            else:
+                # The live attempt may safely use request credentials from
+                # memory. If it is interrupted, recovery will pause instead of
+                # substituting an ambient key or silently dropping auth.
+                print(
+                    f"⚠️ Job {job_id} has request-scoped credentials but no "
+                    "resume-secret keyring; restart recovery may require the "
+                    "credentials again."
+                )
+        runtime_config = dict(durable_config)
+        runtime_config["_execution_generation"] = 0
+        if url and not source_config["canonical_public_url"]:
+            # The initial process may use a signed/request-scoped URL in
+            # memory. It is intentionally absent from durable state; a crash
+            # before source retention enters waiting_for_source.
+            cmd.extend([
+                "--project-dir", job_output_dir,
+                "--job-id", job_id,
+                "--managed-job",
+                "--execution-generation", "0",
+            ])
+        else:
+            cmd = build_job_command(runtime_config)
+    except Exception:
+        await _drop_unstarted_job(reservation_id, job_output_dir)
+        raise
+
     # Enqueue Job
     jobs[job_id] = {
         'status': 'queued',
         'logs': _TimedLog([f"Job {job_id} queued."]),
         'cmd': cmd,
-        'env': env,
+        'env': build_job_child_env(durable_config, runtime_secrets),
+        'job_config': durable_config,
+        'runtime_secrets': runtime_secrets,
+        'ephemeral_source_authorization': bool(
+            url and not source_config["canonical_public_url"]
+        ),
         'output_dir': job_output_dir,
         'attestation': attestation,
         'user_id': user_id,
@@ -3711,24 +5280,21 @@ async def process_endpoint(
         'via_api_key': request_uses_api_key(request),
     }
 
-    # Persist the owner so recovered jobs keep their multi-tenant guard after a
-    # restart (see _recover_jobs_from_disk).
-    if user_id is not None:
-        try:
-            os.makedirs(job_output_dir, exist_ok=True)
-            with open(os.path.join(job_output_dir, ".owner"), "w") as f:
-                f.write(str(user_id))
-        except Exception as e:
-            print(f"⚠️ Could not persist job owner for {job_id}: {e}")
-
     # Resume manifest: enough to re-run this job if the container dies mid-flight
     # (a redeploy). No secrets — the env is rebuilt from os.environ on resume.
-    _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
-                           watermark=jobs[job_id]['watermark'],
-                           webhook_url=webhook_url, webhook_secret=webhook_secret,
-                           base_url=api_base, partial=partial,
-                           source_cap_minutes=source_cap, skip_statics=skip_statics,
-                           via_api_key=jobs[job_id]['via_api_key'])
+    try:
+        _write_resume_manifest(
+            job_id, cmd, priority, user_id, reservation_id,
+            watermark=jobs[job_id]['watermark'],
+            webhook_url=webhook_url, webhook_secret=webhook_secret,
+            base_url=api_base, partial=partial,
+            source_cap_minutes=source_cap, skip_statics=skip_statics,
+            via_api_key=jobs[job_id]['via_api_key'],
+        )
+    except Exception:
+        jobs.pop(job_id, None)
+        await _drop_unstarted_job(reservation_id, job_output_dir)
+        raise
 
     _enqueue_job(job_id, priority)
 
@@ -6000,40 +7566,12 @@ def _read_postiz_state(path: Path) -> dict:
     return state
 
 
-def _fsync_parent_directory(path: Path) -> None:
-    """Persist an atomic rename where the host filesystem supports directory fsync."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        fd = os.open(str(path.parent), flags)
-    except OSError:
-        return  # Windows does not support opening/fsyncing directories this way.
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
 def _write_postiz_state(path: Path, state: dict) -> None:
-    """Crash-safe JSON replacement: temp write + file fsync + replace + dir fsync."""
-    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    """Crash-safe state replacement through the shared durable writer."""
     try:
-        with tmp_path.open("x", encoding="utf-8") as fh:
-            json.dump(state, fh, separators=(",", ":"), sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-        _fsync_parent_directory(path)
-    except OSError as exc:
+        job_state.atomic_write_json(str(path), state)
+    except (OSError, job_state.JobStateError) as exc:
         raise PostizStateError("Could not save Postiz publish state; refusing to publish.") from exc
-    finally:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
 
 
 async def _clip_thumbnail_lock(job_id: str, clip_index: int) -> asyncio.Lock:
@@ -6064,25 +7602,12 @@ def _read_clip_thumbnail_state(path: Path) -> dict:
 
 def _write_clip_thumbnail_state(path: Path, state: dict) -> None:
     """Atomically persist generated candidates without touching clip metadata."""
-    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with tmp_path.open("x", encoding="utf-8") as fh:
-            json.dump(state, fh, separators=(",", ":"), sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-        _fsync_parent_directory(path)
-    except OSError as exc:
+        job_state.atomic_write_json(str(path), state)
+    except (OSError, job_state.JobStateError) as exc:
         raise ClipThumbnailStateError(
             "Could not save AI thumbnail state; the clip itself is unchanged."
         ) from exc
-    finally:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
 
 
 def _clip_thumbnail_root(job_id: str, clip_index: int, fingerprint: str) -> Path:
@@ -6103,23 +7628,10 @@ def _clip_thumbnail_root(job_id: str, clip_index: int, fingerprint: str) -> Path
 
 def _write_thumbnail_file(path: Path, content: bytes) -> None:
     """Atomically save a validated image under its server-owned job directory."""
-    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with tmp_path.open("xb") as fh:
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-        _fsync_parent_directory(path)
-    except OSError as exc:
+        job_state.atomic_write_bytes(str(path), content)
+    except (OSError, job_state.JobStateError) as exc:
         raise ClipThumbnailStateError("Could not save the generated thumbnail.") from exc
-    finally:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
 
 
 def _read_job_transcript(job_id: str) -> dict:

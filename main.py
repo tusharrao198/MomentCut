@@ -1,5 +1,13 @@
+import os
+from dotenv import load_dotenv
+
+# layout_picker and both provider adapters inspect environment configuration
+# at import time. Dotenv must therefore run before those imports.
+load_dotenv()
+
 import time
 import cv2
+import copy
 import subprocess
 import shutil
 import argparse
@@ -8,10 +16,11 @@ import sys
 import threading
 import unicodedata
 import uuid
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ultralytics import YOLO
 import torch
-import os
 import math
 import numpy as np
 from tqdm import tqdm
@@ -34,6 +43,8 @@ import vision_backend
 import worker_failure
 import scene_detection
 import accelerator_runtime
+import checkpoint_store
+import job_state
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             apply_global_candidate_ranking, clip_duration_bounds,
                             dedupe_overlapping, dedupe_ranked_with_floor,
@@ -42,14 +53,10 @@ from clip_selection import (build_transcript_windows, clip_count_targets,
                             snap_clip_to_words_in_window, trim_to_best)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, run_encode,
                           QUALITY, QUALITY_FAST, METADATA_SCRUB, X264)
-from dotenv import load_dotenv
 import json
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
-
-# Load environment variables
-load_dotenv()
 
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
@@ -815,12 +822,8 @@ def cap_source_duration(input_video, max_minutes, safety=False):
         return input_video
     if secs <= 0:
         return input_video
-    duration = 0.0
     try:
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        duration = (int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) / fps) if fps else 0.0
-        cap.release()
+        duration = float(_probe_source(input_video).get("duration") or 0)
     except Exception:
         duration = 0.0
     if duration and duration <= secs + (30.0 if safety else 1.0):
@@ -877,7 +880,12 @@ def _macos_ytdlp_options():
     return javascript_runtime_options()
 
 
-def download_youtube_video(url, output_dir=".", on_audio=None):
+def download_youtube_video(
+    url,
+    output_dir=".",
+    on_audio=None,
+    destination_path=None,
+):
     """
     Downloads a YouTube video using yt-dlp.
     Returns the path to the downloaded video and the video title.
@@ -1216,6 +1224,12 @@ Technical Details: {str(last_err)}
         # Machine-parseable marker consumed by app.py's log reader for the
         # monthly proxy-bandwidth counter. Not shown to clients (log filter).
         print(f"PROXY_BYTES={paid_bytes}")
+    if destination_path:
+        destination_path = os.path.abspath(destination_path)
+        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        if os.path.abspath(downloaded_file) != destination_path:
+            os.replace(downloaded_file, destination_path)
+        downloaded_file = destination_path
     print(f"✅ Video downloaded in {time.time() - step_start_time:.2f}s: {downloaded_file}")
     return downloaded_file, sanitized_title
 
@@ -1872,90 +1886,6 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
         apply_watermark(final_output_video)
     return True
 
-# --- Transcript checkpoint (survive a redeploy without paying twice) ---------
-# A job interrupted by a container restart is re-run from its resume manifest
-# (app.py) with the SAME output directory. Transcription is the slow, paid part
-# of the pipeline that ran before the interruption, so the finished transcript
-# is left in the job directory and picked up by the re-run instead of
-# transcribing again. Same shape and same validation as --transcript.
-TRANSCRIPT_CHECKPOINT = ".transcript_checkpoint.json"
-
-
-def _checkpoint_source_key(input_video, duration):
-    """What ties a checkpoint to ONE source. Not the path: a resumed cloud job
-    re-downloads to the same name, and the CLI may be pointed at a different
-    file in a directory where an earlier run died. Name plus duration is what
-    both the server and a careful CLI user keep stable across the two runs."""
-    return {"name": os.path.basename(input_video), "duration": round(float(duration), 1)}
-
-
-def _transcript_asr_key():
-    """Requested ASR identity that must match before a transcript is reused."""
-    from transcribe_backends import (
-        parakeet_config_identity,
-        whisper_config_identity,
-    )
-
-    backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
-    identity = {
-        "backend": backend,
-        **whisper_config_identity(),
-    }
-    if backend == "parakeet":
-        identity["parakeet"] = parakeet_config_identity()
-    return identity
-
-
-def save_transcript_checkpoint(output_dir, transcript, input_video, duration):
-    """Best effort: a failure here must never fail the job."""
-    try:
-        payload = {"source": _checkpoint_source_key(input_video, duration),
-                   "asr": _transcript_asr_key(),
-                   "transcript": transcript}
-        with open(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT), "w") as f:
-            json.dump(payload, f)
-    except Exception as e:
-        print(f"⚠️ Could not save transcript checkpoint: {e}")
-
-
-def load_transcript_checkpoint(output_dir, input_video, duration):
-    """The transcript an interrupted run left behind for THIS source, or None.
-
-    A checkpoint for a different source (a CLI run that died, then a new video
-    processed in the same directory) is ignored, not reused."""
-    path = os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path) as f:
-            payload = json.load(f)
-        source = payload.get("source") or {}
-        expected = _checkpoint_source_key(input_video, duration)
-        if source.get("name") != expected["name"] \
-                or abs(float(source.get("duration", -1)) - expected["duration"]) > 0.5:
-            print("⏭️ Transcript checkpoint belongs to another source — ignoring it.")
-            return None
-        if payload.get("asr") != _transcript_asr_key():
-            print("⏭️ Transcript checkpoint used another ASR configuration — ignoring it.")
-            return None
-        transcript = payload.get("transcript") or {}
-        if not transcript.get("segments"):
-            raise ValueError("checkpoint has no segments")
-        return transcript
-    except Exception as e:
-        print(f"⚠️ Ignoring unusable transcript checkpoint ({e}).")
-        return None
-
-
-def clear_transcript_checkpoint(output_dir):
-    try:
-        os.remove(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT))
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"⚠️ Could not remove transcript checkpoint: {e}")
-
-
 CLIP_RETRY_PAUSE_SECONDS = float(os.environ.get("CLIP_RETRY_PAUSE_SECONDS", "10"))
 
 
@@ -1980,20 +1910,12 @@ def _free_gpu_cache():
 
 
 def transcribe_video(video_path):
-    print("🎙️  Transcribing video...")
-    from transcribe_backends import transcribe_media
-
-    # transcribe_media owns the one host-wide slot and releases ASR models
-    # before another process is admitted or this job starts rendering.
-    transcript = transcribe_media(video_path)
-
-    print(f"   Detected language '{transcript['language']}', "
-          f"{len(transcript['segments'])} segments")
-    for segment in transcript['segments']:
-        # Print progress to keep user informed (and prevent timeouts feeling)
-        print(f"   [{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}")
-
-    return transcript
+    """Backward-compatible transcript-only wrapper."""
+    from transcribe_backends import NoAudioError
+    result = transcribe_video_with_provenance(video_path)
+    if result["outcome"] == "no_audio":
+        raise NoAudioError(result["provenance"]["fallback_reason_detail"])
+    return result["transcript"]
 
 def _run_gemini_stage(client, model_name, prompt, schema):
     """One schema-enforced model call with transient-error backoff.
@@ -2179,10 +2101,89 @@ def _local_window_detail_prompt(window, *, video_duration, language,
     )
 
 
+def _selection_unit_key(stage, job_config, source_identity, route, payload,
+                        semantic_inputs=None):
+    return checkpoint_store.compatibility_key(stage, {
+        "source_content_identity": {
+            "sha256": source_identity["sha256"],
+            "size": source_identity["size"],
+        },
+        "route": route,
+        "resolved_stage_config": {
+            "configuration_revision": job_config["configuration_revision"],
+            "selection": job_config.get("selection") or {},
+            "text_selection": job_config.get("text_selection") or {},
+        },
+        "expected_upstream_compatibility_keys": [],
+        "semantic_input_hashes": list(semantic_inputs or []) + [
+            checkpoint_store.sha256_bytes(
+                checkpoint_store.canonical_json_bytes(payload)
+            )
+        ],
+    })
+
+
+def _source_analysis_key(stage, job_config, source_identity, config, inputs):
+    return checkpoint_store.compatibility_key(stage, {
+        "source_content_identity": {
+            "sha256": source_identity["sha256"],
+            "size": source_identity["size"],
+        },
+        "route": (config or {}).get("provider") or stage,
+        "resolved_stage_config": {
+            "configuration_revision": job_config["configuration_revision"],
+            "config": config,
+        },
+        "expected_upstream_compatibility_keys": [
+            checkpoint_store.expected_source_request_key(job_config),
+        ],
+        "semantic_input_hashes": [
+            checkpoint_store.sha256_bytes(
+                checkpoint_store.canonical_json_bytes(inputs)
+            )
+        ],
+    })
+
+
 def _run_local_detail_window(client, model_name, window, *, video_duration,
                              language, min_secs, max_secs, costs, label,
-                             words=None):
+                             words=None, checkpoint_store_instance=None,
+                             job_config=None, source_identity=None):
     """Ask the local model for zero-or-one clip and validate it immediately."""
+    detail_key = None
+    reusable = bool(
+        checkpoint_store_instance is not None
+        and job_config
+        and source_identity
+        and (job_config.get("text_selection") or {}).get(
+            "immutable_revision_available"
+        )
+    )
+    if reusable:
+        detail_key = _selection_unit_key(
+            "text-detail",
+            job_config,
+            source_identity,
+            "speech-local",
+            {
+                "window": window,
+                "language": language,
+                "video_duration": video_duration,
+                "clip_min_seconds": min_secs,
+                "clip_max_seconds": max_secs,
+            },
+        )
+        cached = checkpoint_store_instance.load_keyed(
+            "text-detail", detail_key,
+        )
+        if cached is not None:
+            payload = cached.get("payload") or {}
+            if payload.get("outcome") == "empty":
+                return None
+            if payload.get("outcome") == "candidate" \
+                    and isinstance(payload.get("candidate"), dict):
+                return dict(payload["candidate"])
+
     correction = ""
     for semantic_attempt in range(2):
         prompt = _local_window_detail_prompt(
@@ -2213,6 +2214,17 @@ def _run_local_detail_window(client, model_name, window, *, video_duration,
 
         raw_clip = parsed.get("clip") if isinstance(parsed, dict) else None
         if raw_clip is None:
+            if reusable:
+                checkpoint_store_instance.save_keyed(
+                    "text-detail",
+                    detail_key,
+                    {"outcome": "empty"},
+                    {"semantic_input_hashes": [
+                        checkpoint_store.sha256_bytes(
+                            checkpoint_store.canonical_json_bytes(window)
+                        )
+                    ]},
+                )
             return None
         if not isinstance(raw_clip, dict):
             print(
@@ -2251,6 +2263,17 @@ def _run_local_detail_window(client, model_name, window, *, video_duration,
                 )
                 candidate["start"], candidate["end"] = start, end
                 candidate["_word_snapped"] = True
+            if reusable:
+                checkpoint_store_instance.save_keyed(
+                    "text-detail",
+                    detail_key,
+                    {"outcome": "candidate", "candidate": candidate},
+                    {"semantic_input_hashes": [
+                        checkpoint_store.sha256_bytes(
+                            checkpoint_store.canonical_json_bytes(window)
+                        )
+                    ]},
+                )
             return candidate
 
         if semantic_attempt == 0:
@@ -2276,7 +2299,9 @@ def _run_local_detail_window(client, model_name, window, *, video_duration,
 def _run_local_detail_windows(client, model_name, primary_windows,
                               fallback_windows, *, video_duration, language,
                               min_secs, max_secs, min_clips, costs,
-                              max_clips=None, words=None):
+                              max_clips=None, words=None,
+                              checkpoint_store_instance=None, job_config=None,
+                              source_identity=None):
     """Collect one validated candidate per primary window, then bounded fallback."""
     candidates = []
     for window in primary_windows:
@@ -2291,6 +2316,9 @@ def _run_local_detail_windows(client, model_name, primary_windows,
             costs=costs,
             label="detail-window",
             words=words,
+            checkpoint_store_instance=checkpoint_store_instance,
+            job_config=job_config,
+            source_identity=source_identity,
         )
         if candidate:
             candidates.append(candidate)
@@ -2326,6 +2354,9 @@ def _run_local_detail_windows(client, model_name, primary_windows,
             costs=costs,
             label="detail-fallback",
             words=words,
+            checkpoint_store_instance=checkpoint_store_instance,
+            job_config=job_config,
+            source_identity=source_identity,
         )
         if candidate:
             candidates.append(candidate)
@@ -2335,7 +2366,9 @@ def _run_local_detail_windows(client, model_name, primary_windows,
 
 
 def _rank_local_candidates(client, model_name, candidates, *,
-                           transcript_result=None, language="unknown", costs):
+                           transcript_result=None, language="unknown", costs,
+                           checkpoint_store_instance=None, job_config=None,
+                           source_identity=None):
     """Globally compare independent window picks; fall back without data loss."""
     prepared = []
     payload = []
@@ -2368,6 +2401,31 @@ def _rank_local_candidates(client, model_name, candidates, *,
     if len(prepared) < 2:
         return prepared
 
+    rank_key = None
+    reusable = bool(
+        checkpoint_store_instance is not None
+        and job_config
+        and source_identity
+        and (job_config.get("text_selection") or {}).get(
+            "immutable_revision_available"
+        )
+    )
+    if reusable:
+        rank_key = _selection_unit_key(
+            "text-rank",
+            job_config,
+            source_identity,
+            "speech-local",
+            {"candidates": payload, "language": language},
+        )
+        cached = checkpoint_store_instance.load_fixed("text-rank", rank_key)
+        if cached is not None and isinstance(
+            (cached.get("payload") or {}).get("rankings"), list
+        ):
+            return apply_global_candidate_ranking(
+                prepared, cached["payload"]["rankings"],
+            )
+
     prompt = gemini_worker.LOCAL_CLIP_RANK_PROMPT_TEMPLATE.format(
         language=language,
         candidates_json=json.dumps(payload, ensure_ascii=False),
@@ -2383,6 +2441,17 @@ def _rank_local_candidates(client, model_name, candidates, *,
             costs.append(cost)
         rankings = parsed.get("candidates") if isinstance(parsed, dict) else []
         ranked = apply_global_candidate_ranking(prepared, rankings)
+        if reusable:
+            checkpoint_store_instance.save_fixed(
+                "text-rank",
+                rank_key,
+                {"rankings": rankings},
+                {"semantic_input_hashes": [
+                    checkpoint_store.sha256_bytes(
+                        checkpoint_store.canonical_json_bytes(payload)
+                    )
+                ]},
+            )
         print(f"   Globally ranked {len(ranked)} local clip candidate(s).")
         return ranked
     except Exception as error:
@@ -2396,7 +2465,9 @@ def _rank_local_candidates(client, model_name, candidates, *,
         return apply_global_candidate_ranking(prepared, [])
 
 
-def get_viral_clips(transcript_result, video_duration):
+def get_viral_clips(transcript_result, video_duration, *,
+                    checkpoint_store_instance=None, job_config=None,
+                    source_identity=None):
     """Windowed clip selection: score candidates, then extract/rank the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2467,18 +2538,100 @@ def get_viral_clips(transcript_result, video_duration):
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
+        reusable_local = bool(
+            llm_backend.active()
+            and checkpoint_store_instance is not None
+            and job_config
+            and source_identity
+            and (job_config.get("text_selection") or {}).get(
+                "immutable_revision_available"
+            )
+        )
         for batch in score_batches(windows, SCORE_BATCH):
-            raw_scores = _run_stage_split(
-                client, model_name, batch, _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score")
-            reconciled = reconcile_scored_windows(raw_scores, batch)
-            missing = len(batch) - len({
-                entry.get("id") for entry in raw_scores
-                if isinstance(entry, dict) and entry.get("id") in {w["id"] for w in batch}
+            cached_scores = {}
+            score_keys = {}
+            missing_windows = []
+            for window in batch:
+                if reusable_local:
+                    key = _selection_unit_key(
+                        "text-score",
+                        job_config,
+                        source_identity,
+                        "speech-local",
+                        {"window": window, "language": language},
+                    )
+                    score_keys[window["id"]] = key
+                    cached = checkpoint_store_instance.load_keyed(
+                        "text-score", key,
+                    )
+                    cached_score = (cached or {}).get("payload", {}).get("score")
+                    if isinstance(cached_score, dict):
+                        cached_scores[window["id"]] = cached_score
+                        continue
+                missing_windows.append(window)
+
+            fresh_scores = []
+            if missing_windows:
+                raw_scores = _run_stage_split(
+                    client,
+                    model_name,
+                    missing_windows,
+                    _score_prompt,
+                    gemini_worker.ScoreResponse,
+                    "windows",
+                    costs,
+                    "score",
+                )
+                fresh_scores = reconcile_scored_windows(
+                    raw_scores, missing_windows,
+                )
+                returned_ids = {
+                    entry.get("id") for entry in raw_scores
+                    if isinstance(entry, dict)
+                }
+                missing = len(missing_windows) - len({
+                    item for item in returned_ids
+                    if item in {w["id"] for w in missing_windows}
+                })
+                if missing:
+                    print(
+                        f"   ⚠️ score: retained {missing} unscored "
+                        "window(s) with fallback scores."
+                    )
+                if reusable_local:
+                    for entry in fresh_scores:
+                        key = score_keys.get(entry.get("id"))
+                        if key:
+                            checkpoint_store_instance.save_keyed(
+                                "text-score",
+                                key,
+                                {
+                                    "score": entry,
+                                    "origin": (
+                                        "model" if entry.get("id") in returned_ids
+                                        else "reconciled_fallback"
+                                    ),
+                                },
+                                {"semantic_input_hashes": [
+                                    checkpoint_store.sha256_bytes(
+                                        checkpoint_store.canonical_json_bytes(
+                                            next(
+                                                w for w in missing_windows
+                                                if w["id"] == entry["id"]
+                                            )
+                                        )
+                                    )
+                                ]},
+                            )
+            combined = dict(cached_scores)
+            combined.update({
+                entry["id"]: entry for entry in fresh_scores
+                if entry.get("id")
             })
-            if missing:
-                print(f"   ⚠️ score: retained {missing} unscored window(s) with fallback scores.")
-            scored.extend(reconciled)
+            scored.extend(
+                combined[window["id"]]
+                for window in batch if window["id"] in combined
+            )
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
@@ -2523,6 +2676,9 @@ def get_viral_clips(transcript_result, video_duration):
                 max_clips=max_clips,
                 costs=costs,
                 words=words,
+                checkpoint_store_instance=checkpoint_store_instance,
+                job_config=job_config,
+                source_identity=source_identity,
             )
             shorts = _rank_local_candidates(
                 client,
@@ -2531,6 +2687,9 @@ def get_viral_clips(transcript_result, video_duration):
                 transcript_result=transcript_result,
                 language=language,
                 costs=costs,
+                checkpoint_store_instance=checkpoint_store_instance,
+                job_config=job_config,
+                source_identity=source_identity,
             )
             # Rank before overlap removal so the globally stronger version of
             # a repeated moment survives. Keep the best-first order until the
@@ -2681,7 +2840,9 @@ def speech_is_sparse(transcript, duration):
     return words < MIN_SPEECH_WORDS or words / minutes < MIN_SPEECH_WORDS_PER_MIN
 
 
-def get_visual_clips(video_path, video_duration, language="en"):
+def get_visual_clips(video_path, video_duration, language="en", *,
+                     checkpoint_store_instance=None, job_config=None,
+                     source_identity=None):
     """Clip a silent video by vision, locally when configured or via Gemini.
 
     Both paths return the same ``{"shorts", "cost_analysis"}`` shape as
@@ -2700,6 +2861,107 @@ def get_visual_clips(video_path, video_duration, language="en"):
         min_clips = _env_int("CLIP_TARGET_MIN", 3)
         max_clips = max(min_clips, _env_int("CLIP_TARGET_MAX", 15))
         min_secs, max_secs = clip_duration_bounds()
+        scene_boundaries = None
+        scene_config = dict((job_config or {}).get("scene_detection") or {})
+        scene_key = None
+        if (
+            checkpoint_store_instance is not None
+            and job_config is not None
+            and source_identity is not None
+        ):
+            def _scene_key_for_route(effective_engine):
+                if effective_engine not in {"transnetv2", "pyscenedetect"}:
+                    raise checkpoint_store.CheckpointError(
+                        "Unknown effective scene engine"
+                    )
+                return _source_analysis_key(
+                    "source-scenes",
+                    job_config,
+                    source_identity,
+                    {**scene_config, "effective_engine": effective_engine},
+                    {"duration_ms": int(round(float(video_duration) * 1000))},
+                )
+
+            cached_scenes = checkpoint_store_instance.load_routed_fixed(
+                "source-scenes",
+                lambda route: (
+                    route
+                    if route in {"transnetv2", "pyscenedetect"}
+                    else (_ for _ in ()).throw(
+                        checkpoint_store.CheckpointError(
+                            "Unknown effective scene engine"
+                        )
+                    )
+                ),
+                _scene_key_for_route,
+            )
+            if cached_scenes is not None:
+                scene_key = cached_scenes["compatibility_key"]
+                payload = cached_scenes.get("payload") or {}
+                candidate = payload.get("boundaries_seconds")
+                if isinstance(candidate, list) and all(
+                    isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    and 0 <= float(value) <= float(video_duration)
+                    for value in candidate
+                ):
+                    scene_boundaries = [float(value) for value in candidate]
+                    print("♻️ Reusing source-level scene boundaries.")
+        if scene_boundaries is None:
+            try:
+                scenes, scene_fps, scene_provenance = (
+                    scene_detection.detect_scenes_with_provenance(
+                        video_path, scene_config,
+                    )
+                )
+                scene_fps = float(scene_fps or 30.0)
+                values = [0.0, float(video_duration)]
+                for start, end in scenes:
+                    for value in (start, end):
+                        get_seconds = getattr(value, "get_seconds", None)
+                        seconds = (
+                            get_seconds()
+                            if callable(get_seconds)
+                            else float(value) / scene_fps
+                        )
+                        if 0 <= seconds <= float(video_duration):
+                            values.append(seconds)
+                scene_boundaries = sorted(
+                    {round(float(value), 3) for value in values}
+                )
+                if checkpoint_store_instance is not None:
+                    scene_key = _scene_key_for_route(
+                        scene_provenance["effective_engine"]
+                    )
+                    checkpoint_store_instance.save_fixed(
+                        "source-scenes",
+                        scene_key,
+                        {
+                            "boundaries_seconds": scene_boundaries,
+                            "fps": scene_fps,
+                            "detector": scene_provenance,
+                        },
+                        {
+                            "provenance_hashes": [
+                                checkpoint_store.sha256_bytes(
+                                    checkpoint_store.canonical_json_bytes(
+                                        scene_provenance
+                                    )
+                                )
+                            ],
+                            "route_context": scene_provenance[
+                                "effective_engine"
+                            ],
+                            "effective_detector": scene_provenance,
+                        },
+                    )
+            except Exception as error:
+                scene_boundaries = []
+                print(
+                    "   ⚠️ Source scene detection unavailable for local "
+                    f"vision ({type(error).__name__}: {error}) — using "
+                    "evenly spaced frames."
+                )
         result = vision_backend.select_clips(
             video_path=video_path,
             video_duration=video_duration,
@@ -2708,6 +2970,9 @@ def get_visual_clips(video_path, video_duration, language="en"):
             max_clips=max_clips,
             min_seconds=min_secs,
             max_seconds=max_secs,
+            checkpoint_store=checkpoint_store_instance,
+            source_scenes=scene_boundaries,
+            resolved_config=(job_config or {}).get("vision_selection"),
         )
         result["shorts"] = [
             clip_packaging.normalise_clip_packaging_metadata(clip)
@@ -2810,6 +3075,358 @@ def get_visual_clips(video_path, video_duration, language="en"):
                 pass
 
 
+def _sanitized_endpoint_identity(value):
+    """Non-secret endpoint identity safe for durable configuration."""
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(str(value))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{port}{parsed.path.rstrip('/')}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolved_job_config(
+    job_id,
+    args,
+    retained_relative_path,
+    *,
+    checkpointing_enabled=None,
+    completed_selection_route=None,
+):
+    """Snapshot the effective, non-secret settings consumed by this run."""
+    from transcribe_backends import checkpoint_asr_config
+    def env(name, default=None):
+        value = os.environ.get(name)
+        return default if value is None or value == "" else value
+
+    current_enablement = checkpoint_store.pipeline_checkpoints_enabled()
+    checkpoints_enabled = (
+        current_enablement
+        if checkpointing_enabled is None
+        else bool(checkpointing_enabled)
+    )
+    transcript_sha256 = None
+    if args.transcript and os.path.isfile(args.transcript):
+        transcript_sha256 = checkpoint_store.sha256_file(args.transcript)
+    text_descriptor = (
+        (
+            llm_backend.resolved_descriptor()
+            if checkpoints_enabled
+            and completed_selection_route not in {"silent", "complete"}
+            else llm_backend.configured_descriptor()
+        )
+        if llm_backend.active() else {
+            "provider": "gemini",
+            "endpoint": None,
+            "requested_model": env("GEMINI_MODEL"),
+            "immutable_model_revision": None,
+            "immutable_revision_available": False,
+        }
+    )
+    if vision_backend.active():
+        try:
+            requested_max_seconds = float(env("CLIP_MAX_SECONDS", "60"))
+        except (TypeError, ValueError):
+            requested_max_seconds = 60.0
+        descriptor_reader = (
+            vision_backend.resolved_descriptor
+            if checkpoints_enabled
+            and completed_selection_route not in {"speech", "complete"}
+            else vision_backend.configured_descriptor
+        )
+        raw_vision_descriptor = descriptor_reader(requested_max_seconds)
+        vision_descriptor = {
+            "provider": "ollama",
+            "endpoint": raw_vision_descriptor.get("endpoint"),
+            "model": raw_vision_descriptor.get("model"),
+            "immutable_model_revision": raw_vision_descriptor.get("digest"),
+            "immutable_revision_available": bool(
+                raw_vision_descriptor.get("immutable_revision_available")
+            ),
+        }
+    else:
+        vision_descriptor = {
+            "provider": "gemini",
+            "endpoint": None,
+            "model": env("GEMINI_MODEL"),
+            "immutable_model_revision": None,
+            "immutable_revision_available": False,
+        }
+    config = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "configuration_revision": 1,
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source": {
+            "kind": "url" if args.url else "upload",
+            "original_name": None if args.url else os.path.basename(args.input),
+            "retained_relative_path": retained_relative_path,
+            "transcript_sha256": transcript_sha256,
+            "max_source_minutes": env("MAX_SOURCE_MINUTES"),
+            "source_cap_minutes": env("SOURCE_CAP_MINUTES"),
+            "download_skip_statics": env("DOWNLOAD_SKIP_STATICS", "0") == "1",
+            "downloader_policy": "yt-dlp-v1",
+        },
+        "pipeline": {
+            "output_format": args.format,
+            "layouts": sorted(
+                name for name in (
+                    "AUTO_LAYOUT", "SPLIT_LAYOUT", "SCREENCAST_LAYOUT",
+                    "CAMERA_INSET",
+                ) if env(name, "0") == "1"
+            ),
+            "auto_hook": env("AUTO_HOOK", "0") == "1",
+            "auto_hook_style": env("AUTO_HOOK_STYLE"),
+            "auto_hook_seconds": env("AUTO_HOOK_SECONDS"),
+            "captions": env("AUTO_CAPTIONS", "1") != "0",
+            "watermark": env("WATERMARK", "0") == "1",
+        },
+        "selection": {
+            "target_min": env("CLIP_TARGET_MIN"),
+            "target_max": env("CLIP_TARGET_MAX"),
+            "clip_min_seconds": env("CLIP_MIN_SECONDS"),
+            "clip_max_seconds": env("CLIP_MAX_SECONDS"),
+            "score_batch": env("LLM_SCORE_BATCH"),
+            "detail_fallback_windows": env("LLM_DETAIL_FALLBACK_WINDOWS"),
+            "implementation_version": "selection-v1",
+        },
+        "asr": checkpoint_asr_config(),
+        "scene_detection": {
+            "engine": env("SCENE_ENGINE", "transnetv2"),
+            "device": env("TRANSNETV2_DEVICE"),
+            "model_revision": env("TRANSNETV2_MODEL_REVISION"),
+            "threshold": env("TRANSNETV2_THRESHOLD"),
+            "minimum_seconds": env("SCENE_MIN_SEC"),
+            "implementation_version": "source-scenes-v1",
+        },
+        "text_selection": {
+            "provider": text_descriptor["provider"],
+            "endpoint": text_descriptor["endpoint"],
+            "model": text_descriptor["requested_model"],
+            "immutable_model_revision": text_descriptor[
+                "immutable_model_revision"
+            ],
+            "immutable_revision_available": text_descriptor[
+                "immutable_revision_available"
+            ],
+        },
+        "vision_selection": {
+            **vision_descriptor,
+            "window_seconds": env("VISION_WINDOW_SECONDS"),
+            "overlap_seconds": env("VISION_WINDOW_OVERLAP_SECONDS"),
+            "frame_count": env("VISION_FRAMES_PER_WINDOW"),
+            "sample_width": env("VISION_MAX_FRAME_WIDTH"),
+            "context_size": env("VISION_NUM_CTX"),
+            "candidates_per_window": env("VISION_CANDIDATES_PER_WINDOW"),
+            "scene_snap_seconds": env("VISION_SCENE_SNAP_SECONDS"),
+        },
+        "render": {
+            "encoder": env("FFMPEG_ENCODER", "libx264"),
+            "gpu_cut": env("FFMPEG_GPU_CUT", "0") == "1",
+            "audio_normalize": env("AUDIO_NORMALIZE", "0") == "1",
+            "video_decode_backend": env("VIDEO_DECODE_BACKEND", "auto"),
+            "reframe_engine": env("REFRAME_ENGINE"),
+            "yolo_model_path": env("YOLO_MODEL_PATH", "yolov8n.pt"),
+            "detect_stride": env("DETECT_STRIDE"),
+            "jump_confirm_frames": env("JUMP_CONFIRM_FRAMES", "3"),
+            "scene_cut_reset": env("SCENE_CUT_RESET", "1"),
+            "clip_workers": env("CLIP_WORKERS", "6"),
+            "implementation_version": "render-v1",
+        },
+        "environment": {
+            name: os.environ[name]
+            for name in checkpoint_store.PIPELINE_ENV_NAMES
+            if name in os.environ
+        },
+        "checkpointing_enabled": checkpoints_enabled,
+        "credential_requirements": {
+            "gemini_speech": not llm_backend.active(),
+            "gemini_silent": not vision_backend.active(),
+            "private_source": False,
+        },
+    }
+    return job_state.seal_job_config(config)
+
+
+def _job_config_semantics(
+    config,
+    *,
+    ignore_model_resolution=False,
+    ignore_model_sections=(),
+):
+    """Fields that must remain identical across a standalone auto-resume."""
+    value = json.loads(json.dumps(config))
+    value.pop("created_at", None)
+    value.pop("job_config_hash", None)
+    value.pop("checkpointing_enabled", None)
+    (value.get("source") or {}).pop("original_name", None)
+    ignored_sections = set(ignore_model_sections)
+    if ignore_model_resolution:
+        for section_name in ("text_selection", "vision_selection"):
+            section = value.get(section_name)
+            if isinstance(section, dict):
+                section.pop("immutable_model_revision", None)
+                section.pop("immutable_revision_available", None)
+    for section_name in ignored_sections:
+        value.pop(section_name, None)
+    return value
+
+
+def _assert_model_revision_compatibility(config, completed_selection_route=None):
+    """Reject automatic recovery with different local model weights."""
+    text = config.get("text_selection") or {}
+    if completed_selection_route != "silent" \
+            and text.get("immutable_revision_available"):
+        current = llm_backend.resolved_descriptor()
+        if current.get("immutable_model_revision") != text.get(
+            "immutable_model_revision"
+        ):
+            raise checkpoint_store.CheckpointError(
+                "The configured local text model now resolves to different "
+                "weights; start a new project or restore the pinned model"
+            )
+    vision = config.get("vision_selection") or {}
+    if completed_selection_route != "speech" \
+            and vision.get("immutable_revision_available"):
+        selection = config.get("selection") or {}
+        try:
+            max_seconds = float(selection.get("clip_max_seconds") or 60)
+        except (TypeError, ValueError):
+            max_seconds = 60.0
+        current = vision_backend.resolved_descriptor(max_seconds)
+        if current.get("digest") != vision.get("immutable_model_revision"):
+            raise checkpoint_store.CheckpointError(
+                "The configured local vision model now resolves to different "
+                "weights; start a new project or restore the pinned model"
+            )
+
+
+def _checkpointed_selection_boundary(config):
+    return checkpoint_store.completed_selection_boundary(
+        config,
+        current_enablement=checkpoint_store.pipeline_checkpoints_enabled(),
+    )
+
+
+def _probe_source(path):
+    """Return stable video facts, with ffprobe covering OpenCV codec gaps."""
+    capture = cv2.VideoCapture(path)
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+        frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    finally:
+        capture.release()
+    duration = frames / fps if fps > 0 else 0.0
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries",
+                (
+                    "stream=avg_frame_rate,r_frame_rate,nb_frames,width,height,"
+                    "duration:format=duration"
+                ),
+                "-of", "json", path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            payload = json.loads(result.stdout or "{}")
+            streams = payload.get("streams") or []
+            stream = streams[0] if streams else {}
+            format_info = payload.get("format") or {}
+
+            def _positive_float(value):
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    return 0.0
+                return number if math.isfinite(number) and number > 0 else 0.0
+
+            def _positive_int(value):
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    return 0
+                return number if number > 0 else 0
+
+            def _frame_rate(value):
+                text = str(value or "")
+                if "/" in text:
+                    numerator, denominator = text.split("/", 1)
+                    denominator = _positive_float(denominator)
+                    return (
+                        _positive_float(numerator) / denominator
+                        if denominator else 0.0
+                    )
+                return _positive_float(text)
+
+            probed_duration = (
+                _positive_float(stream.get("duration"))
+                or _positive_float(format_info.get("duration"))
+            )
+            probed_fps = (
+                _frame_rate(stream.get("avg_frame_rate"))
+                or _frame_rate(stream.get("r_frame_rate"))
+            )
+            probed_frames = _positive_int(stream.get("nb_frames"))
+            duration = probed_duration or duration
+            fps = probed_fps or fps
+            frames = probed_frames or frames or (
+                int(round(duration * fps)) if duration and fps else 0
+            )
+            width = _positive_int(stream.get("width")) or width
+            height = _positive_int(stream.get("height")) or height
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {
+        "duration": duration,
+        "fps": fps,
+        "frames": frames,
+        "width": width,
+        "height": height,
+    }
+
+
+def transcribe_video_with_provenance(video_path):
+    print("🎙️  Transcribing video...")
+    from transcribe_backends import (
+        host_asr_slot, release_models, transcribe_media_with_provenance,
+    )
+
+    with host_asr_slot():
+        try:
+            result = transcribe_media_with_provenance(video_path)
+        finally:
+            try:
+                release_models()
+            except Exception as error:
+                print(
+                    "⚠️ [ASR] could not release models "
+                    f"({type(error).__name__}: {error})"
+                )
+    transcript = result.get("transcript")
+    if transcript is not None:
+        print(
+            f"   Detected language '{transcript['language']}', "
+            f"{len(transcript['segments'])} segments"
+        )
+        for segment in transcript["segments"]:
+            print(
+                f"   [{segment['start']:.2f}s -> {segment['end']:.2f}s] "
+                f"{segment['text']}"
+            )
+    return result
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
@@ -2824,8 +3441,176 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--project-dir', type=str,
+                        help="Dedicated persistent project directory for checkpointed runs.")
+    parser.add_argument('--job-id', type=str,
+                        help="Durable project/job identifier (managed jobs only).")
+    parser.add_argument('--managed-job', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--execution-generation', type=int,
+                        help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+    checkpoints_enabled = checkpoint_store.pipeline_checkpoints_enabled()
+    if checkpoints_enabled and not args.project_dir:
+        parser.error(
+            "--project-dir is required when PIPELINE_CHECKPOINTS_ENABLED=true"
+        )
+    if args.managed_job and (
+        not args.project_dir or not args.job_id or args.execution_generation is None
+    ):
+        parser.error(
+            "--managed-job requires --project-dir, --job-id and "
+            "--execution-generation"
+        )
+
+    checkpoint_project = None
+    checkpoint_job_config = None
+    checkpoint_job_state = None
+    checkpoint_lease = None
+    checkpoint_store_instance = None
+    compute_checkpoint_store = None
+    if args.project_dir:
+        checkpoint_project = os.path.abspath(args.project_dir)
+        os.makedirs(checkpoint_project, exist_ok=True)
+        if args.managed_job:
+            checkpoint_job_config = job_state.load_job_config(checkpoint_project)
+            checkpoint_job_state = job_state.load_job_state(checkpoint_project)
+            if checkpoint_job_config["job_id"] != args.job_id \
+                    or checkpoint_job_state["job_id"] != args.job_id:
+                parser.error("Managed job identity does not match its project state")
+            if checkpoint_job_config["configuration_revision"] != \
+                    checkpoint_job_state["configuration_revision"]:
+                parser.error(
+                    "Managed job configuration/state revisions do not match"
+                )
+            if checkpoint_job_state["execution_generation"] != args.execution_generation:
+                parser.error("Managed execution generation does not match job state")
+            if (
+                checkpoints_enabled
+                and checkpoint_job_config.get("checkpointing_enabled")
+            ):
+                checkpoint_boundary = _checkpointed_selection_boundary(
+                    checkpoint_job_config
+                )
+                if checkpoint_boundary != "complete":
+                    _assert_model_revision_compatibility(
+                        checkpoint_job_config, checkpoint_boundary,
+                    )
+        else:
+            config_path = os.path.join(checkpoint_project, ".job-config.json")
+            state_path = os.path.join(checkpoint_project, ".job-state.json")
+            if os.path.exists(config_path) != os.path.exists(state_path):
+                parser.error("Project state is incomplete; config and state must both exist")
+            if os.path.exists(config_path):
+                checkpoint_job_config = job_state.load_job_config(checkpoint_project)
+                checkpoint_job_state = job_state.load_job_state(checkpoint_project)
+                durable_job_id = checkpoint_job_config["job_id"]
+                effective_checkpointing = (
+                    checkpoints_enabled
+                    and bool(checkpoint_job_config.get("checkpointing_enabled"))
+                )
+                checkpoint_boundary = (
+                    _checkpointed_selection_boundary(checkpoint_job_config)
+                    if effective_checkpointing else None
+                )
+                current_config = _resolved_job_config(
+                    durable_job_id,
+                    args,
+                    checkpoint_job_config["source"]["retained_relative_path"],
+                    checkpointing_enabled=(
+                        effective_checkpointing
+                    ),
+                    completed_selection_route=checkpoint_boundary,
+                )
+                ignored_model_sections = (
+                    ("text_selection", "vision_selection")
+                    if checkpoint_boundary == "complete"
+                    else ("vision_selection",)
+                    if checkpoint_boundary == "speech"
+                    else ("text_selection",)
+                    if checkpoint_boundary == "silent"
+                    else ()
+                )
+                if _job_config_semantics(
+                    current_config,
+                    ignore_model_resolution=(
+                        not effective_checkpointing
+                    ),
+                    ignore_model_sections=ignored_model_sections,
+                ) != _job_config_semantics(
+                    checkpoint_job_config,
+                    ignore_model_resolution=(
+                        not effective_checkpointing
+                    ),
+                    ignore_model_sections=ignored_model_sections,
+                ):
+                    parser.error(
+                        "Current standalone settings differ from this project's "
+                        "immutable configuration; use the original settings or "
+                        "start a new --project-dir"
+                    )
+            else:
+                durable_job_id = args.job_id or str(uuid.uuid4())
+            checkpoint_lease = job_state.JobLease.acquire(
+                checkpoint_project, durable_job_id,
+            )
+            if checkpoint_job_config is None:
+                retained = "source.mp4"
+                checkpoint_job_config = _resolved_job_config(
+                    durable_job_id, args, retained,
+                )
+                checkpoint_job_state = {
+                    "schema_version": 1,
+                    "job_id": durable_job_id,
+                    "configuration_revision": 1,
+                    "execution_generation": 0,
+                    "status": "accepted",
+                }
+                job_state.write_job_config(
+                    checkpoint_project, checkpoint_job_config,
+                )
+                job_state.write_job_state(
+                    checkpoint_project, checkpoint_job_state,
+                )
+            else:
+                if (
+                    checkpoints_enabled
+                    and checkpoint_job_config.get("checkpointing_enabled")
+                ):
+                    checkpoint_boundary = _checkpointed_selection_boundary(
+                        checkpoint_job_config
+                    )
+                    if checkpoint_boundary != "complete":
+                        _assert_model_revision_compatibility(
+                            checkpoint_job_config, checkpoint_boundary,
+                        )
+            checkpoint_job_state = dict(checkpoint_job_state)
+            checkpoint_job_state["execution_generation"] += 1
+            checkpoint_job_state["status"] = "processing"
+            checkpoint_job_state.pop("live_plan", None)
+            checkpoint_job_state["started_at"] = datetime.now(
+                timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+            job_state.write_job_state(checkpoint_project, checkpoint_job_state)
+            args.execution_generation = checkpoint_job_state["execution_generation"]
+            args.job_id = checkpoint_job_config["job_id"]
+        if args.output and os.path.abspath(args.output) != checkpoint_project:
+            parser.error("--output and --project-dir must name the same directory")
+        args.output = checkpoint_project
+        effective_checkpoints_enabled = (
+            checkpoints_enabled
+            and bool(checkpoint_job_config.get("checkpointing_enabled"))
+        )
+        checkpoint_store_instance = checkpoint_store.CheckpointStore(
+            checkpoint_project,
+            checkpoint_job_config,
+            enabled=effective_checkpoints_enabled,
+            execution_generation=args.execution_generation or 0,
+        )
+        if checkpoint_store_instance.enabled:
+            compute_checkpoint_store = checkpoint_store_instance
+
     output_format = args.format
 
     script_start_time = time.time()
@@ -2846,12 +3631,29 @@ if __name__ == '__main__':
 
     import atexit
     atexit.register(_report_job_cpu)
+    if checkpoint_lease is not None:
+        atexit.register(checkpoint_lease.release)
 
     def _ensure_dir(path: str) -> str:
         """Create directory if missing and return the same path."""
         if path:
             os.makedirs(path, exist_ok=True)
         return path
+
+    retained_source_envelope = None
+    retained_source_path = None
+    if compute_checkpoint_store is not None:
+        retained_source_envelope = compute_checkpoint_store.load_source(
+            checkpoint_store.expected_source_request_key(checkpoint_job_config)
+        )
+        if retained_source_envelope is not None:
+            descriptor = (
+                retained_source_envelope.get("payload") or {}
+            ).get("artifact") or {}
+            relative = descriptor.get("relative_path")
+            if isinstance(relative, str):
+                retained_source_path = os.path.join(checkpoint_project, relative)
+                print("♻️ Reusing the validated retained source.")
     
     # 1. Get Input Video
     if args.url:
@@ -2875,17 +3677,32 @@ if __name__ == '__main__':
         # precomputed transcript already has them. SOURCE_CAP_MINUTES is set on
         # every metered job but only cuts a download clearly longer than the
         # reservation; when it does, the early result is dropped below.
-        early = {"lock": threading.Lock(), "done": threading.Event(), "started": False,
-                 "abandoned": False, "invalid": False, "transcript": None, "clips": None}
+        early = {
+            "lock": threading.Lock(),
+            "done": threading.Event(),
+            "started": False,
+            "abandoned": False,
+            "invalid": False,
+            "transcript": None,
+            "asr_result": None,
+            "clips": None,
+        }
 
         def _early_work(audio_path, audio_duration):
             try:
-                t = transcribe_video(audio_path)
+                result = transcribe_video_with_provenance(audio_path)
+                t = result.get("transcript")
+                if t is None:
+                    raise RuntimeError(
+                        "early audio transcription returned no transcript"
+                    )
+                early["asr_result"] = result
                 early["transcript"] = t
                 if audio_duration and not speech_is_sparse(t, audio_duration):
                     early["clips"] = get_viral_clips(t, audio_duration)
             except Exception as e:
                 print(f"   ℹ️ Early transcription skipped ({type(e).__name__}: {e}).")
+                early["asr_result"] = None
                 early["transcript"] = early["clips"] = None
             finally:
                 early["done"].set()
@@ -2902,14 +3719,47 @@ if __name__ == '__main__':
             threading.Thread(target=_early_work, args=(audio_path, audio_duration),
                              daemon=True).start()
 
-        use_early = (not args.skip_analysis and not args.transcript
+        use_early = (retained_source_path is None
+                     and not args.skip_analysis and not args.transcript
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
-                     and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
-                     and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
-        input_video, video_title = download_youtube_video(
-            args.url, output_dir, on_audio=_on_audio if use_early else None)
+                     and not os.environ.get("MAX_SOURCE_MINUTES", "").strip())
+        if retained_source_path is not None:
+            input_video = retained_source_path
+            video_title = args.job_id or "source"
+        else:
+            destination = None
+            if checkpoint_store_instance is not None:
+                destination = os.path.join(
+                    checkpoint_project,
+                    checkpoint_job_config["source"]["retained_relative_path"],
+                )
+            input_video, video_title = download_youtube_video(
+                args.url,
+                output_dir,
+                on_audio=_on_audio if use_early else None,
+                destination_path=destination,
+            )
     else:
-        input_video = args.input
+        input_video = retained_source_path or args.input
+        if checkpoint_store_instance is not None and retained_source_path is None:
+            retained_relative = checkpoint_job_config["source"][
+                "retained_relative_path"
+            ]
+            owned_path = os.path.join(checkpoint_project, retained_relative)
+            if os.path.abspath(input_video) != os.path.abspath(owned_path):
+                temporary = f"{owned_path}.{uuid.uuid4().hex}.tmp"
+                try:
+                    try:
+                        os.link(input_video, temporary)
+                    except OSError:
+                        shutil.copyfile(input_video, temporary)
+                    os.replace(temporary, owned_path)
+                finally:
+                    try:
+                        os.remove(temporary)
+                    except FileNotFoundError:
+                        pass
+                input_video = owned_path
         video_title = video_title_from_local_path(input_video)
         
         if args.output and not args.skip_analysis:
@@ -2952,18 +3802,100 @@ if __name__ == '__main__':
         if _stamp(input_video) != _before and globals().get("early") is not None:
             early["invalid"] = True  # its words cover the part that was cut off
 
+    source_probe = _probe_source(input_video)
+    if (
+        float(source_probe.get("duration") or 0) <= 0
+        or int(source_probe.get("width") or 0) <= 0
+        or int(source_probe.get("height") or 0) <= 0
+    ):
+        raise RuntimeError(
+            "The retained source is not a valid analyzable video: duration "
+            "and encoded dimensions must be readable"
+        )
+    source_identity = checkpoint_store.build_source_identity(
+        input_video, source_probe,
+    )
+    if compute_checkpoint_store is not None:
+        if retained_source_envelope is None:
+            relative_source = os.path.relpath(input_video, checkpoint_project)
+            source_payload = {
+                "source_type": checkpoint_job_config["source"]["kind"],
+                "retained_relative_path": relative_source,
+                "stable_artifact_stem": checkpoint_job_config["job_id"],
+                "source_fingerprint": source_identity,
+                "probe": source_probe,
+                "artifact": {
+                    "relative_path": relative_source,
+                    "size": source_identity["size"],
+                    "sha256": source_identity["sha256"],
+                    "duration_ms": source_identity["duration_ms"],
+                    "probe": source_probe,
+                },
+                "cap": {
+                    "max_source_minutes": checkpoint_job_config["source"].get(
+                        "max_source_minutes"
+                    ),
+                    "source_cap_minutes": checkpoint_job_config["source"].get(
+                        "source_cap_minutes"
+                    ),
+                },
+            }
+            compute_checkpoint_store.save_source(
+                checkpoint_store.expected_source_request_key(
+                    checkpoint_job_config
+                ),
+                source_payload,
+                {},
+            )
+        compute_checkpoint_store.bind_source(source_identity)
+
+    # A completed clip plan is the furthest reusable analysis boundary. Load it
+    # before optional source analysis so recovery cannot repeat a best-effort
+    # provider call and render an already-completed plan with different layout
+    # or subtitle-crop decisions.
+    clip_plan_envelope = None
+    if not args.skip_analysis and compute_checkpoint_store is not None:
+        clip_plan_envelope = compute_checkpoint_store.load_current_clip_plan(
+            lambda route: checkpoint_store.expected_clip_plan_key(
+                checkpoint_job_config, source_identity, route,
+            )
+        )
+
     # Layout choice is per SOURCE video, not per clip: one upload and one call
     # instead of one per clip, and the answer is a property of the material
     # ("this is a screencast"), which does not change between its own clips.
     # It runs before any render so the modules are switched on in time.
-    if layout_picker.ENABLED:
+    source_analysis = None
+    source_analysis_checkpoints = {}
+    source_subtitle_band = None
+    if clip_plan_envelope is not None:
+        source_analysis = copy.deepcopy(
+            clip_plan_envelope["payload"]["source_analysis"]
+        )
+        source_analysis_checkpoints = copy.deepcopy(
+            source_analysis.get("checkpoints") or {}
+        )
+        source_subtitle_band = source_analysis.get("source_subtitle_band")
+
+    layout_config = layout_picker.resolve_config(os.environ)
+    if source_analysis is not None:
+        layout_record = source_analysis_checkpoints.get("layout") or {}
+        layout_result = layout_record.get("result")
+        if (
+            layout_config["enabled"]
+            and not layout_config["shadow"]
+            and isinstance(layout_result, dict)
+        ):
+            layout_picker.apply(layout_result)
+        print(
+            "♻️ Reusing source layout/subtitle decisions embedded in the "
+            "completed clip plan."
+        )
+    elif layout_config["enabled"]:
         try:
-            _cap = cv2.VideoCapture(input_video)
-            _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
-            _duration = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) / _fps
-            _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            _cap.release()
+            _duration = float(source_probe.get("duration") or 0)
+            _w = int(source_probe.get("width") or 0)
+            _h = int(source_probe.get("height") or 0)
             from reframe_v2 import source_already_fits  # imports main back
             # A source already shot vertical has no width to reorganise, and
             # the render passes it through whatever the model says. Asking
@@ -2971,27 +3903,143 @@ if __name__ == '__main__':
             if _w and _h and source_already_fits(_w, _h, ASPECT_RATIO):
                 print(f"   ↕️  Source is {_w}x{_h} — already vertical, no layout to pick.")
             else:
-                layout_picker.pick_and_apply(input_video, _duration)
+                layout_frames = layout_picker.sample_frames(
+                    input_video,
+                    layout_config["sample_frames"],
+                    layout_config["sample_width"],
+                )
+                layout_inputs = {
+                    "dimensions": [_w, _h],
+                    "duration_ms": int(round(_duration * 1000)),
+                    "sample_hashes": [
+                        checkpoint_store.sha256_bytes(frame)
+                        for frame in layout_frames
+                    ],
+                }
+                layout_key = None
+                cached_layout = None
+                if compute_checkpoint_store is not None:
+                    layout_key = _source_analysis_key(
+                        "source-layout",
+                        checkpoint_job_config,
+                        source_identity,
+                        layout_config,
+                        layout_inputs,
+                    )
+                    cached_layout = compute_checkpoint_store.load_fixed(
+                        "source-layout", layout_key,
+                    )
+                if cached_layout is not None:
+                    layout_result = cached_layout["payload"]
+                    if not layout_config["shadow"]:
+                        layout_picker.apply(layout_result)
+                    print(
+                        f"♻️ Reusing source layout decision "
+                        f"'{layout_result.get('layout', 'none')}'."
+                    )
+                else:
+                    layout_result = layout_picker.pick_with_provenance(
+                        input_video,
+                        _duration,
+                        layout_config,
+                        layout_frames,
+                    )
+                    if not layout_config["shadow"]:
+                        layout_picker.apply(layout_result)
+                    if compute_checkpoint_store is not None \
+                            and layout_result.get("outcome") == "complete":
+                        compute_checkpoint_store.save_fixed(
+                            "source-layout",
+                            layout_key,
+                            layout_result,
+                            {"semantic_input_hashes": layout_inputs["sample_hashes"]},
+                        )
+                source_analysis_checkpoints["layout"] = {
+                    "compatibility_key": layout_key,
+                    "result": layout_result,
+                }
         except Exception as e:
             print(f"⚠️ Layout choice skipped ({e}) — using the default layout.")
 
     # Subtitles already burned into the source: trim them off each cut clip so
     # our captions are the only text layer (burned_subtitles.py). Only when we
     # caption at all, and never on a vertical source, which is passed through.
-    source_subtitle_band = None
-    if (not args.skip_analysis
+    if (source_analysis is None
+            and not args.skip_analysis
             and os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"):
         try:
             import burned_subtitles
-            _cap = cv2.VideoCapture(input_video)
-            _w = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            _h = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            _cap.release()
+            _w = int(source_probe.get("width") or 0)
+            _h = int(source_probe.get("height") or 0)
             from reframe_v2 import source_already_fits
             if not (_w and _h and source_already_fits(_w, _h, ASPECT_RATIO)):
-                source_subtitle_band = burned_subtitles.detect(input_video)
+                subtitle_config = burned_subtitles.resolve_config()
+                subtitle_frames = (
+                    layout_picker.sample_frames(
+                        input_video,
+                        subtitle_config["sample_frames"],
+                        subtitle_config["sample_width"],
+                    )
+                    if subtitle_config["enabled"] and clip_analysis_enabled()
+                    else []
+                )
+                subtitle_inputs = {
+                    "dimensions": [_w, _h],
+                    "sample_hashes": [
+                        checkpoint_store.sha256_bytes(frame)
+                        for frame in subtitle_frames
+                    ],
+                }
+                subtitle_key = None
+                cached_subtitles = None
+                if compute_checkpoint_store is not None:
+                    subtitle_key = _source_analysis_key(
+                        "source-subtitles",
+                        checkpoint_job_config,
+                        source_identity,
+                        subtitle_config,
+                        subtitle_inputs,
+                    )
+                    cached_subtitles = compute_checkpoint_store.load_fixed(
+                        "source-subtitles", subtitle_key,
+                    )
+                if cached_subtitles is not None:
+                    subtitle_result = cached_subtitles["payload"]
+                    source_subtitle_band = subtitle_result.get("band")
+                    print("♻️ Reusing burned-subtitle source analysis.")
+                else:
+                    subtitle_result = burned_subtitles.detect_with_provenance(
+                        input_video, subtitle_frames, subtitle_config,
+                    )
+                    source_subtitle_band = subtitle_result.get("band")
+                    if compute_checkpoint_store is not None \
+                            and subtitle_result.get("outcome") in {"band", "none"}:
+                        compute_checkpoint_store.save_fixed(
+                            "source-subtitles",
+                            subtitle_key,
+                            subtitle_result,
+                            {
+                                "semantic_input_hashes": subtitle_inputs[
+                                    "sample_hashes"
+                                ]
+                            },
+                        )
+                source_analysis_checkpoints["subtitles"] = {
+                    "compatibility_key": subtitle_key,
+                    "result": subtitle_result,
+                }
         except Exception as e:
             print(f"⚠️ Burned-in subtitle check skipped ({e}).")
+
+    if source_analysis is None:
+        source_analysis = {
+            "source_subtitle_band": source_subtitle_band,
+            "layout_config": (
+                checkpoint_job_config.get("pipeline", {}).get("layouts", [])
+                if checkpoint_job_config else []
+            ),
+            "checkpoints": source_analysis_checkpoints,
+        }
 
     # 2. Decision: Analyze clips or process whole?
     if args.skip_analysis:
@@ -3006,32 +4054,89 @@ if __name__ == '__main__':
         render_clip(input_video, output_file, output_format)
     else:
         # Get duration (needed by both the transcript and the vision path).
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
-        cap.release()
+        # ffprobe already validated the source. Prefer its duration because
+        # OpenCV can report fps/frame_count as zero for codecs it cannot decode
+        # even though ffmpeg can process the file normally.
+        duration = float(source_probe["duration"])
 
-        # 3. Transcribe — unless the video has no audio, in which case use the
-        # configured visual selector (local Ollama or the Gemini fallback).
-        from transcribe_backends import NoAudioError
+        # 3. Transcribe — unless a compatible clip plan already contains the
+        # normalized transcript needed by captions.
         transcript = None
+        asr_payload = None
+        asr_provenance = None
+        clips_data = None
+        if clip_plan_envelope is not None:
+            # Rendering enriches each clip with layout/hook metadata. Keep the
+            # persisted clip-plan payload immutable so render identities remain
+            # stable across retries and restarts.
+            clips_data = copy.deepcopy(clip_plan_envelope["payload"])
+            transcript = clips_data.get("transcript")
+            print("♻️ Reusing the validated clip plan — skipping ASR and selection.")
+
         # Module handover (issue #68): another module already transcribed this
         # exact source with the same backend, so reuse its output. Any problem
         # with the file falls back to transcribing normally rather than failing.
-        if args.transcript:
+        if clips_data is None and args.transcript:
             try:
                 with open(args.transcript, 'r') as f:
                     transcript = json.load(f)
                 if not transcript.get('segments'):
                     raise ValueError("transcript has no segments")
+                transcript_hash = checkpoint_store.sha256_file(
+                    args.transcript
+                )
+                expected_transcript_hash = (
+                    checkpoint_job_config.get("source") or {}
+                ).get("transcript_sha256") if checkpoint_job_config else None
+                if expected_transcript_hash \
+                        and transcript_hash != expected_transcript_hash:
+                    raise ValueError(
+                        "transcript bytes differ from the accepted job"
+                    )
+                immutable_transcript = bool(
+                    expected_transcript_hash
+                    and transcript_hash == expected_transcript_hash
+                )
+                asr_payload = {
+                    "outcome": "speech",
+                    "transcript": transcript,
+                }
+                if not checkpoint_store.valid_asr_payload(
+                    asr_payload, duration
+                ):
+                    raise ValueError(
+                        "transcript shape/timestamps do not match the source"
+                    )
+                asr_provenance = {
+                    "requested_backend": "precomputed",
+                    "effective_route": "precomputed-transcript",
+                    "effective_backend": "external",
+                    "effective_model": "transcript-json",
+                    "immutable_model_revision": (
+                        transcript_hash if immutable_transcript else None
+                    ),
+                    "immutable_revision_available": immutable_transcript,
+                    "device": None,
+                    "compute_type": None,
+                    "fallback_reason_code": None,
+                    "fallback_reason_detail": None,
+                    "attempts": [],
+                    "parameters_hash": checkpoint_store.sha256_bytes(
+                        checkpoint_store.canonical_json_bytes({
+                            "transcript_sha256": transcript_hash,
+                        })
+                    ),
+                    "implementation_version": "asr-precomputed-v1",
+                }
                 print(f"⏩ Reusing precomputed transcript "
                       f"({len(transcript['segments'])} segments) — skipping transcription.")
             except Exception as e:
                 print(f"⚠️ Could not use precomputed transcript ({e}) — transcribing normally.")
                 transcript = None
+                asr_payload = None
+                asr_provenance = None
         early_state = globals().get("early")
-        if transcript is None and early_state is not None:
+        if clips_data is None and transcript is None and early_state is not None:
             with early_state["lock"]:
                 early_state["abandoned"] = True  # a late audio would only duplicate work
                 started = early_state["started"]
@@ -3039,19 +4144,45 @@ if __name__ == '__main__':
                 early_state["done"].wait()
                 if early_state["transcript"] is not None:
                     transcript = early_state["transcript"]
+                    early_asr = early_state.get("asr_result")
+                    if isinstance(early_asr, dict) and isinstance(
+                        early_asr.get("provenance"), dict
+                    ):
+                        asr_payload = {
+                            "outcome": early_asr.get("outcome"),
+                            "transcript": transcript,
+                        }
+                        asr_provenance = early_asr["provenance"]
                     print(f"♻️ Using the transcript made while the video downloaded "
                           f"({len(transcript['segments'])} segments).")
-                    save_transcript_checkpoint(output_dir, transcript, input_video, duration)
-        if transcript is None:
-            transcript = load_transcript_checkpoint(output_dir, input_video, duration)
-            if transcript is not None:
-                print(f"♻️ Reusing the transcript from the interrupted run "
-                      f"({len(transcript['segments'])} segments) — skipping transcription.")
-        if transcript is None:
+        if clips_data is None and transcript is None \
+                and compute_checkpoint_store is not None:
+            loaded_asr = compute_checkpoint_store.load_routed_fixed(
+                "asr",
+                checkpoint_store.validate_asr_route,
+                lambda route: checkpoint_store.expected_asr_key(
+                    checkpoint_job_config, source_identity, route,
+                ),
+            )
+            if loaded_asr is not None:
+                asr_payload = loaded_asr["payload"]
+                asr_provenance = (
+                    (loaded_asr.get("provenance") or {}).get("backend") or {}
+                )
+                transcript = asr_payload.get("transcript")
+                print(
+                    f"♻️ Reusing completed ASR outcome "
+                    f"'{asr_payload['outcome']}' — skipping transcription."
+                )
+
+        if clips_data is None and transcript is None and asr_payload is None:
             if failure_reporter is not None:
-                transcription = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
-                transcription = "parakeet" if transcription == "parakeet" else "whisper"
-                failure_reporter.set_context(transcription)
+                transcription = os.environ.get(
+                    "TRANSCRIBE_BACKEND", "whisper"
+                ).strip().lower()
+                transcription = (
+                    "parakeet" if transcription == "parakeet" else "whisper"
+                )
                 if transcription == "parakeet":
                     from accelerator_runtime import resolve_parakeet_engine
                     backend = resolve_parakeet_engine()
@@ -3059,19 +4190,54 @@ if __name__ == '__main__':
                     from accelerator_runtime import resolve_whisper_engine
                     backend = resolve_whisper_engine()
                 failure_reporter.set_context(transcription, backend, (backend,))
-            try:
-                transcript = transcribe_video(input_video)
-                save_transcript_checkpoint(output_dir, transcript, input_video, duration)
-            except NoAudioError as e:
-                print(f"🔇 {e} — switching to visual analysis.")
+            result = transcribe_video_with_provenance(input_video)
+            asr_payload = {
+                "outcome": result["outcome"],
+                "transcript": result.get("transcript"),
+            }
+            asr_provenance = result["provenance"]
+            transcript = result.get("transcript")
+            if result["outcome"] == "no_audio":
+                print(
+                    f"🔇 {asr_provenance.get('fallback_reason_detail')} — "
+                    "switching to visual analysis."
+                )
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
-        if transcript is not None and speech_is_sparse(transcript, duration):
+        if clips_data is None and transcript is not None \
+                and speech_is_sparse(transcript, duration):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
             print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
                   f"switching to visual analysis.")
+            if asr_payload is not None:
+                asr_payload["outcome"] = "sparse_speech"
+                asr_payload["word_count"] = n_words
             transcript = None
+
+        if clips_data is None and asr_payload is not None \
+                and compute_checkpoint_store is not None \
+                and isinstance(asr_provenance, dict) \
+                and checkpoint_store.valid_asr_payload(
+                    asr_payload, duration
+                ):
+            effective_route = asr_provenance["effective_route"]
+            compute_checkpoint_store.save_fixed(
+                "asr",
+                checkpoint_store.expected_asr_key(
+                    checkpoint_job_config, source_identity, effective_route,
+                ),
+                asr_payload,
+                {
+                    "route_context": effective_route,
+                    "provenance_hashes": [
+                        checkpoint_store.sha256_bytes(
+                            checkpoint_store.canonical_json_bytes(asr_provenance)
+                        )
+                    ],
+                    "backend": asr_provenance,
+                },
+            )
 
         # 4. Clip analysis (transcript-driven, or visual for silent videos)
         if failure_reporter is not None:
@@ -3081,14 +4247,28 @@ if __name__ == '__main__':
             backend = "ollama" if selector_is_ollama else "gemini"
             failure_reporter.set_context("clip_selection", backend, (backend,))
         early_clips = (early_state or {}).get("clips") if early_state else None
-        if (transcript is not None and early_clips
+        if clips_data is not None:
+            pass
+        elif (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):
             print("♻️ Using the clips selected while the video downloaded.")
             clips_data = early_clips
         elif transcript is not None:
-            clips_data = get_viral_clips(transcript, duration)
+            clips_data = get_viral_clips(
+                transcript,
+                duration,
+                checkpoint_store_instance=compute_checkpoint_store,
+                job_config=checkpoint_job_config,
+                source_identity=source_identity,
+            )
         else:
-            clips_data = get_visual_clips(input_video, duration)
+            clips_data = get_visual_clips(
+                input_video,
+                duration,
+                checkpoint_store_instance=compute_checkpoint_store,
+                job_config=checkpoint_job_config,
+                source_identity=source_identity,
+            )
 
         if not clips_data or 'shorts' not in clips_data:
             # Deliberately fail instead of reframing the whole video: that path
@@ -3098,6 +4278,9 @@ if __name__ == '__main__':
                 "Clip detection failed — the AI model did not return usable clips for this video.")
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} clips!")
+            selection_descriptor = clips_data.pop(
+                "_checkpoint_model_descriptor", None,
+            )
 
             # Save metadata. Silent videos have no transcript → no subtitles,
             # which is correct (there's no speech to caption).
@@ -3108,12 +4291,147 @@ if __name__ == '__main__':
             # --keep-original) or in uploads/ (upload jobs).
             clips_data['source_video'] = os.path.basename(input_video)
             clips_data['output_format'] = output_format
-            if source_subtitle_band:
+            if source_subtitle_band is not None:
                 clips_data['source_subtitle_band'] = source_subtitle_band
-            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            with open(metadata_file, 'w') as f:
-                json.dump(clips_data, f, indent=2)
+            else:
+                clips_data.pop("source_subtitle_band", None)
+            clips_data["source_analysis"] = copy.deepcopy(source_analysis)
+
+            selection_route = (
+                "speech-local" if transcript is not None and llm_backend.active()
+                else "speech-gemini" if transcript is not None
+                else "silent-local" if vision_backend.active()
+                else "silent-gemini"
+            )
+            if clip_plan_envelope is None and compute_checkpoint_store is not None \
+                    and asr_payload is not None \
+                    and isinstance(asr_provenance, dict):
+                route_context = {
+                    "selection_route": selection_route,
+                    "asr_effective_route": asr_provenance["effective_route"],
+                    "asr_outcome": asr_payload["outcome"],
+                    "selection_model_revision": (
+                        selection_descriptor.get("digest")
+                        if selection_route == "silent-local"
+                        and isinstance(selection_descriptor, dict)
+                        else (
+                            checkpoint_job_config.get("text_selection") or {}
+                        ).get("immutable_model_revision")
+                        if selection_route == "speech-local"
+                        else None
+                    ),
+                }
+                plan_key = checkpoint_store.expected_clip_plan_key(
+                    checkpoint_job_config, source_identity, route_context,
+                )
+                plan_payload = copy.deepcopy(clips_data)
+                plan_saved = compute_checkpoint_store.save_fixed(
+                    "clip-plan",
+                    plan_key,
+                    plan_payload,
+                    {
+                        "route_context": route_context,
+                        "provenance_hashes": [
+                            checkpoint_store.sha256_bytes(
+                                checkpoint_store.canonical_json_bytes(asr_payload)
+                            )
+                        ],
+                    },
+                )
+                clip_plan_envelope = {
+                    "compatibility_key": plan_key,
+                    "payload_hash": checkpoint_store.sha256_bytes(
+                        checkpoint_store.canonical_json_bytes(plan_payload)
+                    ),
+                    "payload": plan_payload,
+                    "checkpointed": plan_saved,
+                }
+
+            metadata_name = (
+                f"{checkpoint_job_config['job_id']}_metadata.json"
+                if checkpoint_job_config else f"{video_title}_metadata.json"
+            )
+            metadata_file = os.path.join(output_dir, metadata_name)
+            metadata_payload = dict(clips_data)
+            metadata_payload.update({
+                "job_id": checkpoint_job_config.get("job_id")
+                if checkpoint_job_config else None,
+                "execution_generation": args.execution_generation,
+                "planned_clip_count": len(clips_data["shorts"]),
+                "clip_plan_compatibility_key": (
+                    clip_plan_envelope.get("compatibility_key")
+                    if clip_plan_envelope else None
+                ),
+            })
+            metadata_plan_hash = checkpoint_store.sha256_bytes(
+                checkpoint_store.canonical_json_bytes(metadata_payload["shorts"])
+            )
+            metadata_payload["plan_hash"] = metadata_plan_hash
+            job_state.atomic_write_json(metadata_file, metadata_payload, mode=0o644)
             print(f"   Saved metadata to {metadata_file}")
+            print(
+                f"CLIP_PLAN_READY {args.execution_generation or 0} "
+                f"{metadata_name} {metadata_plan_hash} "
+                f"{len(clips_data['shorts'])}",
+                flush=True,
+            )
+
+            shorts = clips_data["shorts"]
+            render_keys = {}
+            render_clip_identities = {}
+            reusable_render_indices = set()
+            if compute_checkpoint_store is not None and clip_plan_envelope is not None:
+                for render_index, planned_clip in enumerate(shorts):
+                    immutable_planned_clip = (
+                        clip_plan_envelope["payload"]["shorts"][render_index]
+                    )
+                    render_clip_identities[render_index] = (
+                        checkpoint_store.sha256_bytes(
+                            checkpoint_store.canonical_json_bytes(
+                                immutable_planned_clip
+                            )
+                        )
+                    )
+                    render_key = checkpoint_store.expected_render_key(
+                        checkpoint_job_config,
+                        source_identity,
+                        clip_plan_envelope,
+                        immutable_planned_clip,
+                        source_analysis,
+                    )
+                    render_keys[render_index] = render_key
+                    cached_render = compute_checkpoint_store.load_keyed(
+                        "render", render_key,
+                    )
+                    cached_payload = (
+                        (cached_render or {}).get("payload") or {}
+                    )
+                    artifact = cached_payload.get("artifact")
+                    if (
+                        cached_payload.get("display_index") == render_index
+                        and cached_payload.get("clip_identity")
+                        == render_clip_identities[render_index]
+                        and isinstance(artifact, dict)
+                        and checkpoint_store.artifact_matches_clip_duration(
+                            artifact, immutable_planned_clip,
+                        )
+                        and compute_checkpoint_store.validate_artifact(artifact)
+                    ):
+                        reusable_render_indices.add(render_index)
+                        rendered_metadata = (
+                            cached_payload.get("clip_metadata")
+                        )
+                        if isinstance(rendered_metadata, dict):
+                            planned_clip.update(rendered_metadata)
+                        print(
+                            f"♻️ Reusing completed render for clip "
+                            f"{render_index + 1}."
+                        )
+                        print(
+                            f"CLIP_READY {render_index} "
+                            f"{artifact['relative_path']}",
+                            flush=True,
+                        )
 
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
@@ -3127,7 +4445,11 @@ if __name__ == '__main__':
                 print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
                 print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
 
-                clip_filename = f"{video_title}_clip_{i+1}.mp4"
+                render_key = render_keys.get(i)
+                clip_filename = (
+                    f"clip-{render_key[:16]}.mp4"
+                    if render_key else f"{video_title}_clip_{i+1}.mp4"
+                )
                 clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
                 clip_final_path = os.path.join(output_dir, clip_filename)
 
@@ -3180,7 +4502,67 @@ if __name__ == '__main__':
                         served = captioned or deliver_path
                         if os.environ.get("WATERMARK") == "1":
                             served = mark_delivery(served)
+                        render_probe = _probe_source(served)
+                        if (
+                            not os.path.isfile(served)
+                            or os.path.getsize(served) <= 0
+                            or float(render_probe.get("duration") or 0) <= 0
+                        ):
+                            raise RuntimeError(
+                                f"Clip {i + 1} render completed without a "
+                                "playable media artifact"
+                            )
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+                        if compute_checkpoint_store is not None \
+                                and render_key is not None:
+                            artifact = {
+                                "relative_path": os.path.relpath(
+                                    served, checkpoint_project,
+                                ),
+                                "size": os.path.getsize(served),
+                                "sha256": checkpoint_store.sha256_file(served),
+                                "duration_ms": int(round(
+                                    render_probe["duration"] * 1000
+                                )),
+                                "probe": render_probe,
+                            }
+                            if not checkpoint_store.artifact_matches_clip_duration(
+                                artifact, clip,
+                            ):
+                                raise RuntimeError(
+                                    f"Clip {i + 1} render duration "
+                                    f"({render_probe['duration']:.3f}s) does "
+                                    f"not match its planned "
+                                    f"{(end - start):.3f}s cut"
+                                )
+                            compute_checkpoint_store.save_keyed(
+                                "render",
+                                render_key,
+                                {
+                                    "clip_identity": render_clip_identities[i],
+                                    "display_index": i,
+                                    "artifact": artifact,
+                                    "clip_metadata": {
+                                        key: clip[key] for key in (
+                                            "layout_ranges", "auto_hook",
+                                            "hook_grounding",
+                                        ) if key in clip
+                                    },
+                                },
+                                {
+                                    "upstream_compatibility_keys": [
+                                        clip_plan_envelope["compatibility_key"]
+                                    ],
+                                    "semantic_input_hashes": [
+                                        clip_plan_envelope["payload_hash"],
+                                        checkpoint_store.sha256_bytes(
+                                            checkpoint_store.canonical_json_bytes(
+                                                source_analysis
+                                            )
+                                        ),
+                                    ],
+                                },
+                            )
                         # Hand the API the file to actually serve for this clip.
                         # Without it the status poller guesses the clean reframe
                         # name, so a job in flight showed every clip stripped of
@@ -3199,7 +4581,6 @@ if __name__ == '__main__':
             # job finished 16% sooner with the same CPU, and the peak VRAM stayed
             # at 12 GB of 20 (bench, 25-sep-2026).
             clip_workers = max(int(os.environ.get("CLIP_WORKERS", "6")), 1)
-            shorts = clips_data['shorts']
             failed = []
             if os.environ.get("WATERMARK") == "1":
                 # Tells the /videos guard that the clean twins in this
@@ -3210,8 +4591,11 @@ if __name__ == '__main__':
                 # Best clip first: the pool starts work in submission order, so
                 # the user's first delivered clip is the strongest one instead
                 # of whatever came first in the video.
-                futures = {pool.submit(_process_one_clip, i, shorts[i]): i
-                           for i in clip_render_order(shorts)}
+                futures = {
+                    pool.submit(_process_one_clip, i, shorts[i]): i
+                    for i in clip_render_order(shorts)
+                    if i not in reusable_render_indices
+                }
                 for future in as_completed(futures):
                     i = futures[future]
                     try:
@@ -3242,19 +4626,34 @@ if __name__ == '__main__':
                 raise worker_failure.WorkerFailure(
                     "incomplete_output", "render", "ffmpeg", ("ffmpeg",))
 
-            # Persist per-clip render results added by the workers (auto_hook)
-            # so the editor can see what is already burned into each clip.
-            if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
-                with open(metadata_file, 'w') as f:
-                    json.dump(clips_data, f, indent=2)
+            # Persist per-clip facts added by the workers so the editor sees
+            # what is already burned into each clip. These mutations change the
+            # metadata plan hash, so publish the file and its updated handoff
+            # marker together. Otherwise app.py correctly rejects the terminal
+            # job because the old CLIP_PLAN_READY hash no longer describes the
+            # enriched metadata JSON.
+            metadata_payload.update(clips_data)
+            final_metadata_plan_hash = checkpoint_store.sha256_bytes(
+                checkpoint_store.canonical_json_bytes(
+                    metadata_payload["shorts"]
+                )
+            )
+            metadata_payload["plan_hash"] = final_metadata_plan_hash
+            job_state.atomic_write_json(
+                metadata_file, metadata_payload, mode=0o644,
+            )
+            if final_metadata_plan_hash != metadata_plan_hash:
+                print(
+                    f"CLIP_PLAN_READY {args.execution_generation or 0} "
+                    f"{metadata_name} {final_metadata_plan_hash} "
+                    f"{len(metadata_payload['shorts'])}",
+                    flush=True,
+                )
 
     # Clean up original if requested
-    if args.url and not args.keep_original and os.path.exists(input_video):
+    if args.url and not args.keep_original and os.path.exists(input_video) \
+            and checkpoint_store_instance is None:
         os.remove(input_video)
         print(f"🗑️  Cleaned up downloaded video.")
-    # The job finished: a later run in this directory must transcribe afresh.
-    if not args.skip_analysis:
-        clear_transcript_checkpoint(output_dir)
-
     total_time = time.time() - script_start_time
     print(f"\n⏱️  Total execution time: {total_time:.2f}s")
