@@ -6,3 +6,4 @@ huggingface-hub==2.2.0
 mlx==0.32.4
 mlx-whisper==0.4.3
 parakeet-mlx==0.5.3
+psutil>=5.9,<8

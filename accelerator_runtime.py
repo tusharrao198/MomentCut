@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 import sys
 
 
@@ -28,6 +29,59 @@ def platform_kind() -> str:
     if shutil.which("nvidia-smi"):
         return "nvidia"
     return "cpu"
+
+
+def resolve_memory_admission_backend(value=None) -> str:
+    """Select the host-wide memory signal used before starting a job."""
+    requested = (
+        os.environ.get("MEMORY_ADMISSION_BACKEND", "auto")
+        if value is None else value
+    )
+    requested = str(requested or "auto").strip().lower()
+    if requested not in {"auto", "nvidia", "macos", "count"}:
+        raise AcceleratorConfigurationError(
+            "MEMORY_ADMISSION_BACKEND must be auto, nvidia, macos, or count"
+        )
+    if requested != "auto":
+        return requested
+    kind = platform_kind()
+    if kind == "nvidia":
+        return "nvidia"
+    if kind == "apple":
+        return "macos"
+    return "count"
+
+
+def nvidia_free_mb():
+    """Read free memory on NVIDIA GPU 0, or return None when unavailable."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+                "-i",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(float(result.stdout.strip().splitlines()[0]))
+    except Exception:
+        pass
+    return None
+
+
+def host_available_mb():
+    """Read host-available memory in MiB, or return None when unavailable."""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available // (1024 * 1024))
+    except Exception:
+        return None
 
 
 def resolve_whisper_engine(value=None) -> str:
