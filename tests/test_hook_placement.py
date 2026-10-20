@@ -2,7 +2,9 @@
 exactly the old spot when there is no face. Faces are synthetic boxes in
 frame fractions (x0, y0, x1, y1), the shape hook_placement.detect_faces
 returns."""
+import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -148,6 +150,9 @@ class TestAddHookToVideo:
 
         def run(cmd, **kw):
             calls["cmd"] = cmd
+            for index, arg in enumerate(cmd):
+                if str(arg).endswith(".mp4") and cmd[index - 1] != "-i":
+                    open(arg, "wb").write(b"x")
             return subprocess.CompletedProcess(cmd, 0, b"", b"")
         monkeypatch.setattr(hooks.subprocess, "run", run)
         video = tmp_path / "clip.mp4"
@@ -245,6 +250,48 @@ class TestAddHookToVideo:
         monkeypatch.setattr(hooks.subprocess, "run", run)
         with pytest.raises(subprocess.CalledProcessError):
             hooks.add_hook_to_video(video, "Hi", out, position="top")
+
+    def test_videotoolbox_failure_replays_every_output(
+            self, monkeypatch, fake_ffmpeg, tmp_path):
+        hooks, _calls, video = fake_ffmpeg
+        import ffmpeg_utils
+
+        monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+        monkeypatch.setattr(ffmpeg_utils, "_videotoolbox_ok", True)
+        monkeypatch.setattr(ffmpeg_utils, "_announced_encoders", set())
+        monkeypatch.setattr(
+            hooks.gpu_decode, "run",
+            lambda build, runner, **_kwargs: runner(build(False)))
+
+        outputs = [
+            str(tmp_path / name)
+            for name in ("hooked.mp4", "captioned.mp4", "marked.mp4")
+        ]
+        attempts = []
+        partial_removed = []
+
+        def run(command, **_kwargs):
+            attempts.append(command)
+            if "h264_videotoolbox" in command:
+                Path(outputs[0]).write_bytes(b"partial")
+                return subprocess.CompletedProcess(command, 1, b"", b"failed")
+            partial_removed.append(not os.path.exists(outputs[0]))
+            for output in outputs:
+                Path(output).write_bytes(b"complete")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        monkeypatch.setattr(hooks.subprocess, "run", run)
+        hooks.add_hook_to_video(
+            video, "Hi", outputs[0], position="top",
+            also=("null", outputs[1]),
+            mark=("logo.png", lambda *_args, **_kwargs: "[2:v]null[m]", outputs[2]),
+        )
+
+        assert len(attempts) == 2
+        assert "h264_videotoolbox" in attempts[0]
+        assert "libx264" in attempts[1]
+        assert partial_removed == [True]
+        assert all(Path(path).read_bytes() == b"complete" for path in outputs)
 
     def test_mark_without_captions_is_ignored(self, fake_ffmpeg, tmp_path):
         hooks, calls, video = fake_ffmpeg

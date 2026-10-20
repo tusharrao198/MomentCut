@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 import gemini_worker
 from edit_builder import build_filter_string
-from ffmpeg_utils import video_encode_args, QUALITY, METADATA_SCRUB
+from ffmpeg_utils import QUALITY, METADATA_SCRUB, run_encode
 
 
 class EditDecision(BaseModel):
@@ -489,33 +489,45 @@ class VideoEditor:
 
         print(f"🎬 Executing AI Filter: {filter_string}")
 
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', input_path,
-            '-vf', filter_string,
-            *video_encode_args(QUALITY),
-            '-c:a', 'copy',
-            *METADATA_SCRUB,
-            '-movflags', '+faststart',
-            output_path
-        ]
-        
+        def build(encode_args):
+            return [
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-vf', filter_string,
+                *encode_args,
+                '-c:a', 'copy',
+                *METADATA_SCRUB,
+                '-movflags', '+faststart',
+                output_path,
+            ]
+
+        def execute(command):
+            # Passing UTF-8 bytes avoids filesystem-encoding failures on
+            # minimal images while keeping the caller's existing contract.
+            command_bytes = [
+                arg.encode('utf-8') if isinstance(arg, str) else arg
+                for arg in command
+            ]
+            return subprocess.run(
+                command_bytes, check=True, env=env, timeout=1800)
+
         try:
-            # We must encode arguments if filesystem is ascii but we have unicode chars
-            # But subprocess in Python 3 handles unicode args by encoding them with os.fsencode().
-            # If sys.getfilesystemencoding() is ascii, this fails.
-            # We can't change fs encoding at runtime easily.
-            # Workaround: pass bytes directly? subprocess allows bytes in args.
-            
-            # Convert command elements to bytes assuming utf-8 if they are strings
-            cmd_bytes = []
-            for arg in cmd:
-                if isinstance(arg, str):
-                    cmd_bytes.append(arg.encode('utf-8'))
-                else:
-                    cmd_bytes.append(arg)
-            
-            subprocess.run(cmd_bytes, check=True, env=env, timeout=1800)
+            result = run_encode(
+                build,
+                execute,
+                lambda completed: (
+                    completed.returncode == 0
+                    and os.path.isfile(output_path)
+                    and os.path.getsize(output_path) > 0
+                ),
+                lambda: (
+                    os.path.isfile(output_path) and os.remove(output_path)
+                ),
+                tier=QUALITY,
+            )
+            if (result.returncode != 0 or not os.path.isfile(output_path)
+                    or os.path.getsize(output_path) == 0):
+                raise RuntimeError("FFmpeg completed without a usable output")
         except subprocess.TimeoutExpired:
             print("❌ FFmpeg filter timed out after 1800s.")
             raise RuntimeError("FFmpeg filter timed out after 1800s.")

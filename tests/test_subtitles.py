@@ -270,12 +270,16 @@ class TestBurnFilterFonts:
 
         def fake_run(cmd, **kwargs):
             captured["cmd"] = cmd
+            for index, arg in enumerate(cmd):
+                if str(arg).endswith(".mp4") and cmd[index - 1] != "-i":
+                    open(arg, "wb").write(b"x")
             return _Ok()
 
         monkeypatch.setattr(m.subprocess, "run", fake_run)
         srt = tmp_path / srt_name
         srt.write_text("stub", encoding="utf-8")
-        m.burn_subtitles("in.mp4", str(srt), "out.mp4", font_name="Impact")
+        m.burn_subtitles(
+            "in.mp4", str(srt), str(tmp_path / "out.mp4"), font_name="Impact")
         return " ".join(str(c) for c in captured["cmd"])
 
     def test_srt_filter_includes_fontsdir(self, monkeypatch, tmp_path):
@@ -425,12 +429,17 @@ class TestBurnWithMark:
     def test_without_mark_the_command_is_unchanged(self, monkeypatch, tmp_path):
         import subtitles as m
         captured = {}
-        monkeypatch.setattr(m.subprocess, "run",
-                            lambda cmd, **kw: captured.setdefault("cmd", cmd) and
-                            subprocess.CompletedProcess(cmd, 0, b"", b""))
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            open(cmd[-1], "wb").write(b"x")
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+        monkeypatch.setattr(m.subprocess, "run", fake_run)
         srt = tmp_path / "subs.ass"
         srt.write_text("stub", encoding="utf-8")
-        m.burn_subtitles("in.mp4", str(srt), "out.mp4")
+        output = str(tmp_path / "out.mp4")
+        m.burn_subtitles("in.mp4", str(srt), output)
         cmd = captured["cmd"]
         assert cmd[:5] == ["ffmpeg", "-y", "-i", "in.mp4", "-vf"]
-        assert cmd[5:8] == [cmd[5], "-c:a", "copy"] and cmd[-1] == "out.mp4"
+        assert cmd[5:8] == [cmd[5], "-c:a", "copy"] and cmd[-1] == output

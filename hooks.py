@@ -6,7 +6,8 @@ import urllib.request
 import uuid
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-from ffmpeg_utils import video_encode_args, QUALITY, METADATA_SCRUB, finished_before_crash
+from ffmpeg_utils import (QUALITY, METADATA_SCRUB, finished_before_crash,
+                          run_encode)
 import gpu_decode
 
 
@@ -733,57 +734,86 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         
         overlay = (f"[0:v][1:v]overlay={overlay_x}:{overlay_y}"
                    + (f":enable='between(t,0,{float(duration)})'" if duration else ""))
-        tail = ['-c:a', 'copy', *video_encode_args(QUALITY), *METADATA_SCRUB,
-                '-movflags', '+faststart']
-        if also and mark:
-            extra_vf, extra_path = also
-            logo_path, make_filter, mark_path = mark
-            marked = make_filter(video_width, video_height, video="[sm]",
-                                 logo="[2:v]", out="[m]")
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-i', img_path,
-                '-i', logo_path,
-                '-filter_complex',
-                f"{overlay},split=2[h][c];[c]{extra_vf},split=2[s][sm];{marked}",
-                '-map', '[h]', '-map', '0:a?', *tail, output_path,
-                '-map', '[s]', '-map', '0:a?', *tail, extra_path,
-                '-map', '[m]', '-map', '0:a?', *tail, mark_path,
-            ]
-        elif also:
-            extra_vf, extra_path = also
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-i', img_path,
-                '-filter_complex', f"{overlay},split=2[h][c];[c]{extra_vf}[s]",
-                '-map', '[h]', '-map', '0:a?', *tail, output_path,
-                '-map', '[s]', '-map', '0:a?', *tail, extra_path,
-            ]
-        else:
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-i', img_path,
-                '-filter_complex', overlay,
-                *tail,
-                output_path
-            ]
-        
         outputs = [output_path]
         if also:
             outputs.append(also[1])
             if mark:
                 outputs.append(mark[2])
-        result = gpu_decode.run(
-            lambda on_gpu: gpu_decode.on_card(ffmpeg_cmd, video_path) if on_gpu else ffmpeg_cmd,
-            lambda cmd: subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       timeout=1800),
-            ok=lambda r: r.returncode == 0 or finished_before_crash(r, outputs),
-            path=video_path)
-        if result.returncode != 0 and not finished_before_crash(result, outputs):
-            raise subprocess.CalledProcessError(result.returncode, ffmpeg_cmd,
+
+        def build(encode_args):
+            tail = ['-c:a', 'copy', *encode_args, *METADATA_SCRUB,
+                    '-movflags', '+faststart']
+            if also and mark:
+                extra_vf, extra_path = also
+                logo_path, make_filter, mark_path = mark
+                marked = make_filter(
+                    video_width, video_height, video="[sm]",
+                    logo="[2:v]", out="[m]")
+                return [
+                    'ffmpeg', '-y',
+                    '-i', video_path,
+                    '-i', img_path,
+                    '-i', logo_path,
+                    '-filter_complex',
+                    f"{overlay},split=2[h][c];"
+                    f"[c]{extra_vf},split=2[s][sm];{marked}",
+                    '-map', '[h]', '-map', '0:a?', *tail, output_path,
+                    '-map', '[s]', '-map', '0:a?', *tail, extra_path,
+                    '-map', '[m]', '-map', '0:a?', *tail, mark_path,
+                ]
+            if also:
+                extra_vf, extra_path = also
+                return [
+                    'ffmpeg', '-y',
+                    '-i', video_path,
+                    '-i', img_path,
+                    '-filter_complex', f"{overlay},split=2[h][c];[c]{extra_vf}[s]",
+                    '-map', '[h]', '-map', '0:a?', *tail, output_path,
+                    '-map', '[s]', '-map', '0:a?', *tail, extra_path,
+                ]
+            return [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-i', img_path,
+                '-filter_complex', overlay,
+                *tail,
+                output_path,
+            ]
+
+        def complete(result):
+            files_ok = all(
+                os.path.isfile(path) and os.path.getsize(path) > 0
+                for path in outputs
+            )
+            return (result.returncode == 0 and files_ok) or finished_before_crash(
+                result, outputs)
+
+        def execute(command):
+            return gpu_decode.run(
+                lambda on_gpu: (
+                    gpu_decode.on_card(command, video_path) if on_gpu else command
+                ),
+                lambda candidate: subprocess.run(
+                    candidate, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=1800),
+                ok=complete,
+                path=video_path,
+            )
+
+        def remove_partial_outputs():
+            for path in outputs:
+                if os.path.isfile(path):
+                    os.remove(path)
+
+        result = run_encode(
+            build,
+            execute,
+            complete,
+            remove_partial_outputs,
+            tier=QUALITY,
+        )
+        if not complete(result):
+            raise subprocess.CalledProcessError(result.returncode, result.args,
                                                 result.stdout, result.stderr)
         print(f"✅ Hook added to {output_path}")
         if placed:

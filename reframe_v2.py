@@ -28,7 +28,7 @@ import punch_in
 import screencast_layout
 import layout_ranges
 import split_layout
-from ffmpeg_utils import (video_encode_args, blurred_backdrop, escape_filter_value,
+from ffmpeg_utils import (blurred_backdrop, escape_filter_value, run_encode,
                           QUALITY_FAST, METADATA_SCRUB)
 
 ANALYSIS_MAX_WIDTH = 640
@@ -524,22 +524,45 @@ def _run_segment(input_video, ss, dur, extra_inputs, graph, out_label, seg_path)
     """Encode one scene. The clip is decoded on the card when it can
     (gpu_decode: the same frames, so the same segment) and on the CPU if that
     ffmpeg fails."""
-    def build(on_gpu):
-        on_gpu = on_gpu and gpu_decode.graph_ok(graph)
-        return [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}",
-            *gpu_decode.input_args(on_gpu), "-i", input_video, *extra_inputs,
-            "-filter_complex", gpu_decode.graph(graph, on_gpu), "-map", out_label,
-            *video_encode_args(QUALITY_FAST), "-an", seg_path,
-        ]
+    def build(encode_args):
+        def command(on_gpu):
+            on_gpu = on_gpu and gpu_decode.graph_ok(graph)
+            return [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}",
+                *gpu_decode.input_args(on_gpu), "-i", input_video, *extra_inputs,
+                "-filter_complex", gpu_decode.graph(graph, on_gpu), "-map", out_label,
+                *encode_args, "-an", seg_path,
+            ]
+        return command
 
-    def runner(cmd):
-        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                              timeout=1800)
+    def execute(command):
+        return gpu_decode.run(
+            command,
+            lambda candidate: subprocess.run(
+                candidate, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=1800),
+            ok=lambda completed: (
+                completed.returncode == 0
+                and os.path.isfile(seg_path)
+                and os.path.getsize(seg_path) > 0
+            ),
+            path=input_video,
+        )
 
-    result = gpu_decode.run(build, runner, path=input_video)
-    if result.returncode != 0:
+    result = run_encode(
+        build,
+        execute,
+        lambda completed: (
+            completed.returncode == 0
+            and os.path.isfile(seg_path)
+            and os.path.getsize(seg_path) > 0
+        ),
+        lambda: os.path.isfile(seg_path) and os.remove(seg_path),
+        tier=QUALITY_FAST,
+    )
+    if (result.returncode != 0 or not os.path.isfile(seg_path)
+            or os.path.getsize(seg_path) == 0):
         raise subprocess.CalledProcessError(result.returncode, result.args,
                                             result.stdout, result.stderr)
 
