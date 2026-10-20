@@ -788,22 +788,23 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             return (result.returncode == 0 and files_ok) or finished_before_crash(
                 result, outputs)
 
-        def execute(command):
-            return gpu_decode.run(
-                lambda on_gpu: (
-                    gpu_decode.on_card(command, video_path) if on_gpu else command
-                ),
+        def remove_partial_outputs():
+            for path in outputs:
+                if os.path.isfile(path):
+                    os.remove(path)
+
+        def execute(command, backend=None):
+            return gpu_decode.run_command(
+                command,
                 lambda candidate: subprocess.run(
                     candidate, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     timeout=1800),
                 ok=complete,
                 path=video_path,
+                backend=backend,
+                before_cpu_retry=remove_partial_outputs,
+                retry_videotoolbox="h264_videotoolbox" not in command,
             )
-
-        def remove_partial_outputs():
-            for path in outputs:
-                if os.path.isfile(path):
-                    os.remove(path)
 
         result = run_encode(
             build,
@@ -811,6 +812,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             complete,
             remove_partial_outputs,
             tier=QUALITY,
+            fallback_run_command=lambda command: execute(command, "cpu"),
         )
         if not complete(result):
             raise subprocess.CalledProcessError(result.returncode, result.args,

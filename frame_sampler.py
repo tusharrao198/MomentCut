@@ -66,8 +66,11 @@ def read_at_path(video_path, cap, indices, max_forward=MAX_FORWARD):
     """
     indices = [int(i) for i in indices]
     if (not indices or indices[0] < 0
-            or any(b < a for a, b in zip(indices, indices[1:]))
-            or not gpu_decode.usable(video_path)):
+            or any(b < a for a, b in zip(indices, indices[1:]))):
+        yield from read_at(cap, indices, max_forward)
+        return
+    attempt = gpu_decode.select_attempt(video_path, render=False)
+    if not attempt.is_hardware:
         yield from read_at(cap, indices, max_forward)
         return
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -79,15 +82,28 @@ def read_at_path(video_path, cap, indices, max_forward=MAX_FORWARD):
     frame_bytes = width * height * 3
     expr = gpu_decode.any_of(f"eq(n,{i})" for i in unique)
     errors = tempfile.TemporaryFile()
-    proc = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", *gpu_decode.HW_ARGS, "-i", video_path,
-         "-vf", f"select='{expr}',{gpu_decode.DOWNLOAD}", "-fps_mode", "passthrough",
-         "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-        stdout=subprocess.PIPE, stderr=errors, bufsize=frame_bytes)
+    command = [
+        "ffmpeg", "-loglevel", "error", *gpu_decode.input_args(attempt),
+        "-i", video_path,
+        "-vf", f"select='{expr}',{gpu_decode.download_filter(attempt)}",
+        "-fps_mode", "passthrough",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+    ]
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=errors, bufsize=frame_bytes)
+    except (OSError, subprocess.SubprocessError) as error:
+        errors.close()
+        gpu_decode.note(attempt, failed=True)
+        print(f"   ⚠️ {attempt.backend} frame sampling could not start "
+              f"({type(error).__name__}: {error}), reading on the CPU")
+        yield from read_at(cap, indices, max_forward)
+        return
     done = 0           # how many of ``indices`` were answered from the card
     last = (None, None)
     ended = False
     failed = False
+    read_error = None
     try:
         for idx in indices:
             if idx == last[0]:
@@ -111,17 +127,22 @@ def read_at_path(video_path, cap, indices, max_forward=MAX_FORWARD):
             last = (idx, frame)
             done += 1
             yield frame
+    except (OSError, subprocess.SubprocessError) as error:
+        failed = True
+        read_error = error
     finally:
         if not proc.stdout.closed:
             proc.stdout.close()
         proc.kill()
         proc.wait()
-    gpu_decode.note(True, failed=failed)
+    gpu_decode.note(attempt, failed=failed)
     errors.seek(0)
     detail = errors.read()[-200:].decode(errors="replace").strip().replace("\n", " | ")
     errors.close()
     if failed:
-        print(f"   ⚠️ GPU frame sampling failed (exit {proc.returncode}, "
+        if read_error:
+            detail = f"{type(read_error).__name__}: {read_error}"
+        print(f"   ⚠️ {attempt.backend} frame sampling failed (exit {proc.returncode}, "
               f"{done}/{len(indices)} read: {detail or 'no message'}), "
               f"reading the rest on the CPU")
         yield from read_at(cap, indices[done:], max_forward)

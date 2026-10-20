@@ -1548,11 +1548,13 @@ def apply_watermark(video_path, output_path=None):
                 *encode_args, "-c:a", "copy", *METADATA_SCRUB,
                 "-movflags", "+faststart", tmp_path]
 
-    def execute(command):
-        return gpu_decode.run(
-            lambda on_gpu: (
-                gpu_decode.on_card(command, video_path) if on_gpu else command
-            ),
+    def remove_partial():
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+
+    def execute(command, backend=None):
+        return gpu_decode.run_command(
+            command,
             lambda candidate: subprocess.run(
                 candidate, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 timeout=1800),
@@ -1562,6 +1564,9 @@ def apply_watermark(video_path, output_path=None):
                 and os.path.getsize(tmp_path) > 0
             ),
             path=video_path,
+            backend=backend,
+            before_cpu_retry=remove_partial,
+            retry_videotoolbox="h264_videotoolbox" not in command,
         )
 
     result = run_encode(
@@ -1572,8 +1577,9 @@ def apply_watermark(video_path, output_path=None):
             and os.path.isfile(tmp_path)
             and os.path.getsize(tmp_path) > 0
         ),
-        lambda: os.path.isfile(tmp_path) and os.remove(tmp_path),
+        remove_partial,
         tier=QUALITY,
+        fallback_run_command=lambda command: execute(command, "cpu"),
     )
     if (result.returncode == 0 and os.path.isfile(tmp_path)
             and os.path.getsize(tmp_path) > 0):
