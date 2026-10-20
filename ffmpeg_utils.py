@@ -17,6 +17,7 @@ import threading
 import time
 
 from accelerator_runtime import is_apple_silicon
+import gpu_decode
 
 # Quality tiers pinning the historical libx264 settings.
 QUALITY = "quality"            # was: -preset medium -crf 18
@@ -317,12 +318,15 @@ def _disable_videotoolbox():
 
 
 def run_encode(build_command, run_command, validate_outputs,
-               remove_partial_outputs, *, tier=QUALITY):
+               remove_partial_outputs, *, tier=QUALITY,
+               fallback_run_command=None):
     """Run one replayable encode, retrying only VideoToolbox with x264.
 
     ``build_command`` receives the codec arguments. ``validate_outputs`` owns
-    the caller's existing success definition. A successful x264 replay disables
-    VideoToolbox for later operations in this process.
+    the caller's existing success definition. ``fallback_run_command`` lets a
+    combined VideoToolbox operation force CPU decoding for its x264 replay. A
+    successful x264 replay disables VideoToolbox for later operations in this
+    process.
     """
     encoder = selected_video_encoder(tier)
     _announce_encoder(encoder)
@@ -333,6 +337,8 @@ def run_encode(build_command, run_command, validate_outputs,
     command = build_command(_video_encode_args(tier, encoder))
     try:
         result = run_command(command)
+    except gpu_decode.DecodeConfigurationError:
+        raise
     except Exception:
         if encoder != VIDEOTOOLBOX:
             raise
@@ -342,7 +348,7 @@ def run_encode(build_command, run_command, validate_outputs,
 
     remove_partial_outputs()
     fallback_command = build_command(_video_encode_args(tier, X264))
-    result = run_command(fallback_command)
+    result = (fallback_run_command or run_command)(fallback_command)
     if validate_outputs(result):
         _disable_videotoolbox()
         print("⚠️ [Encoder] VideoToolbox render failed; completed the operation "
@@ -464,6 +470,9 @@ def _source_format(path):
 def _gpu_cut_ok(input_video):
     if os.environ.get("FFMPEG_GPU_CUT", "1").strip() == "0":
         return False
+    decode_mode = os.environ.get("VIDEO_DECODE_BACKEND", "auto").strip().lower()
+    if decode_mode not in {"auto", "cuda"}:
+        return False
     mode = os.environ.get("FFMPEG_ENCODER", "x264").strip().lower()
     if mode not in ("nvenc", "auto"):
         return False
@@ -517,6 +526,24 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
         gpu_command = ['ffmpeg', '-y', '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda',
                        '-ss', str(start), '-to', str(end), '-i', input_video,
                        *gpu_args, *audio_encode_args(), clip_temp_path]
+    videotoolbox_attempt = None
+    videotoolbox_command = None
+    decode_mode = os.environ.get("VIDEO_DECODE_BACKEND", "auto").strip().lower()
+    if decode_mode not in {"auto", "cuda", "videotoolbox", "cpu"}:
+        gpu_decode.select_attempt(input_video, render=True)
+    if (not gpu_command
+            and os.environ.get("FFMPEG_GPU_CUT", "1").strip() != "0"
+            and decode_mode in {"auto", "videotoolbox"}
+            and (is_apple_silicon() or decode_mode == "videotoolbox")):
+        attempt = gpu_decode.select_attempt(input_video, render=True)
+        if attempt.backend == "videotoolbox":
+            videotoolbox_attempt = attempt
+            videotoolbox_command = [
+                'ffmpeg', '-y', *gpu_decode.input_args(attempt),
+                '-ss', str(start), '-to', str(end), '-i', input_video,
+                '-vf', gpu_decode.download_filter(attempt),
+                *encode_args, *audio_encode_args(), clip_temp_path,
+            ]
 
     def _run_one(cmd):
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
@@ -528,7 +555,7 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
         return ok, f"exit {result.returncode}, {size} bytes\n{(result.stderr or '').strip()[-800:]}"
 
     def _run():
-        nonlocal gpu_command
+        nonlocal gpu_command, videotoolbox_command
         if gpu_command:
             ok, report = _run_one(gpu_command)
             if ok:
@@ -537,6 +564,17 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
             print(f"   ⚠️ GPU cut of clip {clip_number} failed — decoding on the CPU.")
             gpu_command = None
             _gpu_cut_sources[input_video] = False
+        if videotoolbox_command:
+            ok, report = _run_one(videotoolbox_command)
+            if ok:
+                gpu_decode.note(videotoolbox_attempt)
+                return ok, report
+            gpu_decode.note(videotoolbox_attempt, failed=True)
+            print(f"   ⚠️ VideoToolbox cut of clip {clip_number} failed — "
+                  "replaying with CPU decode and libx264.")
+            videotoolbox_command = None
+            if os.path.isfile(clip_temp_path):
+                os.remove(clip_temp_path)
         return _run_one(command)
 
     for attempt, wait in enumerate(CUT_RETRY_WAITS + (None,), start=1):

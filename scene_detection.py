@@ -84,17 +84,18 @@ def _extract_frames_small(video_path):
     Decoded on the card when it can (gpu_decode: same frames). The number of
     frames decoded is remembered for the trajectory pass
     (``gpu_decode.decoded_frames``)."""
-    def build(on_gpu):
-        return ["ffmpeg", "-nostdin", *gpu_decode.input_args(on_gpu), "-i", video_path,
-                "-vf", gpu_decode.vf(f"scale={_TN2_W}:{_TN2_H}", on_gpu),
+    def build(attempt):
+        return ["ffmpeg", "-nostdin", *gpu_decode.input_args(attempt), "-i", video_path,
+                "-vf", gpu_decode.vf(f"scale={_TN2_W}:{_TN2_H}", attempt),
                 "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
 
     def runner(cmd):
         return subprocess.run(cmd, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=900)
 
-    proc = gpu_decode.run(build, runner, ok=lambda r: r.returncode == 0 and r.stdout,
-                          path=video_path, render=False)
+    proc = gpu_decode.run_with_backend(
+        build, runner, ok=lambda r: r.returncode == 0 and r.stdout,
+        path=video_path, render=False)
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, proc.args)
     frame_bytes = _TN2_H * _TN2_W * 3

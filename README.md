@@ -261,6 +261,7 @@ WHISPER_MODEL=large-v3-turbo
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE=float16
 FFMPEG_ENCODER=auto           # VideoToolbox on Apple Silicon, NVENC elsewhere, then x264
+VIDEO_DECODE_BACKEND=auto     # VideoToolbox on Apple Silicon, CUDA/NVDEC elsewhere, then CPU
 TRANSCRIBE_BACKEND=parakeet   # optional: ~2x faster than whisper, 25 European languages, auto-falls back to whisper
 ASR_GPU_CONCURRENCY=1
 ```
