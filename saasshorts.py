@@ -18,7 +18,7 @@ import json
 import time
 import subprocess
 
-from ffmpeg_utils import video_encode_args, DELIVERY, mark_ai_generated
+from ffmpeg_utils import DELIVERY, mark_ai_generated, run_encode
 import httpx
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable
@@ -37,6 +37,25 @@ DEFAULT_VOICES = {
     "Josh (Male, deep)": "TxGEqnHWrfWFTfGW9XjX",
     "Sam (Male, raspy)": "yoZ06aMxZJJ28mfd3POQ",
 }
+
+
+def _run_file_encode(build_command, output_path, **run_kwargs):
+    """Run one replayable SaaS render with the shared encoder fallback."""
+    result = run_encode(
+        build_command,
+        lambda command: subprocess.run(command, check=True, **run_kwargs),
+        lambda completed: (
+            completed.returncode == 0
+            and os.path.isfile(output_path)
+            and os.path.getsize(output_path) > 0
+        ),
+        lambda: os.path.isfile(output_path) and os.remove(output_path),
+        tier=DELIVERY,
+    )
+    if (result.returncode != 0 or not os.path.isfile(output_path)
+            or os.path.getsize(output_path) == 0):
+        raise RuntimeError("FFmpeg completed without a usable output")
+    return result
 
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL_SAAS") or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
@@ -1013,21 +1032,23 @@ def generate_broll(
         f"d={total_frames}:s=1080x1920:fps={fps},"
         f"setsar=1"
     )
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", img_path,          # Input 0: image
-        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",  # Input 1: silent audio
-        "-vf", zoompan_filter,
-        "-t", str(dur_secs),
-        "-map", "0:v", "-map", "1:a",
-        *video_encode_args(DELIVERY),
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
+    _run_file_encode(
+        lambda encode_args: [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", img_path,          # Input 0: image
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-vf", zoompan_filter,
+            "-t", str(dur_secs),
+            "-map", "0:v", "-map", "1:a",
+            *encode_args,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
+            output_path,
+        ],
         output_path,
-    ]
-
-    subprocess.run(cmd, check=True, capture_output=True)
+        capture_output=True,
+    )
 
     # Cleanup temp image
     if os.path.exists(img_path):
@@ -1196,15 +1217,17 @@ def composite_video(
 
     if not broll_clips:
         # Simple: talking head + subtitles only
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", talking_head_path,
-            "-vf", sub_filter,
-            *video_encode_args(DELIVERY),
-            "-c:a", "aac", "-b:a", "128k",
+        _run_file_encode(
+            lambda encode_args: [
+                "ffmpeg", "-y",
+                "-i", talking_head_path,
+                "-vf", sub_filter,
+                *encode_args,
+                "-c:a", "aac", "-b:a", "128k",
+                output_path,
+            ],
             output_path,
-        ]
-        subprocess.run(cmd, check=True)
+        )
         print(f"[SaaSShorts] ✅ Final video (simple): {output_path}")
         return output_path
 
@@ -1284,18 +1307,19 @@ def composite_video(
 
     filter_str = ";".join(filter_parts)
 
-    cmd = [
-        "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_str,
-        "-map", "[finalv]",
-        "-map", "[outa]",
-        *video_encode_args(DELIVERY),
-        "-c:a", "aac", "-b:a", "128k",
+    _run_file_encode(
+        lambda encode_args: [
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex", filter_str,
+            "-map", "[finalv]",
+            "-map", "[outa]",
+            *encode_args,
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ],
         output_path,
-    ]
-
-    subprocess.run(cmd, check=True)
+    )
     print(f"[SaaSShorts] ✅ Final video (composite): {output_path}")
     return output_path
 

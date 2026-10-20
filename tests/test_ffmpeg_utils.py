@@ -14,6 +14,8 @@ from ffmpeg_utils import (
     blurred_backdrop,
     mark_ai_generated,
     reset_encoder_cache,
+    run_encode,
+    selected_video_encoder,
     video_encode_args,
 )
 
@@ -67,10 +69,199 @@ def test_auto_probes_only_once(monkeypatch):
         return True
 
     monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: False)
     monkeypatch.setattr(ffmpeg_utils, "_probe_nvenc", fake_probe)
     for _ in range(3):
         video_encode_args(QUALITY_FAST)
     assert len(calls) == 1
+
+
+def test_auto_selects_videotoolbox_only_on_apple(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(
+        ffmpeg_utils, "_probe_nvenc",
+        lambda: pytest.fail("Apple auto must not probe NVENC"))
+
+    assert selected_video_encoder(QUALITY) == "videotoolbox"
+    assert video_encode_args(QUALITY) == [
+        "-c:v", "h264_videotoolbox", "-q:v", "75",
+        "-allow_sw", "0", "-pix_fmt", "yuv420p",
+    ]
+    assert video_encode_args(DELIVERY)[3] == "65"
+
+
+def test_apple_intermediate_stays_on_x264(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+
+    assert selected_video_encoder(INTERMEDIATE) == "x264"
+    assert video_encode_args(INTERMEDIATE) == [
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18"]
+
+
+def test_each_effective_encoder_is_announced_once(monkeypatch, capsys):
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+
+    video_encode_args(INTERMEDIATE)
+    video_encode_args(INTERMEDIATE)
+    video_encode_args(QUALITY)
+    video_encode_args(QUALITY)
+    output = capsys.readouterr().out
+
+    assert output.count("video encoder: libx264") == 1
+    assert output.count("video encoder: h264_videotoolbox") == 1
+
+
+def test_videotoolbox_probe_is_cached_independently(monkeypatch):
+    calls = []
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(
+        ffmpeg_utils, "_probe_videotoolbox",
+        lambda: (calls.append(1), True)[1])
+    monkeypatch.setattr(
+        ffmpeg_utils, "_probe_nvenc",
+        lambda: pytest.fail("VideoToolbox must not probe NVENC"))
+
+    video_encode_args(QUALITY)
+    video_encode_args(QUALITY_FAST)
+    assert calls == [1]
+
+
+def test_videotoolbox_probe_failure_uses_x264(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: False)
+    assert selected_video_encoder(QUALITY) == "x264"
+
+
+def test_videotoolbox_failure_replays_complete_operation_with_x264(
+        monkeypatch, tmp_path):
+    output = tmp_path / "clip.mp4"
+    attempts = []
+    removed = []
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+
+    def build(args):
+        return [*args, str(output)]
+
+    def run(command):
+        attempts.append(command)
+        output.write_bytes(b"ok" if "libx264" in command else b"")
+        return subprocess.CompletedProcess(
+            command, 0 if "libx264" in command else 1)
+
+    def remove():
+        removed.append(True)
+        output.unlink(missing_ok=True)
+
+    result = run_encode(
+        build, run,
+        lambda completed: completed.returncode == 0 and output.stat().st_size > 0,
+        remove,
+    )
+
+    assert result.returncode == 0
+    assert "h264_videotoolbox" in attempts[0]
+    assert "libx264" in attempts[1]
+    assert removed == [True]
+    assert selected_video_encoder(QUALITY) == "x264"
+
+
+def test_command_build_error_is_not_replayed_as_encoder_failure(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    runs = []
+
+    def broken_build(_args):
+        raise ValueError("bad graph")
+
+    with pytest.raises(ValueError, match="bad graph"):
+        run_encode(
+            broken_build,
+            lambda command: runs.append(command),
+            lambda _completed: False,
+            lambda: pytest.fail("No partial output exists before command build"),
+        )
+    assert runs == []
+
+
+def test_videotoolbox_process_error_replays_with_x264(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    attempts = []
+
+    def run(command):
+        attempts.append(command)
+        if "h264_videotoolbox" in command:
+            raise subprocess.CalledProcessError(1, command)
+        return subprocess.CompletedProcess(command, 0)
+
+    result = run_encode(
+        lambda args: list(args),
+        run,
+        lambda completed: completed.returncode == 0,
+        lambda: None,
+    )
+
+    assert result.returncode == 0
+    assert len(attempts) == 2
+    assert "h264_videotoolbox" in attempts[0]
+    assert "libx264" in attempts[1]
+
+
+def test_failed_x264_replay_does_not_disable_videotoolbox(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    attempts = []
+
+    result = run_encode(
+        lambda args: list(args),
+        lambda command: (
+            attempts.append(command),
+            subprocess.CompletedProcess(command, 1),
+        )[1],
+        lambda completed: completed.returncode == 0,
+        lambda: None,
+    )
+
+    assert result.returncode == 1
+    assert len(attempts) == 2
+    assert selected_video_encoder(QUALITY) == "videotoolbox"
+
+
+def test_nvenc_runtime_failure_is_not_replayed_with_x264(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "nvenc")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_nvenc", lambda: True)
+    attempts = []
+
+    result = run_encode(
+        lambda args: list(args),
+        lambda command: (
+            attempts.append(command),
+            subprocess.CompletedProcess(command, 1),
+        )[1],
+        lambda completed: completed.returncode == 0,
+        lambda: pytest.fail("NVENC must keep its existing failure behavior"),
+    )
+
+    assert result.returncode == 1
+    assert len(attempts) == 1
+    assert "h264_nvenc" in attempts[0]
+
+
+def test_apple_auto_cut_does_not_probe_nvenc(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(
+        ffmpeg_utils, "_probe_nvenc",
+        lambda: pytest.fail("Apple intermediate cut must not probe NVENC"))
+
+    assert not ffmpeg_utils._gpu_cut_ok("source.mp4")
 
 
 def test_missing_ffmpeg_binary_means_x264(monkeypatch):
@@ -169,7 +360,7 @@ class _FakeRun:
 @pytest.fixture
 def _cut(tmp_path, monkeypatch):
     """Run cut_clip against a scripted ffmpeg, on the GPU encoder, no waiting."""
-    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setenv("FFMPEG_ENCODER", "nvenc")
     monkeypatch.setattr(ffmpeg_utils, "_probe_nvenc", lambda: True)
     slept = []
     monkeypatch.setattr(ffmpeg_utils.time, "sleep", slept.append)

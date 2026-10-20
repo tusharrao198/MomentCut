@@ -25,7 +25,7 @@ import time
 import uuid
 
 from ffmpeg_utils import (METADATA_SCRUB, QUALITY_FAST, audio_encode_args,
-                          video_encode_args)
+                          run_encode, video_encode_args)
 
 # EDL limits. Deliberately generous — the editor is for humans fixing cuts,
 # not for stitching feature films.
@@ -180,27 +180,31 @@ def virtual_transcript(transcript, segments):
     }
 
 
+def _cut_command(input_path, segment, part_path, encode_args):
+    return [
+        "ffmpeg", "-y",
+        "-ss", str(segment["start"]),
+        "-to", str(segment["end"]),
+        "-i", input_path,
+        *encode_args,
+        *audio_encode_args(),
+        # Every final-artifact producer in the repo scrubs source metadata
+        # and fronts the moov atom (a fast-path recut IS the delivered
+        # file, and without +faststart the browser preview hangs). Also on
+        # intermediate parts: harmless, and it keeps the source's handler
+        # metadata from ever entering the chain.
+        *METADATA_SCRUB, "-movflags", "+faststart",
+        part_path,
+    ]
+
+
 def cut_commands(input_path, segments, part_paths):
-    """ffmpeg argv for each segment cut. Re-encodes for frame-accurate cuts
-    with uniform parameters so the parts concat cleanly."""
-    commands = []
-    for seg, part in zip(segments, part_paths):
-        commands.append([
-            "ffmpeg", "-y",
-            "-ss", str(seg["start"]),
-            "-to", str(seg["end"]),
-            "-i", input_path,
-            *video_encode_args(QUALITY_FAST),
-            *audio_encode_args(),
-            # Every final-artifact producer in the repo scrubs source metadata
-            # and fronts the moov atom (a fast-path recut IS the delivered
-            # file, and without +faststart the browser preview hangs). Also on
-            # intermediate parts: harmless, and it keeps the source's handler
-            # metadata from ever entering the chain.
-            *METADATA_SCRUB, "-movflags", "+faststart",
-            part,
-        ])
-    return commands
+    """ffmpeg argv for frame-accurate, concat-compatible segment cuts."""
+    encode_args = video_encode_args(QUALITY_FAST)
+    return [
+        _cut_command(input_path, segment, part, encode_args)
+        for segment, part in zip(segments, part_paths)
+    ]
 
 
 def concat_command(list_path, out_path):
@@ -216,8 +220,24 @@ def concat_command(list_path, out_path):
 def run_cut_concat(input_path, segments, out_path, workdir, runner=None):
     """Cut every segment from ``input_path`` and join them into ``out_path``."""
     run = runner or _run_ffmpeg
+
+    def cut(segment, path):
+        result = run_encode(
+            lambda encode_args: _cut_command(
+                input_path, segment, path, encode_args),
+            run,
+            lambda _result: (
+                os.path.isfile(path) and os.path.getsize(path) > 0
+            ),
+            lambda: os.path.isfile(path) and os.remove(path),
+            tier=QUALITY_FAST,
+        )
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            raise RuntimeError("ffmpeg completed without a usable recut output")
+        return result
+
     if len(segments) == 1:
-        run(cut_commands(input_path, segments, [out_path])[0])
+        cut(segments[0], out_path)
         return out_path
 
     # Unique per invocation: two concurrent recuts in the same job dir must
@@ -229,8 +249,8 @@ def run_cut_concat(input_path, segments, out_path, workdir, runner=None):
     ]
     list_path = os.path.join(workdir, f"temp_recut_concat_{token}.txt")
     try:
-        for command in cut_commands(input_path, segments, part_paths):
-            run(command)
+        for segment, part in zip(segments, part_paths):
+            cut(segment, part)
         with open(list_path, "w") as f:
             for part in part_paths:
                 # Absolute paths: the concat demuxer resolves relative entries
