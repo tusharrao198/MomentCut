@@ -1,5 +1,6 @@
 import os
 import copy
+import accelerator_runtime
 import clip_packaging
 import clip_thumbnail_image
 import llm_backend
@@ -1259,11 +1260,19 @@ def _jobs_busy_elsewhere(now=None) -> int:
 
 SHARED_GPU_WAIT_SECONDS = 5
 SHARED_GPU_MAX_WAIT = DRAIN_TIMEOUT_SECONDS + 120
+MEMORY_ADMISSION_BACKEND = accelerator_runtime.resolve_memory_admission_backend()
+MAC_MIN_AVAILABLE_MB = max(0, int(os.environ.get("MAC_MIN_AVAILABLE_MB", "0")))
 # Free VRAM a new job needs before it starts. A job peaks at ~4-6 GB while it
 # transcribes; starting one on a nearly full card is what made NVENC and
 # TransNetV2 of the jobs already running fail with CUDA OOM. 0 disables.
 GPU_MIN_FREE_MB = int(os.environ.get("GPU_MIN_FREE_MB", "4500"))
 _gpu_free_cache = {"at": 0.0, "mb": None}
+_memory_reader_warnings = set()
+_memory_requeue_tasks = {}
+
+ADMIT = "ADMIT"
+REQUEUE = "REQUEUE"
+CANCELLED = "CANCELLED"
 
 
 def _gpu_free_mb():
@@ -1272,15 +1281,7 @@ def _gpu_free_mb():
     now = time.monotonic()
     if now - _gpu_free_cache["at"] < 2:
         return _gpu_free_cache["mb"]
-    mb = None
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits",
-             "-i", "0"], capture_output=True, text=True, timeout=5)
-        if out.returncode == 0 and out.stdout.strip():
-            mb = int(float(out.stdout.strip().splitlines()[0]))
-    except Exception:
-        mb = None
+    mb = accelerator_runtime.nvidia_free_mb()
     _gpu_free_cache.update(at=now, mb=mb)
     return mb
 
@@ -1301,29 +1302,128 @@ def gpu_has_room(running_here: int, busy_elsewhere: int, free_mb) -> bool:
     return free_mb >= GPU_MIN_FREE_MB
 
 
-async def _wait_for_shared_gpu():
-    """Hold a new job until the GPU has room for it: this instance's jobs
-    plus the ones another instance is still draining must fit
-    MAX_CONCURRENT_JOBS, and the card must have GPU_MIN_FREE_MB free.
-    Bounded: a killed instance stops heartbeating within
-    HEARTBEAT_STALE_AFTER, a drain cannot outlive DRAIN_TIMEOUT_SECONDS, and
-    past SHARED_GPU_MAX_WAIT the job starts anyway rather than wait forever."""
+def mac_memory_has_room(running_here: int, busy_elsewhere: int, available_mb) -> bool:
+    """Whether job count and the configured Mac unified-memory reserve allow work."""
+    if running_here + busy_elsewhere >= MAX_CONCURRENT_JOBS:
+        return False
+    return (MAC_MIN_AVAILABLE_MB <= 0 or available_mb is None
+            or available_mb >= MAC_MIN_AVAILABLE_MB)
+
+
+def _admission_log(job_id, message):
+    print(message)
+    job = jobs.get(job_id) if job_id else None
+    if job is not None:
+        job.get("logs", []).append(message)
+
+
+def _warn_memory_reader_once(backend):
+    if backend in _memory_reader_warnings:
+        return
+    _memory_reader_warnings.add(backend)
+    print(f"⚠️ {backend} memory availability could not be read; "
+          "using job-count-only admission.")
+
+
+async def _wait_for_shared_gpu(job_id=None):
+    """Wait for the selected host memory policy and return an ownership result.
+
+    NVIDIA retains its existing first-job bypass and bounded force-start.
+    A Mac reserve, when configured, is enforced for the first job and returns
+    REQUEUE after the bounded wait instead of starting under host pressure.
+    """
     waited = 0.0
     logged = False
-    loop = asyncio.get_event_loop()
+    metric_unavailable = False
+    loop = asyncio.get_running_loop()
     while waited < SHARED_GPU_MAX_WAIT:
+        if _draining or _stopping:
+            return CANCELLED
         elsewhere = _jobs_busy_elsewhere()
-        free_mb = await loop.run_in_executor(None, _gpu_free_mb)
-        if gpu_has_room(len(_running_jobs), elsewhere, free_mb):
-            return
+        available_mb = None
+        if MEMORY_ADMISSION_BACKEND == "nvidia":
+            available_mb = await loop.run_in_executor(None, _gpu_free_mb)
+            has_room = gpu_has_room(
+                len(_running_jobs), elsewhere, available_mb)
+            pressure = (
+                f"{available_mb if available_mb is not None else '?'} MiB "
+                f"GPU free (needs {GPU_MIN_FREE_MB})")
+        elif MEMORY_ADMISSION_BACKEND == "macos":
+            if MAC_MIN_AVAILABLE_MB > 0 and not metric_unavailable:
+                available_mb = await loop.run_in_executor(
+                    None, accelerator_runtime.host_available_mb)
+                if available_mb is None:
+                    metric_unavailable = True
+                    _warn_memory_reader_once("macOS host")
+            has_room = mac_memory_has_room(
+                len(_running_jobs), elsewhere, available_mb)
+            pressure = (
+                f"{available_mb} MiB host available "
+                f"(needs {MAC_MIN_AVAILABLE_MB})"
+                if MAC_MIN_AVAILABLE_MB > 0 and not metric_unavailable
+                else f"job-count limit {MAX_CONCURRENT_JOBS}")
+        else:
+            has_room = (
+                len(_running_jobs) + elsewhere < MAX_CONCURRENT_JOBS)
+            pressure = f"job-count limit {MAX_CONCURRENT_JOBS}"
+        if has_room:
+            return ADMIT
         if not logged:
-            print(f"⏳ Holding the next job: {len(_running_jobs)} running here, "
-                  f"{elsewhere} on a draining instance, "
-                  f"{free_mb if free_mb is not None else '?'} MiB GPU free "
-                  f"(needs {GPU_MIN_FREE_MB}).")
+            _admission_log(
+                job_id,
+                f"⏳ Holding the next job: {len(_running_jobs)} running here, "
+                f"{elsewhere} on a draining instance, "
+                f"{pressure}.")
             logged = True
         await asyncio.sleep(SHARED_GPU_WAIT_SECONDS)
         waited += SHARED_GPU_WAIT_SECONDS
+    if _draining or _stopping:
+        return CANCELLED
+    if (MEMORY_ADMISSION_BACKEND == "macos"
+            and MAC_MIN_AVAILABLE_MB > 0
+            and not metric_unavailable):
+        return REQUEUE
+    return ADMIT
+
+
+def _memory_requeue_delay(attempt):
+    return min(60.0, max(1.0, SHARED_GPU_WAIT_SECONDS) * (2 ** min(attempt - 1, 4)))
+
+
+def _schedule_memory_requeue(job_id, priority):
+    """Schedule at most one delayed enqueue for a memory-held Mac job."""
+    current = _memory_requeue_tasks.get(job_id)
+    if current is not None and not current.done():
+        return False
+    job = jobs.get(job_id)
+    if not job or job.get("status") != "queued":
+        return False
+    attempt = int(job.get("_memory_requeues") or 0) + 1
+    job["_memory_requeues"] = attempt
+    delay = _memory_requeue_delay(attempt)
+    job.get("logs", []).append(
+        f"⏳ Mac memory is still below the configured reserve. "
+        f"Checking again in {delay:.0f}s.")
+
+    async def _later():
+        task = asyncio.current_task()
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            if _memory_requeue_tasks.get(job_id) is task:
+                _memory_requeue_tasks.pop(job_id, None)
+        queued_job = jobs.get(job_id)
+        if (_draining or _stopping or not queued_job
+                or queued_job.get("status") != "queued"):
+            return
+        if job_id in _admitting or any(
+                item[2] == job_id for item in list(job_queue._queue)):
+            return
+        _enqueue_job(job_id, priority)
+
+    task = asyncio.create_task(_later())
+    _memory_requeue_tasks[job_id] = task
+    return True
 
 
 def _write_instance_marker():
@@ -1850,44 +1950,52 @@ async def cleanup_jobs():
         except Exception as e:
             print(f"⚠️ Cleanup error: {e}")
 
+async def _dispatch_queued_job(priority, job_id):
+    """Dispatch one dequeued job, settling queue ownership on every non-start."""
+    acquired = False
+    started = False
+    _admitting.add(job_id)
+    try:
+        if _draining or _stopping:
+            print(f"⏸️ Draining — leaving {job_id} for the next instance.")
+            return CANCELLED
+
+        await concurrency_semaphore.acquire()
+        acquired = True
+        result = await _wait_for_shared_gpu(job_id)
+        if result == ADMIT and not (_draining or _stopping):
+            print(f"🔄 Acquired slot for job: {job_id}")
+            _running_jobs.add(job_id)
+            _touch_manifest(job_id)
+            asyncio.create_task(run_job_wrapper(job_id))
+            started = True
+            acquired = False  # run_job_wrapper now owns the slot and queue task.
+            return ADMIT
+
+        if result == REQUEUE and not (_draining or _stopping):
+            _schedule_memory_requeue(job_id, priority)
+            return REQUEUE
+
+        print(f"⏸️ Draining — leaving {job_id} for the next instance.")
+        return CANCELLED
+    finally:
+        _admitting.discard(job_id)
+        if not started:
+            if acquired:
+                concurrency_semaphore.release()
+            job_queue.task_done()
+
+
 async def process_queue():
     """Background worker to process jobs from the queue with concurrency limit."""
     print(f"🚀 Job Queue Worker started with {MAX_CONCURRENT_JOBS} concurrent slots.")
     while True:
         try:
             # Wait for a job (priority, seq, job_id) — lowest priority first.
-            _priority, _seq, job_id = await job_queue.get()
-
-            if _draining:
-                # Leave it on disk for the next instance (manifest, no heartbeat).
-                print(f"⏸️ Draining — leaving {job_id} for the next instance.")
-                job_queue.task_done()
-                continue
-
-            # Acquire semaphore slot (waits if max jobs are running)
-            _admitting.add(job_id)
-            await concurrency_semaphore.acquire()
-            if _draining:
-                _admitting.discard(job_id)
-                concurrency_semaphore.release()
-                job_queue.task_done()
-                print(f"⏸️ Draining — leaving {job_id} for the next instance.")
-                continue
-            # The old container may still be draining its jobs on this GPU.
-            await _wait_for_shared_gpu()
-            _admitting.discard(job_id)
-            if _draining:
-                concurrency_semaphore.release()
-                job_queue.task_done()
-                print(f"⏸️ Draining — leaving {job_id} for the next instance.")
-                continue
-            print(f"🔄 Acquired slot for job: {job_id}")
-            _running_jobs.add(job_id)
-            _touch_manifest(job_id)
-
-            # Process in background task to not block the loop (allowing other slots to fill)
-            asyncio.create_task(run_job_wrapper(job_id))
-            
+            priority, _seq, job_id = await job_queue.get()
+            await _dispatch_queued_job(priority, job_id)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"❌ Queue dispatch error: {e}")
             await asyncio.sleep(1)

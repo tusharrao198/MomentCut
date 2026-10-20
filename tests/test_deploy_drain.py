@@ -23,7 +23,12 @@ def out(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "OUTPUT_DIR", str(root))
     monkeypatch.setattr(app_module, "INSTANCE_ID", "me")
     monkeypatch.setattr(app_module, "_draining", False)
+    monkeypatch.setattr(app_module, "_stopping", False)
     monkeypatch.setattr(app_module, "_running_jobs", set())
+    monkeypatch.setattr(app_module, "_admitting", set())
+    monkeypatch.setattr(app_module, "_memory_reader_warnings", set())
+    monkeypatch.setattr(app_module, "_memory_requeue_tasks", {})
+    monkeypatch.setattr(app_module, "concurrency_semaphore", asyncio.Semaphore(5))
     # Isolate the in-memory job table and queue from other tests.
     monkeypatch.setattr(app_module, "jobs", {})
     monkeypatch.setattr(app_module, "job_queue", asyncio.PriorityQueue())
@@ -254,6 +259,7 @@ class TestSharedGpu:
     def test_waits_while_the_gpu_is_full(self, out, monkeypatch):
         monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 3)
         monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "nvidia")
         busy = {"n": 3}
         monkeypatch.setattr(app_module, "_jobs_busy_elsewhere", lambda now=None: busy["n"])
         monkeypatch.setattr(app_module, "_gpu_free_mb", lambda: None)
@@ -266,11 +272,12 @@ class TestSharedGpu:
                 busy["n"] = 1     # the old instance finished two jobs
             await real_sleep(0)
         monkeypatch.setattr(app_module.asyncio, "sleep", fake_sleep)
-        asyncio.run(app_module._wait_for_shared_gpu())
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
         assert calls["n"] == 3
 
     def test_no_wait_when_alone(self, out, monkeypatch):
         monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 3)
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "nvidia")
         monkeypatch.setattr(app_module, "_running_jobs", {"x", "y"})
         monkeypatch.setattr(app_module, "_jobs_busy_elsewhere", lambda now=None: 0)
         monkeypatch.setattr(app_module, "_gpu_free_mb", lambda: 20000)
@@ -278,7 +285,7 @@ class TestSharedGpu:
         async def boom(sec):
             raise AssertionError("should not wait")
         monkeypatch.setattr(app_module.asyncio, "sleep", boom)
-        asyncio.run(app_module._wait_for_shared_gpu())
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
 
 
 class TestGpuHasRoom:
@@ -299,3 +306,151 @@ class TestGpuHasRoom:
     def test_no_nvidia_smi_falls_back_to_count(self, out, monkeypatch):
         monkeypatch.setattr(app_module, "MAX_CONCURRENT_JOBS", 8)
         assert app_module.gpu_has_room(4, 0, None)
+
+
+class TestMacMemoryAdmission:
+    def test_zero_reserve_uses_count_without_reading_memory(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "macos")
+        monkeypatch.setattr(app_module, "MAC_MIN_AVAILABLE_MB", 0)
+        monkeypatch.setattr(
+            app_module.accelerator_runtime, "host_available_mb",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("zero reserve must not read host memory")))
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
+
+    def test_waits_below_reserve_then_admits(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "macos")
+        monkeypatch.setattr(app_module, "MAC_MIN_AVAILABLE_MB", 4096)
+        monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
+        readings = iter([2048, 6144])
+        monkeypatch.setattr(
+            app_module.accelerator_runtime, "host_available_mb",
+            lambda: next(readings))
+
+        async def no_delay(_seconds):
+            return None
+
+        monkeypatch.setattr(app_module.asyncio, "sleep", no_delay)
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
+
+    def test_reader_failure_falls_back_to_count(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "macos")
+        monkeypatch.setattr(app_module, "MAC_MIN_AVAILABLE_MB", 4096)
+        monkeypatch.setattr(
+            app_module.accelerator_runtime, "host_available_mb", lambda: None)
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
+        assert app_module._memory_reader_warnings == {"macOS host"}
+
+    def test_reader_failure_never_requeues(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "macos")
+        monkeypatch.setattr(app_module, "MAC_MIN_AVAILABLE_MB", 4096)
+        monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(app_module, "SHARED_GPU_MAX_WAIT", 0.01)
+        monkeypatch.setattr(app_module, "_running_jobs", {"already-running"})
+        monkeypatch.setattr(
+            app_module.accelerator_runtime, "host_available_mb", lambda: None)
+
+        async def no_delay(_seconds):
+            return None
+
+        monkeypatch.setattr(app_module.asyncio, "sleep", no_delay)
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
+
+    def test_bounded_low_memory_returns_requeue(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "macos")
+        monkeypatch.setattr(app_module, "MAC_MIN_AVAILABLE_MB", 4096)
+        monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(app_module, "SHARED_GPU_MAX_WAIT", 0.02)
+        monkeypatch.setattr(
+            app_module.accelerator_runtime, "host_available_mb", lambda: 1024)
+
+        async def no_delay(_seconds):
+            return None
+
+        monkeypatch.setattr(app_module.asyncio, "sleep", no_delay)
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.REQUEUE
+
+    def test_nvidia_bounded_wait_still_force_starts(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "nvidia")
+        monkeypatch.setattr(app_module, "SHARED_GPU_MAX_WAIT", 0)
+        monkeypatch.setattr(app_module, "_running_jobs", {"already-running"})
+        monkeypatch.setattr(app_module, "_gpu_free_mb", lambda: 0)
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
+
+    def test_drain_returns_cancelled(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "_draining", True)
+        assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.CANCELLED
+
+
+async def _async_result(value):
+    return value
+
+
+class TestAdmissionOwnership:
+    @staticmethod
+    def _dequeued(monkeypatch, job_id):
+        queue = asyncio.PriorityQueue()
+        queue.put_nowait((2, 0, job_id))
+        priority, _seq, queued_id = queue.get_nowait()
+        monkeypatch.setattr(app_module, "job_queue", queue)
+        monkeypatch.setattr(app_module, "concurrency_semaphore", asyncio.Semaphore(1))
+        app_module.jobs[job_id] = {"status": "queued", "logs": []}
+        return priority, queued_id
+
+    def test_requeue_releases_all_dispatch_ownership(self, out, monkeypatch):
+        scheduled = []
+        monkeypatch.setattr(
+            app_module, "_wait_for_shared_gpu",
+            lambda _job_id=None: _async_result(app_module.REQUEUE))
+        monkeypatch.setattr(
+            app_module, "_schedule_memory_requeue",
+            lambda job_id, priority: scheduled.append((job_id, priority)) or True)
+        priority, job_id = self._dequeued(monkeypatch, "held")
+
+        assert asyncio.run(
+            app_module._dispatch_queued_job(priority, job_id)) == app_module.REQUEUE
+        assert app_module.concurrency_semaphore._value == 1
+        assert app_module.job_queue._unfinished_tasks == 0
+        assert "held" not in app_module._admitting
+        assert scheduled == [("held", 2)]
+
+    def test_cancelled_dispatch_releases_all_ownership(self, out, monkeypatch):
+        monkeypatch.setattr(
+            app_module, "_wait_for_shared_gpu",
+            lambda _job_id=None: _async_result(app_module.CANCELLED))
+        priority, job_id = self._dequeued(monkeypatch, "cancelled")
+
+        assert asyncio.run(
+            app_module._dispatch_queued_job(priority, job_id)) == app_module.CANCELLED
+        assert app_module.concurrency_semaphore._value == 1
+        assert app_module.job_queue._unfinished_tasks == 0
+        assert "cancelled" not in app_module._admitting
+
+    def test_coroutine_cancellation_releases_all_ownership(self, out, monkeypatch):
+        async def cancel(_job_id=None):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(app_module, "_wait_for_shared_gpu", cancel)
+        priority, job_id = self._dequeued(monkeypatch, "interrupted")
+
+        async def run():
+            with pytest.raises(asyncio.CancelledError):
+                await app_module._dispatch_queued_job(priority, job_id)
+
+        asyncio.run(run())
+        assert app_module.concurrency_semaphore._value == 1
+        assert app_module.job_queue._unfinished_tasks == 0
+        assert "interrupted" not in app_module._admitting
+
+    def test_duplicate_delayed_requeue_is_suppressed(self, out, monkeypatch):
+        monkeypatch.setattr(app_module, "_memory_requeue_delay", lambda _attempt: 0)
+        app_module.jobs["held"] = {"status": "queued", "logs": []}
+
+        async def run():
+            assert app_module._schedule_memory_requeue("held", 2)
+            assert not app_module._schedule_memory_requeue("held", 2)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+        assert app_module.job_queue.qsize() == 1
