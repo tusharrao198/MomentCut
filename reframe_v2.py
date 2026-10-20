@@ -401,7 +401,7 @@ def _read_frame(stream, frame_bytes, shape):
     return np.frombuffer(buf, dtype=np.uint8).reshape(shape)
 
 
-def _sparse_trajectory(input_video, n_frames, on_gpu, small_w, small_h,
+def _sparse_trajectory(input_video, n_frames, attempt, small_w, small_h,
                        scenes_boundaries, scene_strategies, orig_w, scale,
                        cameraman, tracker):
     """The trajectory decoding only the detector's frames (plus the last one,
@@ -413,15 +413,21 @@ def _sparse_trajectory(input_video, n_frames, on_gpu, small_w, small_h,
     piped = sorted(set(wanted) | {n_frames - 1})
     expr = gpu_decode.any_of([select_expr(piped, m.DETECT_STRIDE), f"gte(n,{n_frames})"])
     chain = f"scale={small_w}:{small_h}"
-    vf = (f"select='{expr}',{gpu_decode.DOWNLOAD},{chain}" if on_gpu
+    vf = (f"select='{expr}',{gpu_decode.download_filter(attempt)},{chain}"
+          if attempt.is_hardware
           else f"select='{expr}',{chain}")
     frame_bytes = small_w * small_h * 3
     shape = (small_h, small_w, 3)
-    proc = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", *gpu_decode.input_args(on_gpu),
-         "-i", input_video, "-vf", vf, "-fps_mode", "passthrough",
-         "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 4)
+    try:
+        proc = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", *gpu_decode.input_args(attempt),
+             "-i", input_video, "-vf", vf, "-fps_mode", "passthrough",
+             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=frame_bytes * 4)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise _SparseMismatch(
+            f"ffmpeg could not start ({type(error).__name__}: {error})") from error
     queue = iter(piped)
 
     def next_frame(frame_number):
@@ -433,6 +439,7 @@ def _sparse_trajectory(input_video, n_frames, on_gpu, small_w, small_h,
             raise _SparseMismatch(f"stream ended before frame {frame_number}")
         return frame
 
+    completed = False
     try:
         xs = _trajectory_loop(next_frame, True, n_frames, scenes_boundaries,
                               scene_strategies, orig_w, scale, cameraman, tracker)
@@ -441,10 +448,14 @@ def _sparse_trajectory(input_video, n_frames, on_gpu, small_w, small_h,
                 raise _SparseMismatch(f"stream ended before frame {frame_number}")
         if proc.stdout.read(1):
             raise _SparseMismatch(f"clip has more than {n_frames} frames")
+        completed = True
     finally:
         proc.stdout.close()
-        proc.kill()
-        proc.wait()
+        if not completed:
+            proc.kill()
+        rc = proc.wait()
+    if rc != 0:
+        raise _SparseMismatch(f"ffmpeg exited {rc}")
     return xs
 
 
@@ -462,7 +473,8 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
     small_w, small_h = _analysis_size(orig_w, orig_h)
     scale = orig_w / small_w
     n_frames = gpu_decode.decoded_frames(input_video) if SPARSE_TRAJECTORY else None
-    on_card = gpu_decode.usable(input_video)
+    hardware = gpu_decode.select_attempt(input_video, render=False)
+    cpu = gpu_decode.select_attempt(input_video, render=False, backend="cpu")
     saved = copy.deepcopy(cameraman.__dict__), copy.deepcopy(tracker.__dict__)
 
     def restore():
@@ -472,29 +484,41 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
         tracker.__dict__.update(copy.deepcopy(saved[1]))
 
     if n_frames:
-        for on_gpu in ([True, False] if on_card else [False]):
+        attempts = [hardware, cpu] if hardware.is_hardware else [cpu]
+        for attempt in attempts:
             try:
-                xs = _sparse_trajectory(input_video, n_frames, on_gpu, small_w, small_h,
+                xs = _sparse_trajectory(input_video, n_frames, attempt, small_w, small_h,
                                         scenes_boundaries, scene_strategies, orig_w,
                                         scale, cameraman, tracker)
-                gpu_decode.note(on_gpu)
+                gpu_decode.note(attempt)
                 return xs
             except _SparseMismatch as e:
-                print(f"   ⚠️ Sparse trajectory pass ({'GPU' if on_gpu else 'CPU'}): {e}")
-                if on_gpu:
-                    gpu_decode.note(True, failed=True)
+                print(f"   ⚠️ Sparse trajectory pass ({attempt.backend}): {e}")
+                if attempt.is_hardware:
+                    gpu_decode.note(attempt, failed=True)
                 restore()
 
     # Every frame, as before; decoded on the card when it can (same frames).
     # A card decode that does not end cleanly is thrown away and redone.
-    for on_gpu in ([True, False] if on_card and not n_frames else [False]):
+    attempts = [hardware, cpu] if hardware.is_hardware and not n_frames else [cpu]
+    for attempt in attempts:
         frame_bytes = small_w * small_h * 3
-        proc = subprocess.Popen(
-            ["ffmpeg", "-loglevel", "error", *gpu_decode.input_args(on_gpu),
-             "-i", input_video,
-             "-vf", gpu_decode.vf(f"scale={small_w}:{small_h}", on_gpu),
-             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 4)
+        try:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error", *gpu_decode.input_args(attempt),
+                 "-i", input_video,
+                 "-vf", gpu_decode.vf(f"scale={small_w}:{small_h}", attempt),
+                 "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                bufsize=frame_bytes * 4)
+        except (OSError, subprocess.SubprocessError) as error:
+            if not attempt.is_hardware:
+                raise
+            gpu_decode.note(attempt, failed=True)
+            print(f"   ⚠️ {attempt.backend} trajectory decode could not start "
+                  f"({type(error).__name__}: {error}), decoding on the CPU")
+            restore()
+            continue
         try:
             xs = _trajectory_loop(
                 lambda: _read_frame(proc.stdout, frame_bytes, (small_h, small_w, 3)),
@@ -503,13 +527,14 @@ def _analyze_trajectory(input_video, scenes_boundaries, scene_strategies,
         finally:
             proc.stdout.close()
             rc = proc.wait()
-        if not on_gpu:
+        if not attempt.is_hardware:
             return xs
         if rc == 0 and xs:
-            gpu_decode.note(True)
+            gpu_decode.note(attempt)
             return xs
-        gpu_decode.note(True, failed=True)
-        print("   ⚠️ GPU trajectory decode failed, decoding on the CPU")
+        gpu_decode.note(attempt, failed=True)
+        print(f"   ⚠️ {attempt.backend} trajectory decode failed, "
+              "decoding on the CPU")
         restore()
 
 
@@ -525,19 +550,28 @@ def _run_segment(input_video, ss, dur, extra_inputs, graph, out_label, seg_path)
     (gpu_decode: the same frames, so the same segment) and on the CPU if that
     ffmpeg fails."""
     def build(encode_args):
-        def command(on_gpu):
-            on_gpu = on_gpu and gpu_decode.graph_ok(graph)
+        def command(attempt):
+            if attempt.is_hardware and not gpu_decode.graph_ok(graph):
+                attempt = gpu_decode.select_attempt(
+                    input_video, render=True, backend="cpu")
             return [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}",
-                *gpu_decode.input_args(on_gpu), "-i", input_video, *extra_inputs,
-                "-filter_complex", gpu_decode.graph(graph, on_gpu), "-map", out_label,
+                *gpu_decode.input_args(attempt), "-i", input_video, *extra_inputs,
+                "-filter_complex", gpu_decode.graph(graph, attempt), "-map", out_label,
                 *encode_args, "-an", seg_path,
             ]
         return command
 
-    def execute(command):
-        return gpu_decode.run(
+    def remove_partial():
+        if os.path.isfile(seg_path):
+            os.remove(seg_path)
+
+    def execute(command, backend=None):
+        cpu = gpu_decode.select_attempt(
+            input_video, render=True, backend="cpu")
+        retry_videotoolbox = "h264_videotoolbox" not in command(cpu)
+        return gpu_decode.run_with_backend(
             command,
             lambda candidate: subprocess.run(
                 candidate, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -548,6 +582,9 @@ def _run_segment(input_video, ss, dur, extra_inputs, graph, out_label, seg_path)
                 and os.path.getsize(seg_path) > 0
             ),
             path=input_video,
+            backend=backend,
+            before_cpu_retry=remove_partial,
+            retry_videotoolbox=retry_videotoolbox,
         )
 
     result = run_encode(
@@ -558,8 +595,9 @@ def _run_segment(input_video, ss, dur, extra_inputs, graph, out_label, seg_path)
             and os.path.isfile(seg_path)
             and os.path.getsize(seg_path) > 0
         ),
-        lambda: os.path.isfile(seg_path) and os.remove(seg_path),
+        remove_partial,
         tier=QUALITY_FAST,
+        fallback_run_command=lambda command: execute(command, "cpu"),
     )
     if (result.returncode != 0 or not os.path.isfile(seg_path)
             or os.path.getsize(seg_path) == 0):

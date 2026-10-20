@@ -8,12 +8,17 @@ import re
 import subprocess
 import sys
 import types
+from dataclasses import FrozenInstanceError
 
 import numpy as np
 import pytest
 
 import gpu_decode
 import reframe_v2
+
+CPU = gpu_decode._attempt("cpu")
+CUDA = gpu_decode._attempt("cuda")
+VIDEOTOOLBOX = gpu_decode._attempt("videotoolbox")
 
 
 # --- command rewrites -------------------------------------------------------
@@ -28,6 +33,14 @@ def test_graph_feeds_the_first_input_from_the_card():
 def test_vf_chain_starts_with_the_download():
     assert gpu_decode.vf("scale=48:27", True) == f"{gpu_decode.DOWNLOAD},scale=48:27"
     assert gpu_decode.vf("scale=48:27", False) == "scale=48:27"
+
+
+def test_videotoolbox_attempt_uses_the_same_cpu_readable_bridge():
+    assert gpu_decode.input_args(VIDEOTOOLBOX) == gpu_decode.VIDEOTOOLBOX_HW_ARGS
+    assert gpu_decode.vf("scale=48:27", VIDEOTOOLBOX) == (
+        f"{gpu_decode.DOWNLOAD},scale=48:27")
+    with pytest.raises(FrozenInstanceError):
+        VIDEOTOOLBOX.backend = "cpu"
 
 
 def test_on_card_rewrites_filter_complex_and_input():
@@ -82,6 +95,153 @@ def test_run_stays_on_the_cpu_when_the_card_is_not_usable(monkeypatch):
                    lambda c: calls.append(c) or subprocess.CompletedProcess(c, 0),
                    path="x.mp4")
     assert calls == ["cpu"]
+
+
+def test_auto_selects_videotoolbox_on_apple_without_checking_cuda(monkeypatch):
+    monkeypatch.setattr(gpu_decode, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(gpu_decode, "videotoolbox_usable", lambda path, render=False: True)
+    monkeypatch.setattr(
+        gpu_decode, "usable",
+        lambda path, render=False: pytest.fail("Apple auto must not probe CUDA"))
+    assert gpu_decode.select_attempt("clip.mp4").backend == "videotoolbox"
+
+
+def test_auto_preserves_cuda_selection_off_apple(monkeypatch):
+    monkeypatch.setattr(gpu_decode, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(gpu_decode, "usable", lambda path, render=False: True)
+    monkeypatch.setattr(
+        gpu_decode, "videotoolbox_usable",
+        lambda path, render=False: pytest.fail("NVIDIA auto must not probe VideoToolbox"))
+    assert gpu_decode.select_attempt("clip.mp4").backend == "cuda"
+
+
+def test_explicit_cpu_never_probes_hardware(monkeypatch):
+    monkeypatch.setattr(
+        gpu_decode, "usable",
+        lambda path, render=False: pytest.fail("CPU route must not probe CUDA"))
+    monkeypatch.setattr(
+        gpu_decode, "videotoolbox_usable",
+        lambda path, render=False: pytest.fail("CPU route must not probe VideoToolbox"))
+    assert gpu_decode.select_attempt("clip.mp4", backend="cpu").backend == "cpu"
+
+
+def test_videotoolbox_probe_rejects_software_fallback_with_exit_zero(
+        monkeypatch, tmp_path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    info = {"index": 0, "codec_name": "h264", "profile": "High",
+            "pix_fmt": "yuv420p", "width": 16, "height": 16}
+    gpu_decode._videotoolbox_probe_cache.clear()
+    expected = b"\0" * (16 * 16 * 3 // 2)
+    stderr = (
+        b"graph input pixfmt:videotoolbox_vld\n"
+        b"VideoToolbox malfunction.\n"
+        b"Failed setup for format videotoolbox_vld: "
+        b"hwaccel initialisation returned error.\n"
+    )
+    monkeypatch.setattr(
+        gpu_decode.subprocess, "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, expected, stderr))
+    assert not gpu_decode._probe_videotoolbox(str(source), info)
+
+
+def test_videotoolbox_probe_requires_positive_hardware_surface_and_caches(
+        monkeypatch, tmp_path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    info = {"index": 0, "codec_name": "h264", "profile": "High",
+            "pix_fmt": "yuv420p", "width": 16, "height": 16}
+    gpu_decode._videotoolbox_probe_cache.clear()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, b"\0" * (16 * 16 * 3 // 2),
+            b"graph input pixfmt:videotoolbox_vld")
+
+    monkeypatch.setattr(gpu_decode.subprocess, "run", run)
+    assert gpu_decode._probe_videotoolbox(str(source), info)
+    assert gpu_decode._probe_videotoolbox(str(source), info)
+    assert len(calls) == 1
+
+
+def test_videotoolbox_probe_cache_includes_stream_properties(monkeypatch, tmp_path):
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    base = {"index": 0, "codec_name": "h264", "pix_fmt": "yuv420p",
+            "width": 16, "height": 16}
+    gpu_decode._videotoolbox_probe_cache.clear()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, b"\0" * (16 * 16 * 3 // 2),
+            b"graph input pixfmt:videotoolbox_vld")
+
+    monkeypatch.setattr(gpu_decode.subprocess, "run", run)
+    assert gpu_decode._probe_videotoolbox(
+        str(source), {**base, "profile": "High"})
+    assert gpu_decode._probe_videotoolbox(
+        str(source), {**base, "profile": "Main"})
+    assert len(calls) == 2
+
+
+def test_videotoolbox_failed_operation_removes_partial_and_replays_cpu(monkeypatch):
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=True, backend=None: (
+            CPU if backend == "cpu" else VIDEOTOOLBOX))
+    calls = []
+    cleanup = []
+
+    result = gpu_decode.run_with_backend(
+        lambda attempt: attempt.backend,
+        lambda command: (
+            calls.append(command),
+            subprocess.CompletedProcess(
+                command, 1 if command == "videotoolbox" else 0),
+        )[1],
+        path="clip.mp4",
+        before_cpu_retry=lambda: cleanup.append(True),
+    )
+
+    assert result.returncode == 0
+    assert calls == ["videotoolbox", "cpu"]
+    assert cleanup == [True]
+
+
+def test_combined_videotoolbox_operation_can_defer_complete_replay(monkeypatch):
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=True, backend=None: VIDEOTOOLBOX)
+    calls = []
+    result = gpu_decode.run_with_backend(
+        lambda attempt: attempt.backend,
+        lambda command: (
+            calls.append(command),
+            subprocess.CompletedProcess(command, 1),
+        )[1],
+        path="clip.mp4",
+        retry_videotoolbox=False,
+    )
+    assert result.returncode == 1
+    assert calls == ["videotoolbox"]
+
+
+def test_new_runner_preserves_cuda_exception_behavior(monkeypatch):
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=True, backend=None: CUDA)
+    with pytest.raises(subprocess.TimeoutExpired):
+        gpu_decode.run_with_backend(
+            lambda attempt: attempt.backend,
+            lambda command: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(command, 1)),
+            path="clip.mp4",
+        )
 
 
 def test_only_plain_8bit_420_h264_hevc_goes_to_the_card():
@@ -229,7 +389,9 @@ def test_sparse_trajectory_restores_state_and_falls_back(monkeypatch, fake_main)
     camera as it found it and let the full pass run."""
     xs, _seen, _c, _t = _dense(fake_main, orig_w=4)
     monkeypatch.setattr(gpu_decode, "decoded_frames", lambda path: N)
-    monkeypatch.setattr(gpu_decode, "usable", lambda path, render=False: False)
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=False, backend=None: CPU)
 
     def broken_sparse(*args, **kw):
         cam, tr = args[-2], args[-1]
@@ -282,11 +444,63 @@ def test_decoded_count_is_tied_to_the_exact_file(tmp_path):
 def test_sampler_uses_read_at_when_the_card_is_not_usable(monkeypatch):
     import frame_sampler
 
-    monkeypatch.setattr(gpu_decode, "usable", lambda path, render=False: False)
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=False, backend=None: CPU)
     monkeypatch.setattr(frame_sampler, "read_at",
                         lambda cap, idx, max_forward=0: iter([("cpu", i) for i in idx]))
     assert list(frame_sampler.read_at_path("clip.mp4", None, [3, 1])) == [("cpu", 3), ("cpu", 1)]
     assert list(frame_sampler.read_at_path("clip.mp4", None, [1, 3])) == [("cpu", 1), ("cpu", 3)]
+
+
+def test_empty_sampler_request_does_not_probe_a_decoder(monkeypatch):
+    import frame_sampler
+
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda *args, **kwargs: pytest.fail("empty request must not probe"))
+    assert list(frame_sampler.read_at_path("clip.mp4", None, [])) == []
+
+
+def test_sampler_read_error_preserves_cpu_remainder_fallback(monkeypatch):
+    import frame_sampler
+
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=False, backend=None: VIDEOTOOLBOX)
+    monkeypatch.setattr(
+        frame_sampler, "read_at",
+        lambda cap, idx, max_forward=0: iter([("cpu", i) for i in idx]))
+
+    class _Cap:
+        def get(self, prop):
+            return 2
+
+    class _Stream:
+        closed = False
+
+        def readinto(self, _buffer):
+            raise OSError("pipe failed")
+
+        def close(self):
+            self.closed = True
+
+    class _Proc:
+        def __init__(self):
+            self.stdout = _Stream()
+            self.returncode = None
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self):
+            if self.returncode is None:
+                self.returncode = 1
+            return self.returncode
+
+    monkeypatch.setattr(frame_sampler.subprocess, "Popen", lambda *a, **k: _Proc())
+    assert list(frame_sampler.read_at_path(
+        "clip.mp4", _Cap(), [1, 2])) == [("cpu", 1), ("cpu", 2)]
 
 
 def test_frame_count_is_kept_only_when_the_cfr_sync_changed_nothing():
@@ -303,7 +517,10 @@ def test_dense_card_decode_that_fails_is_redone_on_the_cpu(monkeypatch, fake_mai
     card first; a card ffmpeg that exits with an error is thrown away."""
     xs, _seen, _c, _t = _dense(fake_main, orig_w=4)
     monkeypatch.setattr(gpu_decode, "decoded_frames", lambda path: None)
-    monkeypatch.setattr(gpu_decode, "usable", lambda path, render=False: True)
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=False, backend=None: (
+            CPU if backend == "cpu" else CUDA))
     runs = []
 
     class _Proc:
@@ -322,6 +539,48 @@ def test_dense_card_decode_that_fails_is_redone_on_the_cpu(monkeypatch, fake_mai
     monkeypatch.setattr(reframe_v2, "_analysis_size", lambda w, h: (4, 4))
     cam, tr = _Cameraman(), _Tracker()
     out = reframe_v2._analyze_trajectory("clip.mp4", SCENES, STRATS, 30.0, 4, 4, cam, tr)
+    assert runs == [True, False]
+    assert out == xs
+
+
+def test_dense_hardware_start_failure_is_redone_on_the_cpu(monkeypatch, fake_main):
+    xs, _seen, _c, _t = _dense(fake_main, orig_w=4)
+    monkeypatch.setattr(gpu_decode, "decoded_frames", lambda path: None)
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=False, backend=None: (
+            CPU if backend == "cpu" else VIDEOTOOLBOX))
+    runs = []
+
+    class _Stream:
+        def __init__(self):
+            self.frames = [_frame(n).tobytes() for n in range(N)]
+
+        def read(self, size):
+            return self.frames.pop(0) if self.frames else b""
+
+        def close(self):
+            pass
+
+    class _Proc:
+        def __init__(self):
+            self.stdout = _Stream()
+
+        def wait(self):
+            return 0
+
+    def popen(command, **kwargs):
+        hardware = "-hwaccel" in command
+        runs.append(hardware)
+        if hardware:
+            raise OSError("VideoToolbox unavailable")
+        return _Proc()
+
+    monkeypatch.setattr(reframe_v2.subprocess, "Popen", popen)
+    monkeypatch.setattr(reframe_v2, "_analysis_size", lambda w, h: (4, 4))
+    cam, tr = _Cameraman(), _Tracker()
+    out = reframe_v2._analyze_trajectory(
+        "clip.mp4", SCENES, STRATS, 30.0, 4, 4, cam, tr)
     assert runs == [True, False]
     assert out == xs
 

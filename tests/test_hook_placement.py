@@ -260,8 +260,8 @@ class TestAddHookToVideo:
         monkeypatch.setattr(ffmpeg_utils, "_videotoolbox_ok", True)
         monkeypatch.setattr(ffmpeg_utils, "_announced_encoders", set())
         monkeypatch.setattr(
-            hooks.gpu_decode, "run",
-            lambda build, runner, **_kwargs: runner(build(False)))
+            hooks.gpu_decode, "select_attempt",
+            lambda path, render=True, backend=None: hooks.gpu_decode._attempt("cpu"))
 
         outputs = [
             str(tmp_path / name)

@@ -711,22 +711,23 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
         return (result.returncode == 0 and files_ok) or finished_before_crash(
             result, outputs)
 
-    def execute(command):
-        _log(f"🎬 Burning subtitles: {' '.join(command)}")
-        return gpu_decode.run(
-            lambda on_gpu: (
-                gpu_decode.on_card(command, video_path) if on_gpu else command
-            ),
-            lambda candidate: subprocess.run(
-                candidate, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
-            ok=complete,
-            path=video_path,
-        )
-
     def remove_partial_outputs():
         for path in outputs:
             if os.path.isfile(path):
                 os.remove(path)
+
+    def execute(command, backend=None):
+        _log(f"🎬 Burning subtitles: {' '.join(command)}")
+        return gpu_decode.run_command(
+            command,
+            lambda candidate: subprocess.run(
+                candidate, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
+            ok=complete,
+            path=video_path,
+            backend=backend,
+            before_cpu_retry=remove_partial_outputs,
+            retry_videotoolbox="h264_videotoolbox" not in command,
+        )
 
     result = run_encode(
         build,
@@ -734,6 +735,7 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
         complete,
         remove_partial_outputs,
         tier=QUALITY,
+        fallback_run_command=lambda command: execute(command, "cpu"),
     )
 
     if not complete(result):

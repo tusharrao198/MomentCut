@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 import ffmpeg_utils
+import gpu_decode
 from ffmpeg_utils import (
     AI_DISCLOSURE,
     DELIVERY,
@@ -172,6 +173,50 @@ def test_videotoolbox_failure_replays_complete_operation_with_x264(
     assert selected_video_encoder(QUALITY) == "x264"
 
 
+def test_videotoolbox_encoder_fallback_can_force_cpu_decode(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    primary = []
+    cpu = []
+
+    result = run_encode(
+        lambda args: list(args),
+        lambda command: (
+            primary.append(command),
+            subprocess.CompletedProcess(command, 1),
+        )[1],
+        lambda completed: completed.returncode == 0,
+        lambda: None,
+        fallback_run_command=lambda command: (
+            cpu.append(command),
+            subprocess.CompletedProcess(command, 0),
+        )[1],
+    )
+
+    assert result.returncode == 0
+    assert len(primary) == 1
+    assert "h264_videotoolbox" in primary[0]
+    assert len(cpu) == 1
+    assert "libx264" in cpu[0]
+
+
+def test_invalid_decode_configuration_is_not_hidden_as_encoder_fallback(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    fallbacks = []
+
+    with pytest.raises(gpu_decode.DecodeConfigurationError):
+        run_encode(
+            lambda args: list(args),
+            lambda command: (_ for _ in ()).throw(
+                gpu_decode.DecodeConfigurationError("bad decoder")),
+            lambda completed: completed.returncode == 0,
+            lambda: None,
+            fallback_run_command=lambda command: fallbacks.append(command),
+        )
+    assert fallbacks == []
+
+
 def test_command_build_error_is_not_replayed_as_encoder_failure(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
     monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
@@ -261,6 +306,15 @@ def test_apple_auto_cut_does_not_probe_nvenc(monkeypatch):
         ffmpeg_utils, "_probe_nvenc",
         lambda: pytest.fail("Apple intermediate cut must not probe NVENC"))
 
+    assert not ffmpeg_utils._gpu_cut_ok("source.mp4")
+
+
+def test_cpu_decode_override_disables_cuda_cut(monkeypatch):
+    monkeypatch.setenv("VIDEO_DECODE_BACKEND", "cpu")
+    monkeypatch.setenv("FFMPEG_ENCODER", "nvenc")
+    monkeypatch.setattr(
+        ffmpeg_utils, "nvenc_available",
+        lambda: pytest.fail("CPU override must not probe NVENC for a cut"))
     assert not ffmpeg_utils._gpu_cut_ok("source.mp4")
 
 
@@ -440,6 +494,50 @@ def test_failed_gpu_cut_falls_back_to_the_cpu_decode(_cut, monkeypatch):
     assert "-hwaccel" in fake.commands[0]
     assert "-hwaccel" not in fake.commands[1]
     assert len(fake.commands) == 2
+
+
+def test_apple_cut_uses_videotoolbox_decode_and_x264(monkeypatch, tmp_path):
+    output = tmp_path / "temp_clip.mp4"
+    fake = _FakeRun([(0, 5_000_000, "")])
+    monkeypatch.setenv("FFMPEG_ENCODER", "x264")
+    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_ok", lambda path: False)
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=True, backend=None: gpu_decode._attempt("videotoolbox"))
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", fake)
+
+    ffmpeg_utils.cut_clip("source.mp4", str(output), 1.5, 12.0, 4)
+
+    command = fake.commands[0]
+    assert command[command.index("-hwaccel") + 1] == "videotoolbox"
+    assert command[command.index("-hwaccel_output_format") + 1] == "videotoolbox_vld"
+    assert command[command.index("-vf") + 1] == gpu_decode.DOWNLOAD
+    assert "libx264" in command
+
+
+def test_failed_videotoolbox_cut_replays_complete_cpu_x264(
+        monkeypatch, tmp_path):
+    output = tmp_path / "temp_clip.mp4"
+    fake = _FakeRun([
+        (1, 100, "VideoToolbox malfunction"),
+        (0, 5_000_000, ""),
+    ])
+    monkeypatch.setenv("FFMPEG_ENCODER", "x264")
+    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_ok", lambda path: False)
+    monkeypatch.setattr(
+        gpu_decode, "select_attempt",
+        lambda path, render=True, backend=None: gpu_decode._attempt("videotoolbox"))
+    monkeypatch.setattr(ffmpeg_utils.subprocess, "run", fake)
+
+    ffmpeg_utils.cut_clip("source.mp4", str(output), 1.5, 12.0, 4)
+
+    assert len(fake.commands) == 2
+    assert "-hwaccel" in fake.commands[0]
+    assert "-hwaccel" not in fake.commands[1]
+    assert "libx264" in fake.commands[0]
+    assert "libx264" in fake.commands[1]
 
 
 # --- INTERMEDIATE: the cut is decoded again at once, so NVENC spends bits, not effort ---
