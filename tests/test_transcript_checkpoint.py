@@ -59,6 +59,12 @@ class TestNeverTheWrongTranscript:
         (tmp_path / main.TRANSCRIPT_CHECKPOINT).write_text(json.dumps(TRANSCRIPT))
         assert _load(tmp_path) is None
 
+    def test_different_whisper_engine_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WHISPER_ENGINE", "faster-whisper")
+        _save(tmp_path)
+        monkeypatch.setenv("WHISPER_ENGINE", "auto")
+        assert _load(tmp_path) is None
+
 
 class TestRobustness:
     def test_empty_transcript_is_ignored(self, tmp_path):

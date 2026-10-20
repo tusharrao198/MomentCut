@@ -212,6 +212,163 @@ def test_run_whisper_transcription_materializes_segments(fake_faster_whisper, mo
     assert info.language == "es"
 
 
+def test_whisper_auto_keeps_faster_whisper_off_apple(monkeypatch):
+    import accelerator_runtime
+
+    sentinel = {"text": "nvidia", "language": "en", "segments": []}
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_faster_whisper", lambda path, force_cpu=False: sentinel)
+    monkeypatch.setattr(
+        tb, "_run_mlx_whisper",
+        lambda *_args, **_kwargs: pytest.fail("MLX must not run off Apple"))
+
+    assert tb._transcribe_with_whisper("video.mp4") is sentinel
+
+
+def test_whisper_auto_selects_mlx_on_apple(monkeypatch):
+    import accelerator_runtime
+
+    sentinel = {"text": "apple", "language": "en", "segments": []}
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(tb, "_run_mlx_whisper",
+                        lambda *_args, **_kwargs: sentinel)
+
+    assert tb._transcribe_with_whisper("video.mp4") is sentinel
+
+
+def test_whisper_auto_falls_back_to_faster_whisper_cpu(monkeypatch):
+    import accelerator_runtime
+
+    sentinel = {"text": "cpu", "language": "en", "segments": []}
+    calls = []
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        tb, "_run_mlx_whisper",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("Metal failed")))
+    monkeypatch.setattr(
+        tb, "_transcribe_with_faster_whisper",
+        lambda path, force_cpu=False: (calls.append(force_cpu), sentinel)[1])
+
+    assert tb._transcribe_with_whisper("video.mp4") is sentinel
+    assert calls == [True]
+
+
+def test_faster_whisper_cuda_failure_keeps_existing_sticky_cpu_fallback(
+        monkeypatch):
+    calls = []
+
+    def run(_path, _force_cpu=False, **_params):
+        calls.append(_force_cpu)
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory")
+        return [], SimpleNamespace(duration=0, language="en")
+
+    monkeypatch.setattr(tb, "_whisper_force_cpu", False)
+    monkeypatch.setattr(tb, "_whisper_model", object())
+    monkeypatch.setattr(tb, "_run_whisper_once", run)
+
+    tb.run_whisper_transcription("video.mp4")
+
+    assert calls == [False, False]
+    assert tb._whisper_force_cpu is True
+    assert tb._whisper_model is None
+
+
+def test_faster_whisper_non_cuda_error_still_propagates(monkeypatch):
+    monkeypatch.setattr(tb, "_whisper_force_cpu", False)
+    monkeypatch.setattr(
+        tb, "_run_whisper_once",
+        lambda *_args, **_kwargs: (
+            _ for _ in ()).throw(RuntimeError("decoder failed")))
+
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        tb.run_whisper_transcription("video.mp4")
+
+
+def test_explicit_mlx_does_not_silently_fallback(monkeypatch):
+    import accelerator_runtime
+
+    monkeypatch.setenv("WHISPER_ENGINE", "mlx")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        tb, "_run_mlx_whisper",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("Metal failed")))
+    with pytest.raises(RuntimeError, match="Metal failed"):
+        tb._transcribe_with_whisper("video.mp4")
+
+
+def test_whisper_span_uses_mlx_with_forced_language(monkeypatch):
+    import accelerator_runtime
+
+    transcript = {
+        "text": "Hello.",
+        "language": "en",
+        "segments": [{
+            "start": 0.0,
+            "end": 1.0,
+            "text": "Hello.",
+            "words": [{"word": " Hello.", "start": 0.0, "end": 1.0}],
+        }],
+    }
+    calls = []
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        tb, "_run_mlx_whisper",
+        lambda audio, params, show_progress: (
+            calls.append((params, show_progress)), transcript)[1])
+
+    text, words = tb._whisper_span(object(), "en")
+    assert text == "Hello."
+    assert words[0]["word"] == " Hello."
+    assert calls[0][0]["language"] == "en"
+    assert calls[0][0]["vad_filter"] is False
+    assert calls[0][1] is False
+
+
+def test_whisper_config_identity_changes_with_engine(monkeypatch):
+    import accelerator_runtime
+
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    mlx = tb.whisper_config_identity()
+    monkeypatch.setenv("WHISPER_ENGINE", "faster-whisper")
+    faster = tb.whisper_config_identity()
+
+    assert mlx["resolved_whisper_engine"] == "mlx"
+    assert faster["resolved_whisper_engine"] == "faster-whisper"
+    assert mlx != faster
+
+
+def test_transcribe_media_owns_one_host_slot(monkeypatch):
+    events = []
+
+    class Slot:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *_args):
+            events.append("exit")
+
+    sentinel = {"text": "ok", "language": "en", "segments": []}
+    monkeypatch.setattr(tb, "host_asr_slot", Slot)
+    monkeypatch.setattr(tb, "_transcribe_media", lambda path: sentinel)
+    monkeypatch.setattr(tb, "release_models", lambda: events.append("release"))
+
+    assert tb.transcribe_media("video.mp4") is sentinel
+    assert events == ["enter", "release", "exit"]
+
+
 # --- release_models: the API process must not keep the models resident ------
 
 class _FakeCT2:

@@ -1812,10 +1812,21 @@ def _checkpoint_source_key(input_video, duration):
     return {"name": os.path.basename(input_video), "duration": round(float(duration), 1)}
 
 
+def _transcript_asr_key():
+    """Requested ASR identity that must match before a transcript is reused."""
+    from transcribe_backends import whisper_config_identity
+
+    return {
+        "backend": os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower(),
+        **whisper_config_identity(),
+    }
+
+
 def save_transcript_checkpoint(output_dir, transcript, input_video, duration):
     """Best effort: a failure here must never fail the job."""
     try:
         payload = {"source": _checkpoint_source_key(input_video, duration),
+                   "asr": _transcript_asr_key(),
                    "transcript": transcript}
         with open(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT), "w") as f:
             json.dump(payload, f)
@@ -1839,6 +1850,9 @@ def load_transcript_checkpoint(output_dir, input_video, duration):
         if source.get("name") != expected["name"] \
                 or abs(float(source.get("duration", -1)) - expected["duration"]) > 0.5:
             print("⏭️ Transcript checkpoint belongs to another source — ignoring it.")
+            return None
+        if payload.get("asr") != _transcript_asr_key():
+            print("⏭️ Transcript checkpoint used another ASR configuration — ignoring it.")
             return None
         transcript = payload.get("transcript") or {}
         if not transcript.get("segments"):
@@ -1883,23 +1897,11 @@ def _free_gpu_cache():
 
 def transcribe_video(video_path):
     print("🎙️  Transcribing video...")
-    from transcribe_backends import transcribe_media, release_models, host_asr_slot
+    from transcribe_backends import transcribe_media
 
-    # At most ASR_HOST_SLOTS jobs transcribe on the GPU at once, host-wide.
-    # Inside the slot, the model's VRAM is handed back before the long render
-    # phase: a job process used to keep Parakeet (onnxruntime CUDA arena)
-    # resident until it exited. Measured in prod on 22-sep-2026, a job three
-    # clips into its render still held 5.9 GB of the 20 GB card; eight such
-    # jobs filled it and NVENC / TransNetV2 failed with CUDA OOM (30-60% of
-    # jobs failing per hour at peak). Nothing after this point transcribes.
-    with host_asr_slot():
-        try:
-            transcript = transcribe_media(video_path)
-        finally:
-            try:
-                release_models()
-            except Exception as e:
-                print(f"⚠️ [ASR] could not release models ({type(e).__name__}: {e})")
+    # transcribe_media owns the one host-wide slot and releases ASR models
+    # before another process is admitted or this job starts rendering.
+    transcript = transcribe_media(video_path)
 
     print(f"   Detected language '{transcript['language']}', "
           f"{len(transcript['segments'])} segments")

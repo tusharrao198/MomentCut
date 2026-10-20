@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# N1: native Apple-Silicon Whisper. These versions are the combination
+# exercised by the local Mac benchmark before the adapter was added.
+huggingface-hub==2.2.0
+mlx==0.32.4
+mlx-whisper==0.4.3
