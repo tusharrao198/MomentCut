@@ -47,3 +47,22 @@ def resolve_whisper_engine(value=None) -> str:
             "WHISPER_ENGINE=mlx requires an Apple Silicon Mac"
         )
     return requested
+
+
+def resolve_parakeet_engine(value=None) -> str:
+    """Resolve N2 without changing the existing ONNX route off Apple."""
+    requested = (
+        os.environ.get("PARAKEET_ENGINE", "auto") if value is None else value
+    )
+    requested = str(requested or "auto").strip().lower()
+    if requested not in {"auto", "onnx", "mlx"}:
+        raise AcceleratorConfigurationError(
+            "PARAKEET_ENGINE must be auto, onnx, or mlx"
+        )
+    if requested == "auto":
+        return "mlx" if is_apple_silicon() else "onnx"
+    if requested == "mlx" and not is_apple_silicon():
+        raise AcceleratorConfigurationError(
+            "PARAKEET_ENGINE=mlx requires an Apple Silicon Mac"
+        )
+    return requested

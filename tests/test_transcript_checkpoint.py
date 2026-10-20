@@ -65,6 +65,13 @@ class TestNeverTheWrongTranscript:
         monkeypatch.setenv("WHISPER_ENGINE", "auto")
         assert _load(tmp_path) is None
 
+    def test_different_parakeet_engine_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRANSCRIBE_BACKEND", "parakeet")
+        monkeypatch.setenv("PARAKEET_ENGINE", "onnx")
+        _save(tmp_path)
+        monkeypatch.setenv("PARAKEET_ENGINE", "auto")
+        assert _load(tmp_path) is None
+
 
 class TestRobustness:
     def test_empty_transcript_is_ignored(self, tmp_path):

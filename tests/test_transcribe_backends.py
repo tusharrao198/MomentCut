@@ -115,6 +115,88 @@ def _valid_transcript(n_words=200, duration=120.0, language="es"):
             "segments": [{"start": 0.0, "end": duration, "text": "x", "words": words}]}
 
 
+def test_parakeet_auto_keeps_onnx_off_apple(monkeypatch):
+    import accelerator_runtime
+
+    sentinel = _valid_transcript()
+    monkeypatch.setenv("PARAKEET_ENGINE", "auto")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: False)
+    monkeypatch.setattr(tb, "_transcribe_with_parakeet", lambda path: sentinel)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_parakeet_mlx",
+        lambda path: pytest.fail("MLX must not run off Apple"))
+
+    assert tb._transcribe_with_selected_parakeet("video.mp4") is sentinel
+
+
+def test_parakeet_auto_selects_mlx_on_apple(monkeypatch):
+    import accelerator_runtime
+
+    sentinel = _valid_transcript()
+    monkeypatch.setenv("PARAKEET_ENGINE", "auto")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_parakeet_mlx", lambda path: sentinel)
+
+    assert tb._transcribe_with_selected_parakeet("video.mp4") is sentinel
+
+
+def test_parakeet_auto_runtime_failure_falls_through_n1(monkeypatch):
+    sentinel = {"text": "whisper", "language": "en", "segments": []}
+    monkeypatch.setenv("TRANSCRIBE_BACKEND", "parakeet")
+    monkeypatch.setenv("PARAKEET_ENGINE", "auto")
+    monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_selected_parakeet",
+        lambda path: (_ for _ in ()).throw(RuntimeError("Metal failed")))
+    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+
+    assert tb._transcribe_media("video.mp4") is sentinel
+
+
+def test_explicit_parakeet_engine_runtime_failure_propagates(monkeypatch):
+    monkeypatch.setenv("TRANSCRIBE_BACKEND", "parakeet")
+    monkeypatch.setenv("PARAKEET_ENGINE", "mlx")
+    monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_selected_parakeet",
+        lambda path: (_ for _ in ()).throw(RuntimeError("Metal failed")))
+
+    with pytest.raises(RuntimeError, match="Metal failed"):
+        tb._transcribe_media("video.mp4")
+
+
+def test_explicit_parakeet_quality_rejection_still_falls_through_n1(
+        monkeypatch):
+    rejected = {"text": "", "language": "en", "segments": []}
+    sentinel = {"text": "whisper", "language": "en", "segments": []}
+    monkeypatch.setenv("TRANSCRIBE_BACKEND", "parakeet")
+    monkeypatch.setenv("PARAKEET_ENGINE", "mlx")
+    monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_selected_parakeet", lambda path: rejected)
+    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
+
+    assert tb._transcribe_media("video.mp4") is sentinel
+
+
+def test_parakeet_config_identity_changes_with_engine(monkeypatch):
+    import accelerator_runtime
+
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setenv("PARAKEET_ENGINE", "auto")
+    mlx = tb.parakeet_config_identity()
+    monkeypatch.setenv("PARAKEET_ENGINE", "onnx")
+    onnx = tb.parakeet_config_identity()
+
+    assert mlx["resolved_parakeet_engine"] == "mlx"
+    assert onnx["resolved_parakeet_engine"] == "onnx"
+    assert mlx != onnx
+
+
 def test_fallback_reason_none_for_good_result():
     assert tb._parakeet_fallback_reason(_valid_transcript()) is None
 
@@ -141,8 +223,9 @@ def test_transcribe_media_falls_back_on_parakeet_exception(monkeypatch):
 
     sentinel = {"text": "ok", "language": "en", "segments": []}
     monkeypatch.setenv("TRANSCRIBE_BACKEND", "parakeet")
+    monkeypatch.setenv("PARAKEET_ENGINE", "auto")
     monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
-    monkeypatch.setattr(tb, "_transcribe_with_parakeet", boom)
+    monkeypatch.setattr(tb, "_transcribe_with_selected_parakeet", boom)
     monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda path: sentinel)
     assert tb.transcribe_media("video.mp4") is sentinel
 

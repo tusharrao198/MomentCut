@@ -263,12 +263,12 @@ def _transcribe_with_faster_whisper(media_path, force_cpu=False):
     return _faster_whisper_transcript(segments, info)
 
 
-def _release_loaded_mlx_model():
+def _release_loaded_mlx_models():
     module = sys.modules.get("mac_asr")
     if module is None:
         return False
     try:
-        return module.release_whisper_model()
+        return module.release_models()
     except Exception as e:
         print(f"⚠️ [ASR] MLX cleanup failed ({type(e).__name__}: {e})")
         return False
@@ -279,7 +279,7 @@ def _cleanup_failed_mlx():
     for _ in range(_ASR_SLOTS):
         _ASR_GATE.acquire()
     try:
-        _release_loaded_mlx_model()
+        _release_loaded_mlx_models()
     finally:
         for _ in range(_ASR_SLOTS):
             _ASR_GATE.release()
@@ -324,6 +324,37 @@ def whisper_config_identity():
         identity.update({"model": repository, "revision": revision})
     else:
         identity.update(get_whisper_config())
+    return identity
+
+
+def _requested_parakeet_engine():
+    return os.environ.get("PARAKEET_ENGINE", "auto").strip().lower() or "auto"
+
+
+def parakeet_config_identity():
+    """Stable requested N2 identity for transcript checkpoint validation."""
+    from accelerator_runtime import resolve_parakeet_engine
+
+    requested = _requested_parakeet_engine()
+    engine = resolve_parakeet_engine(requested)
+    identity = {
+        "parakeet_engine": requested,
+        "resolved_parakeet_engine": engine,
+    }
+    if engine == "mlx":
+        from mac_asr import resolve_parakeet_model
+        repository, revision = resolve_parakeet_model()
+        identity.update({
+            "model": repository,
+            "revision": revision,
+            "chunk_seconds": 120,
+            "overlap_seconds": 15,
+        })
+    else:
+        identity.update({
+            "model": PARAKEET_MODEL_ID,
+            "vad_batch": PARAKEET_VAD_BATCH,
+        })
     return identity
 
 
@@ -453,7 +484,7 @@ def release_models():
             whisper, _whisper_model, _whisper_key = _whisper_model, None, None
         with _parakeet_lock:
             parakeet, _parakeet_model = _parakeet_model, None
-        mlx_released = _release_loaded_mlx_model()
+        mlx_released = _release_loaded_mlx_models()
     finally:
         for _ in range(_ASR_SLOTS):
             _ASR_GATE.release()
@@ -556,6 +587,53 @@ def _transcribe_with_parakeet(media_path):
             os.remove(wav_path)
         except OSError:
             pass
+
+
+def _run_mlx_parakeet(wav_path, progress):
+    import mac_asr
+
+    def update(current, total):
+        if total:
+            progress.update(progress.total * float(current) / float(total))
+
+    try:
+        with _ASR_GATE:
+            transcript = mac_asr.transcribe_parakeet(
+                wav_path, chunk_callback=update)
+    except Exception:
+        _cleanup_failed_mlx()
+        raise
+    progress.update(progress.total)
+    transcript["language"] = _detect_language(transcript["text"])
+    return transcript
+
+
+def _transcribe_with_parakeet_mlx(media_path):
+    wav_path = _extract_wav(media_path)
+    try:
+        try:
+            duration = os.path.getsize(wav_path) / 32000.0
+        except OSError:
+            duration = 0.0
+        transcript = _run_mlx_parakeet(
+            wav_path, _TranscribeProgress(duration))
+        _repair_script_drift(transcript, wav_path)
+        return transcript
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+
+
+def _transcribe_with_selected_parakeet(media_path):
+    """Select MLX only on Apple; preserve ONNX everywhere else."""
+    from accelerator_runtime import resolve_parakeet_engine
+
+    engine = resolve_parakeet_engine(_requested_parakeet_engine())
+    if engine == "mlx":
+        return _transcribe_with_parakeet_mlx(media_path)
+    return _transcribe_with_parakeet(media_path)
 
 
 def _parakeet_transcript(results):
@@ -788,8 +866,12 @@ def _transcribe_media(media_path):
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
 
     if backend == "parakeet":
+        from accelerator_runtime import AcceleratorConfigurationError
+        from mac_asr import MacASRConfigurationError
+
+        requested = _requested_parakeet_engine()
         try:
-            transcript = _transcribe_with_parakeet(media_path)
+            transcript = _transcribe_with_selected_parakeet(media_path)
             reason = _parakeet_fallback_reason(transcript)
             if reason is None:
                 print(f"🎙️ [ASR] parakeet ok: lang={transcript['language']} "
@@ -797,7 +879,11 @@ def _transcribe_media(media_path):
                 return transcript
             print(f"⚠️ [ASR] parakeet result rejected ({reason}) — "
                   f"falling back to whisper")
+        except (MacASRConfigurationError, AcceleratorConfigurationError):
+            raise
         except Exception as e:
+            if requested != "auto":
+                raise
             print(f"⚠️ [ASR] parakeet failed ({type(e).__name__}: {e}) — "
                   f"falling back to whisper")
 

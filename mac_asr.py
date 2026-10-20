@@ -1,10 +1,11 @@
 """Lazy Apple-Silicon ASR adapters.
 
 Importing this module is safe on every platform: MLX and Hugging Face are
-loaded only when the Mac Whisper route is actually invoked.
+loaded only when an Apple-Silicon ASR route is actually invoked.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import subprocess
@@ -18,7 +19,7 @@ class MacASRConfigurationError(ValueError):
 
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
-_MODEL_ALIASES = {
+_WHISPER_MODEL_ALIASES = {
     "small": (
         "mlx-community/whisper-small-mlx",
         "45f3915923c7a79a5a5b5a7d909d39aeb0e5630e",
@@ -28,7 +29,15 @@ _MODEL_ALIASES = {
         "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
     ),
 }
-_model_lock = threading.Lock()
+_PARAKEET_MODEL = (
+    "mlx-community/parakeet-tdt-0.6b-v3",
+    "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15",
+)
+_whisper_lock = threading.Lock()
+_parakeet_lock = threading.Lock()
+_parakeet_model = None
+_parakeet_key = None
+_mlx_import_error = None
 
 
 def resolve_whisper_model():
@@ -37,7 +46,7 @@ def resolve_whisper_model():
     repository = os.environ.get("WHISPER_MLX_MODEL", "").strip()
     revision = os.environ.get("WHISPER_MLX_MODEL_REVISION", "").strip().lower()
 
-    default = _MODEL_ALIASES.get(alias)
+    default = _WHISPER_MODEL_ALIASES.get(alias)
     if not repository:
         if default is None:
             raise MacASRConfigurationError(
@@ -58,6 +67,22 @@ def resolve_whisper_model():
     return repository, revision
 
 
+def resolve_parakeet_model():
+    """Return the configured immutable Parakeet MLX model identity."""
+    repository = os.environ.get(
+        "PARAKEET_MLX_MODEL", _PARAKEET_MODEL[0]).strip()
+    revision = os.environ.get("PARAKEET_MLX_MODEL_REVISION", "").strip().lower()
+    if not revision and repository == _PARAKEET_MODEL[0]:
+        revision = _PARAKEET_MODEL[1]
+    if not repository:
+        raise MacASRConfigurationError("PARAKEET_MLX_MODEL cannot be empty")
+    if not _REVISION_RE.fullmatch(revision):
+        raise MacASRConfigurationError(
+            "PARAKEET_MLX_MODEL_REVISION must be a 40-character commit SHA"
+        )
+    return repository, revision
+
+
 def _snapshot_path(repository, revision):
     from huggingface_hub import snapshot_download
 
@@ -68,6 +93,22 @@ def _snapshot_path(repository, revision):
             f"Resolved MLX snapshot {resolved.name!r} does not match {revision!r}"
         )
     return str(resolved)
+
+
+def _import_mlx_package(name):
+    """Avoid re-importing MLX after a native-extension initialization failure."""
+    global _mlx_import_error
+    if _mlx_import_error is not None:
+        raise RuntimeError(
+            f"MLX initialization previously failed: {_mlx_import_error}"
+        )
+    try:
+        return importlib.import_module(name)
+    except (ImportError, OSError) as error:
+        _mlx_import_error = f"{type(error).__name__}: {error}"
+        raise RuntimeError(
+            f"{name} is unavailable; install requirements-macos.txt"
+        ) from error
 
 
 def _mlx_kwargs(params):
@@ -127,16 +168,11 @@ def _normalise_result(result):
 
 def transcribe_whisper(audio, **params):
     """Run pinned mlx-whisper and return the OpenShorts transcript contract."""
-    try:
-        import mlx_whisper
-    except (ImportError, OSError) as error:
-        raise RuntimeError(
-            "mlx-whisper is unavailable; install requirements-macos.txt"
-        ) from error
+    mlx_whisper = _import_mlx_package("mlx_whisper")
 
     repository, revision = resolve_whisper_model()
     model_path = _snapshot_path(repository, revision)
-    with _model_lock:
+    with _whisper_lock:
         result = mlx_whisper.transcribe(
             audio,
             path_or_hf_repo=model_path,
@@ -145,6 +181,61 @@ def transcribe_whisper(audio, **params):
     if not isinstance(result, dict):
         raise RuntimeError("mlx-whisper returned a non-object result")
     return _normalise_result(result)
+
+
+def _normalise_parakeet_result(result):
+    from subtitles import merge_continuation_words
+
+    segments = []
+    for source in getattr(result, "sentences", None) or []:
+        words = []
+        for item in getattr(source, "tokens", None) or []:
+            if getattr(item, "start", None) is None:
+                continue
+            start = float(item.start)
+            end = max(start, float(getattr(item, "end", start)))
+            text = str(getattr(item, "text", "") or "")
+            if not words and text and not text.startswith(" "):
+                text = " " + text
+            if text:
+                words.append({"word": text, "start": start, "end": end})
+        words.sort(key=lambda word: (word["start"], word["end"]))
+        words = merge_continuation_words(words)
+        if not words:
+            continue
+        text = str(getattr(source, "text", "") or "").strip()
+        segments.append({
+            "start": words[0]["start"],
+            "end": words[-1]["end"],
+            "text": text or "".join(word["word"] for word in words).strip(),
+            "words": words,
+        })
+    segments.sort(key=lambda segment: (segment["start"], segment["end"]))
+    text = str(getattr(result, "text", "") or "").strip()
+    if not text:
+        text = " ".join(segment["text"] for segment in segments)
+    return {"text": text, "segments": segments}
+
+
+def transcribe_parakeet(audio, *, chunk_callback=None):
+    """Run pinned parakeet-mlx and return normalized text and segments."""
+    parakeet_mlx = _import_mlx_package("parakeet_mlx")
+
+    repository, revision = resolve_parakeet_model()
+    model_path = _snapshot_path(repository, revision)
+    key = (repository, revision)
+    global _parakeet_model, _parakeet_key
+    with _parakeet_lock:
+        if _parakeet_model is None or _parakeet_key != key:
+            _parakeet_model = parakeet_mlx.from_pretrained(model_path)
+            _parakeet_key = key
+        result = _parakeet_model.transcribe(
+            audio,
+            chunk_duration=120,
+            overlap_duration=15,
+            chunk_callback=chunk_callback,
+        )
+    return _normalise_parakeet_result(result)
 
 
 def audio_duration_seconds(audio):
@@ -172,13 +263,35 @@ def audio_duration_seconds(audio):
 def release_whisper_model():
     """Release mlx-whisper state without importing MLX just to clear it."""
     released = False
-    with _model_lock:
+    with _whisper_lock:
         transcribe_module = sys.modules.get("mlx_whisper.transcribe")
         holder = getattr(transcribe_module, "ModelHolder", None)
         if holder is not None:
             released = getattr(holder, "model", None) is not None
             holder.model = None
             holder.model_path = None
+    core = sys.modules.get("mlx.core")
+    clear_cache = getattr(core, "clear_cache", None)
+    if callable(clear_cache):
+        clear_cache()
+    return released
+
+
+def release_models():
+    """Release both MLX ASR engines, then clear the shared MLX cache."""
+    global _parakeet_model, _parakeet_key
+    released = False
+    with _whisper_lock:
+        transcribe_module = sys.modules.get("mlx_whisper.transcribe")
+        holder = getattr(transcribe_module, "ModelHolder", None)
+        if holder is not None:
+            released = getattr(holder, "model", None) is not None
+            holder.model = None
+            holder.model_path = None
+    with _parakeet_lock:
+        released = released or _parakeet_model is not None
+        _parakeet_model = None
+        _parakeet_key = None
     core = sys.modules.get("mlx.core")
     clear_cache = getattr(core, "clear_cache", None)
     if callable(clear_cache):
