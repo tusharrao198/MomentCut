@@ -5271,13 +5271,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
                 return generate_srt_from_video(input_path, srt_path)
 
             loop = asyncio.get_event_loop()
-            try:
-                success = await loop.run_in_executor(None, run_transcribe_srt)
-            finally:
-                # The ASR models must not stay resident in the API process:
-                # they held 7.7 GB of VRAM idle (transcribe_backends.release_models).
-                import transcribe_backends
-                await loop.run_in_executor(None, transcribe_backends.release_models)
+            success = await loop.run_in_executor(None, run_transcribe_srt)
             if not success:
                 raise HTTPException(status_code=400, detail="No words found for this clip range.")
 
@@ -8174,13 +8168,7 @@ async def thumbnail_upload(
 
             from main import transcribe_video
             loop = asyncio.get_event_loop()
-            try:
-                transcript = await loop.run_in_executor(None, transcribe_video, vpath)
-            finally:
-                # See transcribe_backends.release_models: the API process is
-                # long-lived and the GPU is shared with every running job.
-                import transcribe_backends
-                await loop.run_in_executor(None, transcribe_backends.release_models)
+            transcript = await loop.run_in_executor(None, transcribe_video, vpath)
             segments = transcript.get("segments", [])
             duration = segments[-1]["end"] if segments else 0
 

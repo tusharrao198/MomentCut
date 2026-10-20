@@ -159,7 +159,7 @@ _whisper_lock = threading.Lock()
 _whisper_force_cpu = False
 
 
-def _get_whisper_model():
+def _get_whisper_model(force_cpu=False):
     """Process-wide WhisperModel singleton, rebuilt if the env config changes.
 
     Keeping the model resident avoids a full reload per transcription (which
@@ -167,7 +167,7 @@ def _get_whisper_model():
     """
     global _whisper_model, _whisper_key
     cfg = get_whisper_config()
-    if _whisper_force_cpu:
+    if _whisper_force_cpu or force_cpu:
         cfg["device"] = "cpu"
         cfg["compute_type"] = "int8"
     key = (cfg["model_size"], cfg["device"], cfg["compute_type"])
@@ -179,17 +179,21 @@ def _get_whisper_model():
     return _whisper_model, cfg["device"]
 
 
-def _whisper_device():
-    return "cpu" if _whisper_force_cpu else get_whisper_config()["device"]
+def _whisper_device(force_cpu=False):
+    return "cpu" if _whisper_force_cpu or force_cpu else get_whisper_config()["device"]
 
 
-def _run_whisper_once(media_path, **params):
-    gate = _ASR_GATE if _whisper_device() != "cpu" else _NULL_GATE
+def _run_whisper_once(media_path, _force_cpu=False, **params):
+    device = _whisper_device(True) if _force_cpu else _whisper_device()
+    gate = _ASR_GATE if device != "cpu" else _NULL_GATE
     # The model is fetched inside the gate: release_models() drains the gate
     # before unloading, so a transcription can never start on a model that is
     # being dropped underneath it.
     with gate:
-        model, _device = _get_whisper_model()
+        model, _device = (
+            _get_whisper_model(force_cpu=True)
+            if _force_cpu else _get_whisper_model()
+        )
         segments, info = model.transcribe(media_path, **params)
         progress = _TranscribeProgress(getattr(info, "duration", 0))
         materialized = []
@@ -226,9 +230,7 @@ def run_whisper_transcription(media_path, **params):
         return _run_whisper_once(media_path, **params)
 
 
-def _transcribe_with_whisper(media_path):
-    segments, info = run_whisper_transcription(media_path, **WHISPER_TRANSCRIBE_PARAMS)
-
+def _faster_whisper_transcript(segments, info):
     out_segments = []
     text_parts = []
     for segment in segments:
@@ -249,6 +251,106 @@ def _transcribe_with_whisper(media_path):
         "language": info.language,
         "segments": out_segments,
     }
+
+
+def _transcribe_with_faster_whisper(media_path, force_cpu=False):
+    if force_cpu:
+        segments, info = _run_whisper_once(
+            media_path, _force_cpu=True, **WHISPER_TRANSCRIBE_PARAMS)
+    else:
+        segments, info = run_whisper_transcription(
+            media_path, **WHISPER_TRANSCRIBE_PARAMS)
+    return _faster_whisper_transcript(segments, info)
+
+
+def _release_loaded_mlx_model():
+    module = sys.modules.get("mac_asr")
+    if module is None:
+        return False
+    try:
+        return module.release_whisper_model()
+    except Exception as e:
+        print(f"⚠️ [ASR] MLX cleanup failed ({type(e).__name__}: {e})")
+        return False
+
+
+def _cleanup_failed_mlx():
+    """Clear shared MLX state only after every in-process ASR slot is idle."""
+    for _ in range(_ASR_SLOTS):
+        _ASR_GATE.acquire()
+    try:
+        _release_loaded_mlx_model()
+    finally:
+        for _ in range(_ASR_SLOTS):
+            _ASR_GATE.release()
+
+
+def _run_mlx_whisper(audio, params, show_progress):
+    import mac_asr
+
+    try:
+        with _ASR_GATE:
+            transcript = mac_asr.transcribe_whisper(audio, **params)
+    except Exception:
+        _cleanup_failed_mlx()
+        raise
+
+    if show_progress:
+        progress = _TranscribeProgress(mac_asr.audio_duration_seconds(audio))
+        for segment in transcript["segments"]:
+            progress.update(segment["end"])
+        progress.update(progress.total)
+    return transcript
+
+
+def _requested_whisper_engine():
+    return os.environ.get("WHISPER_ENGINE", "auto").strip().lower() or "auto"
+
+
+def whisper_config_identity():
+    """Stable requested N1 identity for transcript checkpoint validation."""
+    from accelerator_runtime import resolve_whisper_engine
+
+    requested = _requested_whisper_engine()
+    engine = resolve_whisper_engine(requested)
+    identity = {
+        "whisper_engine": requested,
+        "resolved_whisper_engine": engine,
+        "params": dict(WHISPER_TRANSCRIBE_PARAMS),
+    }
+    if engine == "mlx":
+        from mac_asr import resolve_whisper_model
+        repository, revision = resolve_whisper_model()
+        identity.update({"model": repository, "revision": revision})
+    else:
+        identity.update(get_whisper_config())
+    return identity
+
+
+def _transcribe_with_whisper(media_path):
+    """Use MLX on Apple Silicon and preserve faster-whisper everywhere else."""
+    from accelerator_runtime import resolve_whisper_engine
+    from mac_asr import MacASRConfigurationError
+
+    requested = _requested_whisper_engine()
+    engine = resolve_whisper_engine(requested)
+    if engine == "faster-whisper":
+        return _transcribe_with_faster_whisper(media_path)
+
+    try:
+        transcript = _run_mlx_whisper(
+            media_path, WHISPER_TRANSCRIBE_PARAMS, show_progress=True)
+        print(f"🎙️ [ASR] mlx-whisper ok: lang={transcript['language']} "
+              f"segments={len(transcript['segments'])}")
+        return transcript
+    except MacASRConfigurationError:
+        raise
+    except Exception as e:
+        if requested == "mlx":
+            raise
+        print(f"⚠️ [ASR] mlx-whisper failed ({type(e).__name__}: {e}) — "
+              "falling back to faster-whisper on CPU")
+        return _transcribe_with_faster_whisper(media_path, force_cpu=True)
 
 
 # --- parakeet ---------------------------------------------------------------
@@ -334,21 +436,16 @@ def _get_parakeet_model():
 def release_models():
     """Drop the resident ASR models and hand their VRAM back to the GPU.
 
-    main.py runs one job per process, so its singletons die with the job.
-    The API process is different: ``/api/subtitle`` on a dubbed clip and the
-    thumbnail studio transcribe in-process, and after the first such request
-    the models sit in the long-lived uvicorn process for good. Measured in
-    prod on 17-sep-2026: the API held 7.7 GB of a 20 GB GPU while idle
-    (ctranslate2 whisper + onnxruntime CUDA parakeet + torch), and with eight
-    jobs running alongside it NVENC could not open a session ("Generic error
-    in an external library", exit 187, 0 bytes) and TransNetV2 hit CUDA OOM:
-    5 of 12 jobs failed. The API calls this after each in-process
-    transcription; a job process never needs to.
+    ``transcribe_media`` calls this before releasing its host-wide slot, for
+    both short-lived workers and the long-lived API process.  That prevents
+    CTranslate2, ONNX Runtime or MLX state from remaining resident while a
+    render or another admitted transcription starts.
 
     Drains every gate slot first, so no transcription is mid-decode on the
     model being dropped, and both loaders fetch their model inside the gate.
     """
     global _whisper_model, _whisper_key, _parakeet_model
+    mlx_released = False
     for _ in range(_ASR_SLOTS):
         _ASR_GATE.acquire()
     try:
@@ -356,6 +453,7 @@ def release_models():
             whisper, _whisper_model, _whisper_key = _whisper_model, None, None
         with _parakeet_lock:
             parakeet, _parakeet_model = _parakeet_model, None
+        mlx_released = _release_loaded_mlx_model()
     finally:
         for _ in range(_ASR_SLOTS):
             _ASR_GATE.release()
@@ -380,7 +478,7 @@ def release_models():
             torch.cuda.empty_cache()
     except Exception:
         pass
-    if "onnxruntime" in sys.modules or "faster_whisper" in sys.modules:
+    if mlx_released or "onnxruntime" in sys.modules or "faster_whisper" in sys.modules:
         print("🧹 [ASR] resident models released")
 
 
@@ -527,16 +625,14 @@ def _read_wav_16k(wav_path):
     return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def _whisper_span(audio, language):
-    """Whisper words for one short audio span (seconds relative to the span).
-
-    Calls the model directly rather than through run_whisper_transcription so
-    the user-facing progress lines are not printed once per span.
-    """
+def _faster_whisper_span(audio, language, force_cpu=False):
     params = dict(WHISPER_TRANSCRIBE_PARAMS, language=language, vad_filter=False)
-    gate = _ASR_GATE if _whisper_device() != "cpu" else _NULL_GATE
+    gate = _ASR_GATE if _whisper_device(force_cpu) != "cpu" else _NULL_GATE
     with gate:
-        model, _device = _get_whisper_model()
+        model, _device = (
+            _get_whisper_model(force_cpu=True)
+            if force_cpu else _get_whisper_model()
+        )
         segments, _info = model.transcribe(audio, **params)
         segments = list(segments)
     words = [
@@ -545,6 +641,38 @@ def _whisper_span(audio, language):
     ]
     text = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
     return text, merge_continuation_words(words)
+
+
+def _whisper_span(audio, language):
+    """Whisper words for one short audio span (seconds relative to the span).
+
+    Calls the selected engine without full-file progress output.  Apple
+    ``auto`` uses MLX; every non-Apple route remains faster-whisper.
+    """
+    from accelerator_runtime import resolve_whisper_engine
+    from mac_asr import MacASRConfigurationError
+
+    requested = _requested_whisper_engine()
+    if resolve_whisper_engine(requested) == "faster-whisper":
+        return _faster_whisper_span(audio, language)
+
+    params = dict(WHISPER_TRANSCRIBE_PARAMS, language=language, vad_filter=False)
+    try:
+        transcript = _run_mlx_whisper(audio, params, show_progress=False)
+        words = [
+            word
+            for segment in transcript["segments"]
+            for word in segment.get("words", [])
+        ]
+        return transcript["text"], merge_continuation_words(words)
+    except MacASRConfigurationError:
+        raise
+    except Exception as e:
+        if requested == "mlx":
+            raise
+        print(f"⚠️ [ASR] MLX repair span failed ({type(e).__name__}: {e}) — "
+              "falling back to faster-whisper on CPU")
+        return _faster_whisper_span(audio, language, force_cpu=True)
 
 
 def _repair_script_drift(transcript, wav_path):
@@ -647,8 +775,7 @@ def _has_audio_stream(media_path) -> bool:
         return True  # probe failed — don't block, let the backend try
 
 
-def transcribe_media(media_path):
-    """Transcribe with the configured backend, falling back to whisper."""
+def _transcribe_media(media_path):
     # Silent videos (AI-generated clips, muted screen recordings) have no audio
     # stream; every ASR backend then crashes deep inside libav with an opaque
     # "tuple index out of range". Detect it up front and fail with a clear,
@@ -675,3 +802,16 @@ def transcribe_media(media_path):
                   f"falling back to whisper")
 
     return _transcribe_with_whisper(media_path)
+
+
+def transcribe_media(media_path):
+    """Transcribe and clean up through exactly one host-wide ASR slot."""
+    with host_asr_slot():
+        try:
+            return _transcribe_media(media_path)
+        finally:
+            try:
+                release_models()
+            except Exception as e:
+                print(f"⚠️ [ASR] could not release models "
+                      f"({type(e).__name__}: {e})")

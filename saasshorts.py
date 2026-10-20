@@ -1073,17 +1073,10 @@ def transcribe_audio_for_subs(audio_path: str) -> list:
     Transcribe audio with word-level timestamps via the configured ASR backend.
     Returns list of {"word": str, "start": float, "end": float}.
     """
-    from transcribe_backends import transcribe_media, release_models
+    from transcribe_backends import transcribe_media
 
     print(f"[SaaSShorts] 🎙️ Transcribing audio for subtitles...")
-    try:
-        transcript = transcribe_media(audio_path)
-    finally:
-        # This runs inside the API process, like the thumbnail studio and
-        # the dubbed-subtitle path: the models must not stay resident
-        # (transcribe_backends.release_models). Measured 17-sep-2026, 30 min
-        # after a deploy: one SaaSShorts job left uvicorn holding 5.1 GB.
-        release_models()
+    transcript = transcribe_media(audio_path)
 
     words = [
         {"word": w["word"].strip(), "start": w["start"], "end": w["end"]}
