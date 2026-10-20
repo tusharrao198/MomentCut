@@ -197,9 +197,15 @@ class TestFfmpegCommands:
 
     def test_single_segment_cuts_straight_to_output(self, tmp_path):
         ran = []
+
+        def fake_run(command):
+            ran.append(command)
+            with open(command[-1], "wb") as f:
+                f.write(b"x")
+
         recut.run_cut_concat("in.mp4", [_seg(10, 20)],
                              str(tmp_path / "out.mp4"), str(tmp_path),
-                             runner=ran.append)
+                             runner=fake_run)
         assert len(ran) == 1
         assert ran[0][-1] == str(tmp_path / "out.mp4")
 

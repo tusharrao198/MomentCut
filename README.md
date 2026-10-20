@@ -260,7 +260,7 @@ services:
 WHISPER_MODEL=large-v3-turbo
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE=float16
-FFMPEG_ENCODER=auto           # probes h264_nvenc at startup, falls back to x264
+FFMPEG_ENCODER=auto           # VideoToolbox on Apple Silicon, NVENC elsewhere, then x264
 TRANSCRIBE_BACKEND=parakeet   # optional: ~2x faster than whisper, 25 European languages, auto-falls back to whisper
 ASR_GPU_CONCURRENCY=1
 ```

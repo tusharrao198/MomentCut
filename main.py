@@ -39,8 +39,8 @@ from clip_selection import (build_transcript_windows, clip_count_targets,
                             normalise_detail_candidates,
                             reconcile_scored_windows, score_batches, shortlist_target,
                             snap_clip_to_words_in_window, trim_to_best)
-from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
-                          QUALITY_FAST, METADATA_SCRUB)
+from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, run_encode,
+                          QUALITY, QUALITY_FAST, METADATA_SCRUB, X264)
 from dotenv import load_dotenv
 import json
 
@@ -1416,12 +1416,27 @@ def trim_subtitle_band(input_video, band):
     root, ext = os.path.splitext(input_video)
     out = f"{root}_nosubs{ext or '.mp4'}"
     try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", input_video,
-             "-vf", burned_subtitles.crop_filter(band),
-             *video_encode_args(QUALITY_FAST), "-c:a", "copy", out],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            timeout=1800)
+        result = run_encode(
+            lambda encode_args: [
+                "ffmpeg", "-y", "-loglevel", "error", "-i", input_video,
+                "-vf", burned_subtitles.crop_filter(band),
+                *encode_args, "-c:a", "copy", out,
+            ],
+            lambda command: subprocess.run(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=1800),
+            lambda completed: (
+                completed.returncode == 0
+                and os.path.isfile(out)
+                and os.path.getsize(out) > 0
+            ),
+            lambda: os.path.isfile(out) and os.remove(out),
+            tier=QUALITY_FAST,
+        )
+        if (result.returncode != 0 or not os.path.isfile(out)
+                or os.path.getsize(out) == 0):
+            raise subprocess.CalledProcessError(
+                result.returncode, result.args, result.stdout, result.stderr)
         return out
     except (subprocess.SubprocessError, OSError) as e:
         print(f"   ⚠️ Could not trim the source subtitles ({e}) — rendering as is.")
@@ -1526,17 +1541,42 @@ def apply_watermark(video_path, output_path=None):
 
     filt = watermark_filter(vw, vh)
     tmp_path = (output_path or video_path) + ".wm.mp4"
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", logo_path,
-           "-filter_complex", filt,
-           *video_encode_args(QUALITY), "-c:a", "copy", *METADATA_SCRUB,
-           "-movflags", "+faststart", tmp_path]
-    result = gpu_decode.run(
-        lambda on_gpu: gpu_decode.on_card(cmd, video_path) if on_gpu else cmd,
-        lambda c: subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                 timeout=1800),
-        ok=lambda r: r.returncode == 0 and os.path.exists(tmp_path),
-        path=video_path)
-    if result.returncode == 0 and os.path.exists(tmp_path):
+
+    def build(encode_args):
+        return ["ffmpeg", "-y", "-i", video_path, "-i", logo_path,
+                "-filter_complex", filt,
+                *encode_args, "-c:a", "copy", *METADATA_SCRUB,
+                "-movflags", "+faststart", tmp_path]
+
+    def execute(command):
+        return gpu_decode.run(
+            lambda on_gpu: (
+                gpu_decode.on_card(command, video_path) if on_gpu else command
+            ),
+            lambda candidate: subprocess.run(
+                candidate, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=1800),
+            ok=lambda completed: (
+                completed.returncode == 0
+                and os.path.isfile(tmp_path)
+                and os.path.getsize(tmp_path) > 0
+            ),
+            path=video_path,
+        )
+
+    result = run_encode(
+        build,
+        execute,
+        lambda completed: (
+            completed.returncode == 0
+            and os.path.isfile(tmp_path)
+            and os.path.getsize(tmp_path) > 0
+        ),
+        lambda: os.path.isfile(tmp_path) and os.remove(tmp_path),
+        tier=QUALITY,
+    )
+    if (result.returncode == 0 and os.path.isfile(tmp_path)
+            and os.path.getsize(tmp_path) > 0):
         os.replace(tmp_path, output_path or video_path)
         return True
     err = (result.stderr or b"").decode(errors="ignore")[-300:]
@@ -1664,7 +1704,7 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
          '-f', 'rawvideo', '-pix_fmt', 'bgr24',
          '-video_size', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}',
          '-framerate', str(fps), '-i', 'pipe:0',
-         *video_encode_args(QUALITY_FAST), '-an', silent_video_path],
+         *video_encode_args(QUALITY_FAST, encoder=X264), '-an', silent_video_path],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     reader = cv2.VideoCapture(input_video)

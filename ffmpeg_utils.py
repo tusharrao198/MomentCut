@@ -4,7 +4,9 @@ FFMPEG_ENCODER env values:
   x264  (default) — CPU libx264, exact pre-GPU behavior
   nvenc           — force h264_nvenc; probed once and falls back to x264
                     (with a warning) if the GPU/driver is unavailable
-  auto            — h264_nvenc when the probe succeeds, else x264
+  videotoolbox    — force h264_videotoolbox; probed once and falls back to x264
+  auto            — VideoToolbox on Apple Silicon, otherwise the existing
+                    NVENC-then-x264 selection
 
 Only the codec/quality args live here; surrounding args (-movflags, -pix_fmt,
 audio codecs, filters) stay at each call site.
@@ -13,6 +15,8 @@ import os
 import subprocess
 import threading
 import time
+
+from accelerator_runtime import is_apple_silicon
 
 # Quality tiers pinning the historical libx264 settings.
 QUALITY = "quality"            # was: -preset medium -crf 18
@@ -47,6 +51,19 @@ _NVENC_ARGS = {
                "-rc", "vbr", "-cq", "29", "-b:v", "0", "-spatial-aq", "1",
                "-pix_fmt", "yuv420p"],
 }
+
+_VIDEOTOOLBOX_ARGS = {
+    QUALITY: ["-c:v", "h264_videotoolbox", "-q:v", "75",
+              "-allow_sw", "0", "-pix_fmt", "yuv420p"],
+    QUALITY_FAST: ["-c:v", "h264_videotoolbox", "-q:v", "75",
+                   "-allow_sw", "0", "-pix_fmt", "yuv420p"],
+    DELIVERY: ["-c:v", "h264_videotoolbox", "-q:v", "65",
+               "-allow_sw", "0", "-pix_fmt", "yuv420p"],
+}
+
+X264 = "x264"
+NVENC = "nvenc"
+VIDEOTOOLBOX = "videotoolbox"
 
 # Output args that drop container/stream metadata carried over from the source
 # — most notably YouTube's "produced by Google Inc." stream handler, which
@@ -148,7 +165,8 @@ def audio_encode_args():
 
 _probe_lock = threading.Lock()
 _nvenc_ok = None  # None = not probed yet
-_announced = False
+_videotoolbox_ok = None
+_announced_encoders = set()
 
 
 def _probe_nvenc():
@@ -181,36 +199,155 @@ def nvenc_available():
     return _nvenc_ok
 
 
+def _probe_videotoolbox():
+    """Prove that FFmpeg can complete a hardware-only VideoToolbox encode."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
+        "-frames:v", "1", "-c:v", "h264_videotoolbox",
+        "-allow_sw", "0", "-pix_fmt", "yuv420p", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def videotoolbox_available():
+    """Probe h264_videotoolbox once and cache the verdict."""
+    global _videotoolbox_ok
+    if _videotoolbox_ok is None:
+        with _probe_lock:
+            if _videotoolbox_ok is None:
+                _videotoolbox_ok = _probe_videotoolbox()
+    return _videotoolbox_ok
+
+
 def reset_encoder_cache():
     """Test hook: forget the cached probe result."""
-    global _nvenc_ok, _announced
+    global _nvenc_ok, _videotoolbox_ok, _announced_encoders
     with _probe_lock:
         _nvenc_ok = None
-        _announced = False
+        _videotoolbox_ok = None
+        _announced_encoders = set()
 
 
-def video_encode_args(tier=QUALITY):
-    """Return the codec/quality args for one encode, honoring FFMPEG_ENCODER."""
-    global _announced
+def selected_video_encoder(tier=QUALITY):
+    """Return x264, nvenc or videotoolbox for this encode tier."""
     if tier not in _X264_ARGS:
         raise ValueError(f"Unknown encode tier: {tier!r}")
 
     mode = os.environ.get("FFMPEG_ENCODER", "x264").strip().lower()
-    use_nvenc = False
-    if mode in ("nvenc", "auto"):
-        use_nvenc = nvenc_available()
-        if mode == "nvenc" and not use_nvenc:
+    if mode not in {X264, NVENC, VIDEOTOOLBOX, "auto"}:
+        print(f"⚠️ [Encoder] Unknown FFMPEG_ENCODER={mode!r}; using libx264")
+        mode = X264
+
+    # This file is decoded again immediately. The measured Mac route keeps
+    # the intermediate on x264 and should not probe VideoToolbox just to
+    # decide not to use it.
+    if tier == INTERMEDIATE and (
+        mode == VIDEOTOOLBOX or (mode == "auto" and is_apple_silicon())
+    ):
+        return X264
+
+    if mode == NVENC:
+        encoder = NVENC if nvenc_available() else X264
+        if encoder == X264:
             print("⚠️ [Encoder] FFMPEG_ENCODER=nvenc but h264_nvenc is not "
                   "usable here — falling back to libx264")
+    elif mode == VIDEOTOOLBOX:
+        encoder = VIDEOTOOLBOX if videotoolbox_available() else X264
+        if encoder == X264:
+            print("⚠️ [Encoder] FFMPEG_ENCODER=videotoolbox but "
+                  "h264_videotoolbox is not usable here — falling back to libx264")
+    elif mode == "auto":
+        if is_apple_silicon():
+            encoder = VIDEOTOOLBOX if videotoolbox_available() else X264
+        else:
+            encoder = NVENC if nvenc_available() else X264
+    else:
+        encoder = X264
 
-    if not _announced:
-        _announced = True
-        print(f"🎞️ [Encoder] video encoder: {'h264_nvenc' if use_nvenc else 'libx264'} "
-              f"(FFMPEG_ENCODER={mode})")
+    return encoder
 
-    if use_nvenc and tier == INTERMEDIATE:
-        return _intermediate_nvenc_args()
-    return list((_NVENC_ARGS if use_nvenc else _X264_ARGS)[tier])
+
+def _video_encode_args(tier, encoder):
+    if encoder == NVENC:
+        if tier == INTERMEDIATE:
+            return _intermediate_nvenc_args()
+        return list(_NVENC_ARGS[tier])
+    if encoder == VIDEOTOOLBOX and tier != INTERMEDIATE:
+        return list(_VIDEOTOOLBOX_ARGS[tier])
+    return list(_X264_ARGS[tier])
+
+
+def _announce_encoder(encoder):
+    global _announced_encoders
+    if encoder in _announced_encoders:
+        return
+    _announced_encoders.add(encoder)
+    codec = {
+        X264: "libx264",
+        NVENC: "h264_nvenc",
+        VIDEOTOOLBOX: "h264_videotoolbox",
+    }[encoder]
+    mode = os.environ.get("FFMPEG_ENCODER", "x264").strip().lower()
+    print(f"🎞️ [Encoder] video encoder: {codec} (FFMPEG_ENCODER={mode})")
+
+
+def video_encode_args(tier=QUALITY, *, encoder=None):
+    """Return fresh codec/quality args for the selected or requested encoder."""
+    selected = selected_video_encoder(tier) if encoder is None else encoder
+    if selected not in {X264, NVENC, VIDEOTOOLBOX}:
+        raise ValueError(f"Unknown video encoder: {selected!r}")
+
+    if encoder is None:
+        _announce_encoder(selected)
+
+    return _video_encode_args(tier, selected)
+
+
+def _disable_videotoolbox():
+    global _videotoolbox_ok
+    with _probe_lock:
+        _videotoolbox_ok = False
+
+
+def run_encode(build_command, run_command, validate_outputs,
+               remove_partial_outputs, *, tier=QUALITY):
+    """Run one replayable encode, retrying only VideoToolbox with x264.
+
+    ``build_command`` receives the codec arguments. ``validate_outputs`` owns
+    the caller's existing success definition. A successful x264 replay disables
+    VideoToolbox for later operations in this process.
+    """
+    encoder = selected_video_encoder(tier)
+    _announce_encoder(encoder)
+
+    # Command construction is caller code, not an encoder-runtime failure.
+    # Build outside the guarded execution so a bad graph/argv is not
+    # incorrectly retried and reported as a VideoToolbox problem.
+    command = build_command(_video_encode_args(tier, encoder))
+    try:
+        result = run_command(command)
+    except Exception:
+        if encoder != VIDEOTOOLBOX:
+            raise
+    else:
+        if validate_outputs(result) or encoder != VIDEOTOOLBOX:
+            return result
+
+    remove_partial_outputs()
+    fallback_command = build_command(_video_encode_args(tier, X264))
+    result = run_command(fallback_command)
+    if validate_outputs(result):
+        _disable_videotoolbox()
+        print("⚠️ [Encoder] VideoToolbox render failed; completed the operation "
+              "with libx264 and disabled VideoToolbox for this process")
+    return result
 
 
 def _intermediate_nvenc_args():
@@ -327,7 +464,12 @@ def _source_format(path):
 def _gpu_cut_ok(input_video):
     if os.environ.get("FFMPEG_GPU_CUT", "1").strip() == "0":
         return False
-    if os.environ.get("FFMPEG_ENCODER", "x264").strip().lower() not in ("nvenc", "auto"):
+    mode = os.environ.get("FFMPEG_ENCODER", "x264").strip().lower()
+    if mode not in ("nvenc", "auto"):
+        return False
+    # N3 keeps the Apple intermediate on x264. Do not make an unrelated
+    # NVENC probe after the encoder resolver has already selected that route.
+    if mode == "auto" and is_apple_silicon():
         return False
     if input_video not in _gpu_cut_sources:
         fmt = _source_format(input_video) if nvenc_available() else None

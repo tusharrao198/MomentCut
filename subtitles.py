@@ -3,8 +3,8 @@ import re
 import subprocess
 import sys
 
-from ffmpeg_utils import (video_encode_args, escape_filter_value, QUALITY,
-                          METADATA_SCRUB, finished_before_crash)
+from ffmpeg_utils import (escape_filter_value, QUALITY, METADATA_SCRUB,
+                          finished_before_crash, run_encode)
 import gpu_decode
 
 
@@ -681,33 +681,62 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
                           border_color=border_color, border_width=border_width,
                           bg_color=bg_color, bg_opacity=bg_opacity)
 
-    tail = ['-c:a', 'copy', *video_encode_args(QUALITY), *METADATA_SCRUB,
-            '-movflags', '+faststart']
     outputs = [output_path]
     size = _video_size(video_path) if mark else None
     if size:
-        logo_path, make_filter, mark_path = mark
-        marked = make_filter(size[0], size[1], video="[sm]", logo="[1:v]", out="[m]")
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-i', logo_path,
-            '-filter_complex', f"[0:v]{vf},split=2[s][sm];{marked}",
-            '-map', '[s]', '-map', '0:a?', *tail, output_path,
-            '-map', '[m]', '-map', '0:a?', *tail, mark_path,
-        ]
-        outputs.append(mark_path)
-    else:
-        cmd = ['ffmpeg', '-y', '-i', video_path, '-vf', vf, *tail, output_path]
+        outputs.append(mark[2])
 
-    _log(f"🎬 Burning subtitles: {' '.join(cmd)}")
-    result = gpu_decode.run(
-        lambda on_gpu: gpu_decode.on_card(cmd, video_path) if on_gpu else cmd,
-        lambda c: subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
-        ok=lambda r: r.returncode == 0 or finished_before_crash(r, outputs),
-        path=video_path)
+    def build(encode_args):
+        tail = ['-c:a', 'copy', *encode_args, *METADATA_SCRUB,
+                '-movflags', '+faststart']
+        if size:
+            logo_path, make_filter, mark_path = mark
+            marked = make_filter(
+                size[0], size[1], video="[sm]", logo="[1:v]", out="[m]")
+            return [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-i', logo_path,
+                '-filter_complex', f"[0:v]{vf},split=2[s][sm];{marked}",
+                '-map', '[s]', '-map', '0:a?', *tail, output_path,
+                '-map', '[m]', '-map', '0:a?', *tail, mark_path,
+            ]
+        return ['ffmpeg', '-y', '-i', video_path, '-vf', vf, *tail, output_path]
 
-    if result.returncode != 0 and not finished_before_crash(result, outputs):
+    def complete(result):
+        files_ok = all(
+            os.path.isfile(path) and os.path.getsize(path) > 0
+            for path in outputs
+        )
+        return (result.returncode == 0 and files_ok) or finished_before_crash(
+            result, outputs)
+
+    def execute(command):
+        _log(f"🎬 Burning subtitles: {' '.join(command)}")
+        return gpu_decode.run(
+            lambda on_gpu: (
+                gpu_decode.on_card(command, video_path) if on_gpu else command
+            ),
+            lambda candidate: subprocess.run(
+                candidate, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE),
+            ok=complete,
+            path=video_path,
+        )
+
+    def remove_partial_outputs():
+        for path in outputs:
+            if os.path.isfile(path):
+                os.remove(path)
+
+    result = run_encode(
+        build,
+        execute,
+        complete,
+        remove_partial_outputs,
+        tier=QUALITY,
+    )
+
+    if not complete(result):
         stderr_text = result.stderr.decode(errors='replace')
         _log(f"❌ FFmpeg Subtitle Error: {stderr_text}")
         raise Exception(f"FFmpeg failed: {stderr_text}")
