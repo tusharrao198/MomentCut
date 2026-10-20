@@ -1814,12 +1814,19 @@ def _checkpoint_source_key(input_video, duration):
 
 def _transcript_asr_key():
     """Requested ASR identity that must match before a transcript is reused."""
-    from transcribe_backends import whisper_config_identity
+    from transcribe_backends import (
+        parakeet_config_identity,
+        whisper_config_identity,
+    )
 
-    return {
-        "backend": os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower(),
+    backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
+    identity = {
+        "backend": backend,
         **whisper_config_identity(),
     }
+    if backend == "parakeet":
+        identity["parakeet"] = parakeet_config_identity()
+    return identity
 
 
 def save_transcript_checkpoint(output_dir, transcript, input_video, duration):
