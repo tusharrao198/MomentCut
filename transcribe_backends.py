@@ -520,7 +520,17 @@ def release_models():
     # behind (scene_detection keeps it as a module singleton too).
     tn2 = sys.modules.get("scene_detection")
     if tn2 is not None:
-        tn2._tn2_model = None
+        try:
+            release_tn2 = getattr(tn2, "release_transnetv2_model", None)
+            if callable(release_tn2):
+                release_tn2()
+            else:
+                tn2._tn2_model = None
+        except Exception as e:
+            # This is a best-effort allocator release. Never turn successful
+            # transcription into a failed job because cleanup was unavailable.
+            print(f"⚠️ [ASR] TransNetV2 cleanup failed "
+                  f"({type(e).__name__}: {e})")
     import gc
     gc.collect()
     try:

@@ -28,6 +28,7 @@ import numpy as np
 from scenedetect import open_video, SceneManager, FrameTimecode
 from scenedetect.detectors import ContentDetector
 
+import accelerator_runtime
 import gpu_decode
 
 # TransNetV2 input size (width x height), fixed by the trained model.
@@ -76,6 +77,30 @@ def _get_tn2_model():
         model.eval()
         _tn2_model = model
     return _tn2_model
+
+
+def _clear_mps_cache_if_active(device):
+    """Clear MPS blocks only when this stage actually ran on an active Mac."""
+    if not accelerator_runtime.apple_acceleration_active():
+        return False
+    from platforms.macos.cleanup import clear_mps_cache
+
+    return clear_mps_cache(device)
+
+
+def release_transnetv2_model():
+    """Drop the resident scene model and then release its unused MPS cache."""
+    global _tn2_model
+    with _TN2_LOCK:
+        model, _tn2_model = _tn2_model, None
+    if model is None:
+        return False
+    device = getattr(model, "device", None)
+    del model
+    import gc
+    gc.collect()
+    _clear_mps_cache_if_active(device)
+    return True
 
 
 def _extract_frames_small(video_path):
@@ -129,6 +154,7 @@ def _detect_transnetv2(video_path):
         # the rest of the process; eight jobs doing that filled a 20 GB card.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        _clear_mps_cache_if_active(model.device)
 
     # predictions_to_scenes returns [[start, end], ...] with INCLUSIVE ends;
     # downstream expects PySceneDetect's exclusive ends.

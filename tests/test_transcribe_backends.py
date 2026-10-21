@@ -590,6 +590,11 @@ def test_release_models_drops_the_transnetv2_singleton_too(monkeypatch):
     import types
     fake = types.ModuleType("scene_detection")
     fake._tn2_model = object()
+
+    def release():
+        fake._tn2_model = None
+
+    fake.release_transnetv2_model = release
     monkeypatch.setitem(sys.modules, "scene_detection", fake)
     monkeypatch.setattr(tb, "_whisper_model", None)
     monkeypatch.setattr(tb, "_parakeet_model", None)
@@ -597,6 +602,38 @@ def test_release_models_drops_the_transnetv2_singleton_too(monkeypatch):
     tb.release_models()
 
     assert fake._tn2_model is None
+
+
+def test_release_models_keeps_legacy_scene_release_behavior(monkeypatch):
+    import types
+    fake = types.ModuleType("scene_detection")
+    fake._tn2_model = object()
+    monkeypatch.setitem(sys.modules, "scene_detection", fake)
+    monkeypatch.setattr(tb, "_whisper_model", None)
+    monkeypatch.setattr(tb, "_parakeet_model", None)
+
+    tb.release_models()
+
+    assert fake._tn2_model is None
+
+
+def test_release_models_keeps_completed_transcription_when_scene_cleanup_fails(
+        monkeypatch, capsys):
+    import types
+    fake = types.ModuleType("scene_detection")
+
+    def fail():
+        raise RuntimeError("MPS allocator unavailable")
+
+    fake.release_transnetv2_model = fail
+    monkeypatch.setitem(sys.modules, "scene_detection", fake)
+    monkeypatch.setattr(tb, "_whisper_model", None)
+    monkeypatch.setattr(tb, "_parakeet_model", None)
+
+    tb.release_models()
+
+    assert "TransNetV2 cleanup failed (RuntimeError: MPS allocator unavailable)" \
+        in capsys.readouterr().out
 
 
 class TestHostAsrSlot:
