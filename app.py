@@ -1260,6 +1260,9 @@ def _jobs_busy_elsewhere(now=None) -> int:
 
 SHARED_GPU_WAIT_SECONDS = 5
 SHARED_GPU_MAX_WAIT = DRAIN_TIMEOUT_SECONDS + 120
+# Validate the optional Apple feature gate during backend startup, even when
+# an operator explicitly selected a portable admission mode.
+accelerator_runtime.apple_acceleration_state()
 MEMORY_ADMISSION_BACKEND = accelerator_runtime.resolve_memory_admission_backend()
 MAC_MIN_AVAILABLE_MB = max(0, int(os.environ.get("MAC_MIN_AVAILABLE_MB", "0")))
 # Free VRAM a new job needs before it starts. A job peaks at ~4-6 GB while it
@@ -1325,6 +1328,13 @@ def _warn_memory_reader_once(backend):
           "using job-count-only admission.")
 
 
+def _mac_host_available_mb():
+    """Load the macOS memory probe only after admission selected it."""
+    from platforms.macos.memory import host_available_mb
+
+    return host_available_mb()
+
+
 async def _wait_for_shared_gpu(job_id=None):
     """Wait for the selected host memory policy and return an ownership result.
 
@@ -1351,7 +1361,7 @@ async def _wait_for_shared_gpu(job_id=None):
         elif MEMORY_ADMISSION_BACKEND == "macos":
             if MAC_MIN_AVAILABLE_MB > 0 and not metric_unavailable:
                 available_mb = await loop.run_in_executor(
-                    None, accelerator_runtime.host_available_mb)
+                    None, _mac_host_available_mb)
                 if available_mb is None:
                     metric_unavailable = True
                     _warn_memory_reader_once("macOS host")

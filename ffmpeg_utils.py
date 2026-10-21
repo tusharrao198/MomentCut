@@ -1,22 +1,26 @@
 """Central video-encoder selection for every ffmpeg encode call site.
 
 FFMPEG_ENCODER env values:
-  x264  (default) — CPU libx264, exact pre-GPU behavior
+  x264             — CPU libx264, exact pre-GPU behavior
   nvenc           — force h264_nvenc; probed once and falls back to x264
                     (with a warning) if the GPU/driver is unavailable
   videotoolbox    — force h264_videotoolbox; probed once and falls back to x264
   auto            — VideoToolbox on Apple Silicon, otherwise the existing
                     NVENC-then-x264 selection
 
+When unset, Apple Silicon uses ``auto``; every non-Apple host keeps the
+historical ``x264`` default.
+
 Only the codec/quality args live here; surrounding args (-movflags, -pix_fmt,
 audio codecs, filters) stay at each call site.
 """
 import os
 import subprocess
+import sys
 import threading
 import time
 
-from accelerator_runtime import is_apple_silicon
+import accelerator_runtime
 import gpu_decode
 
 # Quality tiers pinning the historical libx264 settings.
@@ -53,18 +57,32 @@ _NVENC_ARGS = {
                "-pix_fmt", "yuv420p"],
 }
 
-_VIDEOTOOLBOX_ARGS = {
-    QUALITY: ["-c:v", "h264_videotoolbox", "-q:v", "75",
-              "-allow_sw", "0", "-pix_fmt", "yuv420p"],
-    QUALITY_FAST: ["-c:v", "h264_videotoolbox", "-q:v", "75",
-                   "-allow_sw", "0", "-pix_fmt", "yuv420p"],
-    DELIVERY: ["-c:v", "h264_videotoolbox", "-q:v", "65",
-               "-allow_sw", "0", "-pix_fmt", "yuv420p"],
-}
-
 X264 = "x264"
 NVENC = "nvenc"
 VIDEOTOOLBOX = "videotoolbox"
+
+
+def _macos_ffmpeg_adapter():
+    """Load VideoToolbox implementation only after the Mac policy selects it."""
+    if not accelerator_runtime.apple_acceleration_active():
+        return None
+    from platforms.macos import ffmpeg as adapter
+
+    return adapter
+
+
+def configured_encoder_mode():
+    """Return the operator setting with a gate-aware automatic default."""
+    configured = os.environ.get("FFMPEG_ENCODER", "").strip().lower()
+    if configured:
+        # ``auto`` must stay portable when an Apple host deliberately disabled
+        # its optional adapter feature; explicit NVENC retains its old probe.
+        if (configured == "auto"
+                and accelerator_runtime.apple_acceleration_state() == "disabled"):
+            return X264
+        return configured
+    return "auto" if accelerator_runtime.apple_acceleration_active() else X264
+
 
 # Output args that drop container/stream metadata carried over from the source
 # — most notably YouTube's "produced by Google Inc." stream handler, which
@@ -166,7 +184,6 @@ def audio_encode_args():
 
 _probe_lock = threading.Lock()
 _nvenc_ok = None  # None = not probed yet
-_videotoolbox_ok = None
 _announced_encoders = set()
 
 
@@ -200,88 +217,62 @@ def nvenc_available():
     return _nvenc_ok
 
 
-def _probe_videotoolbox():
-    """Prove that FFmpeg can complete a hardware-only VideoToolbox encode."""
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
-        "-frames:v", "1", "-c:v", "h264_videotoolbox",
-        "-allow_sw", "0", "-pix_fmt", "yuv420p", "-f", "null", "-",
-    ]
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def videotoolbox_available():
-    """Probe h264_videotoolbox once and cache the verdict."""
-    global _videotoolbox_ok
-    if _videotoolbox_ok is None:
-        with _probe_lock:
-            if _videotoolbox_ok is None:
-                _videotoolbox_ok = _probe_videotoolbox()
-    return _videotoolbox_ok
-
-
 def reset_encoder_cache():
-    """Test hook: forget the cached probe result."""
-    global _nvenc_ok, _videotoolbox_ok, _announced_encoders
+    """Test hook: forget cached encoder capability state."""
+    global _nvenc_ok, _announced_encoders
     with _probe_lock:
         _nvenc_ok = None
-        _videotoolbox_ok = None
         _announced_encoders = set()
+    adapter = sys.modules.get("platforms.macos.ffmpeg")
+    if adapter is not None:
+        adapter.reset_encoder_cache()
 
 
 def selected_video_encoder(tier=QUALITY):
-    """Return x264, nvenc or videotoolbox for this encode tier."""
+    """Return x264, nvenc or VideoToolbox for this encode tier."""
     if tier not in _X264_ARGS:
         raise ValueError(f"Unknown encode tier: {tier!r}")
 
-    mode = os.environ.get("FFMPEG_ENCODER", "x264").strip().lower()
+    mode = configured_encoder_mode()
     if mode not in {X264, NVENC, VIDEOTOOLBOX, "auto"}:
         print(f"⚠️ [Encoder] Unknown FFMPEG_ENCODER={mode!r}; using libx264")
         mode = X264
 
-    # This file is decoded again immediately. The measured Mac route keeps
-    # the intermediate on x264 and should not probe VideoToolbox just to
-    # decide not to use it.
-    if tier == INTERMEDIATE and (
-        mode == VIDEOTOOLBOX or (mode == "auto" and is_apple_silicon())
-    ):
-        return X264
+    if mode == VIDEOTOOLBOX:
+        accelerator_runtime.require_apple_acceleration(
+            "FFMPEG_ENCODER=videotoolbox")
+    adapter = _macos_ffmpeg_adapter()
+    if adapter is not None:
+        decision = adapter.encoder_decision(tier, mode)
+        if decision is not None:
+            if decision.warning:
+                print(decision.warning)
+            return decision.encoder
 
+    # Existing NVIDIA/CPU selection remains below the Mac dispatch hook.
     if mode == NVENC:
         encoder = NVENC if nvenc_available() else X264
         if encoder == X264:
             print("⚠️ [Encoder] FFMPEG_ENCODER=nvenc but h264_nvenc is not "
                   "usable here — falling back to libx264")
-    elif mode == VIDEOTOOLBOX:
-        encoder = VIDEOTOOLBOX if videotoolbox_available() else X264
-        if encoder == X264:
-            print("⚠️ [Encoder] FFMPEG_ENCODER=videotoolbox but "
-                  "h264_videotoolbox is not usable here — falling back to libx264")
     elif mode == "auto":
-        if is_apple_silicon():
-            encoder = VIDEOTOOLBOX if videotoolbox_available() else X264
-        else:
-            encoder = NVENC if nvenc_available() else X264
+        encoder = NVENC if nvenc_available() else X264
     else:
         encoder = X264
-
     return encoder
-
 
 def _video_encode_args(tier, encoder):
     if encoder == NVENC:
         if tier == INTERMEDIATE:
             return _intermediate_nvenc_args()
         return list(_NVENC_ARGS[tier])
-    if encoder == VIDEOTOOLBOX and tier != INTERMEDIATE:
-        return list(_VIDEOTOOLBOX_ARGS[tier])
+    if encoder == VIDEOTOOLBOX:
+        accelerator_runtime.require_apple_acceleration(
+            "FFMPEG_ENCODER=videotoolbox")
+        adapter = _macos_ffmpeg_adapter()
+        if adapter is None:
+            raise RuntimeError("VideoToolbox adapter was not selected")
+        return adapter.encoder_args(tier)
     return list(_X264_ARGS[tier])
 
 
@@ -295,7 +286,7 @@ def _announce_encoder(encoder):
         NVENC: "h264_nvenc",
         VIDEOTOOLBOX: "h264_videotoolbox",
     }[encoder]
-    mode = os.environ.get("FFMPEG_ENCODER", "x264").strip().lower()
+    mode = configured_encoder_mode()
     print(f"🎞️ [Encoder] video encoder: {codec} (FFMPEG_ENCODER={mode})")
 
 
@@ -312,9 +303,9 @@ def video_encode_args(tier=QUALITY, *, encoder=None):
 
 
 def _disable_videotoolbox():
-    global _videotoolbox_ok
-    with _probe_lock:
-        _videotoolbox_ok = False
+    adapter = sys.modules.get("platforms.macos.ffmpeg")
+    if adapter is not None:
+        adapter.disable_encoder()
 
 
 def run_encode(build_command, run_command, validate_outputs,
@@ -473,12 +464,12 @@ def _gpu_cut_ok(input_video):
     decode_mode = os.environ.get("VIDEO_DECODE_BACKEND", "auto").strip().lower()
     if decode_mode not in {"auto", "cuda"}:
         return False
-    mode = os.environ.get("FFMPEG_ENCODER", "x264").strip().lower()
+    mode = configured_encoder_mode()
     if mode not in ("nvenc", "auto"):
         return False
     # N3 keeps the Apple intermediate on x264. Do not make an unrelated
     # NVENC probe after the encoder resolver has already selected that route.
-    if mode == "auto" and is_apple_silicon():
+    if mode == "auto" and accelerator_runtime.apple_acceleration_active():
         return False
     if input_video not in _gpu_cut_sources:
         fmt = _source_format(input_video) if nvenc_available() else None
@@ -533,17 +524,17 @@ def cut_clip(input_video, clip_temp_path, start, end, clip_number):
         gpu_decode.select_attempt(input_video, render=True)
     if (not gpu_command
             and os.environ.get("FFMPEG_GPU_CUT", "1").strip() != "0"
-            and decode_mode in {"auto", "videotoolbox"}
-            and (is_apple_silicon() or decode_mode == "videotoolbox")):
+            and decode_mode in {"auto", "videotoolbox"}):
         attempt = gpu_decode.select_attempt(input_video, render=True)
-        if attempt.backend == "videotoolbox":
+        if attempt.backend == VIDEOTOOLBOX:
+            adapter = _macos_ffmpeg_adapter()
+            if adapter is None:
+                raise RuntimeError("VideoToolbox decode selected without Mac adapter")
             videotoolbox_attempt = attempt
-            videotoolbox_command = [
-                'ffmpeg', '-y', *gpu_decode.input_args(attempt),
-                '-ss', str(start), '-to', str(end), '-i', input_video,
-                '-vf', gpu_decode.download_filter(attempt),
-                *encode_args, *audio_encode_args(), clip_temp_path,
-            ]
+            videotoolbox_command = adapter.precise_cut_command(
+                input_video, start, end, encode_args, audio_encode_args(),
+                clip_temp_path, attempt,
+            )
 
     def _run_one(cmd):
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
