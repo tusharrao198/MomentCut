@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import mac_asr
+from platforms.macos import asr as mac_asr
 
 
 SMALL_REVISION = "45f3915923c7a79a5a5b5a7d909d39aeb0e5630e"

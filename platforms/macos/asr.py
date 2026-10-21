@@ -13,8 +13,10 @@ import sys
 import threading
 from pathlib import Path
 
+from accelerator_runtime import AcceleratorConfigurationError
 
-class MacASRConfigurationError(ValueError):
+
+class MacASRConfigurationError(AcceleratorConfigurationError):
     """The selected MLX model cannot be resolved deterministically."""
 
 

@@ -313,7 +313,7 @@ class TestMacMemoryAdmission:
         monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "macos")
         monkeypatch.setattr(app_module, "MAC_MIN_AVAILABLE_MB", 0)
         monkeypatch.setattr(
-            app_module.accelerator_runtime, "host_available_mb",
+            app_module, "_mac_host_available_mb",
             lambda: (_ for _ in ()).throw(
                 AssertionError("zero reserve must not read host memory")))
         assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
@@ -324,7 +324,7 @@ class TestMacMemoryAdmission:
         monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
         readings = iter([2048, 6144])
         monkeypatch.setattr(
-            app_module.accelerator_runtime, "host_available_mb",
+            app_module, "_mac_host_available_mb",
             lambda: next(readings))
 
         async def no_delay(_seconds):
@@ -337,7 +337,7 @@ class TestMacMemoryAdmission:
         monkeypatch.setattr(app_module, "MEMORY_ADMISSION_BACKEND", "macos")
         monkeypatch.setattr(app_module, "MAC_MIN_AVAILABLE_MB", 4096)
         monkeypatch.setattr(
-            app_module.accelerator_runtime, "host_available_mb", lambda: None)
+            app_module, "_mac_host_available_mb", lambda: None)
         assert asyncio.run(app_module._wait_for_shared_gpu()) == app_module.ADMIT
         assert app_module._memory_reader_warnings == {"macOS host"}
 
@@ -348,7 +348,7 @@ class TestMacMemoryAdmission:
         monkeypatch.setattr(app_module, "SHARED_GPU_MAX_WAIT", 0.01)
         monkeypatch.setattr(app_module, "_running_jobs", {"already-running"})
         monkeypatch.setattr(
-            app_module.accelerator_runtime, "host_available_mb", lambda: None)
+            app_module, "_mac_host_available_mb", lambda: None)
 
         async def no_delay(_seconds):
             return None
@@ -362,7 +362,7 @@ class TestMacMemoryAdmission:
         monkeypatch.setattr(app_module, "SHARED_GPU_WAIT_SECONDS", 0.01)
         monkeypatch.setattr(app_module, "SHARED_GPU_MAX_WAIT", 0.02)
         monkeypatch.setattr(
-            app_module.accelerator_runtime, "host_available_mb", lambda: 1024)
+            app_module, "_mac_host_available_mb", lambda: 1024)
 
         async def no_delay(_seconds):
             return None

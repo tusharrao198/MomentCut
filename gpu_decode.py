@@ -14,17 +14,20 @@ before any other filter, and from there the graph is the one the CPU path
 runs: frames, samples and encodes come out byte-identical.
 
 Only plain 8-bit 4:2:0 H.264/HEVC without a rotation goes to hardware. NVIDIA
-keeps its existing free-VRAM gate and CUDA/NVDEC command. Apple Silicon probes
-the actual source with a forced VideoToolbox hardware-frame download, so an
-ffmpeg that silently falls back to software is rejected. Any real hardware
-operation that fails is replayed on the CPU by its owning consumer.
+keeps its existing free-VRAM gate and CUDA/NVDEC command. The explicit Apple
+VideoToolbox diagnostic probes the actual source with a forced hardware-frame
+download, so an ffmpeg that silently falls back to software is rejected. Any
+real hardware operation that fails is replayed on the CPU by its owning
+consumer.
 
 ``VIDEO_DECODE_BACKEND=auto`` selects CUDA off Apple when the existing NVIDIA
-gate passes, VideoToolbox on Apple Silicon when its source probe passes, and
-CPU otherwise. Explicit ``cuda``, ``videotoolbox`` and ``cpu`` values are
-diagnostic overrides with the same safe fallback. ``GPU_DECODE=0`` turns
-hardware decoding off; ``GPU_DECODE_RENDER=0`` keeps hardware analysis but
-decodes render operations on the CPU.
+gate passes and CPU on Apple Silicon. A native target-Mac benchmark found the
+VideoToolbox command path materially slower for OpenShorts' CPU-readable frame
+workload, so VideoToolbox remains an explicit diagnostic override rather than
+the automatic Mac route. Explicit ``cuda`` and ``videotoolbox`` values retain
+the same safe CPU fallback. ``GPU_DECODE=0`` turns hardware decoding off;
+``GPU_DECODE_RENDER=0`` keeps hardware analysis but decodes render operations
+on the CPU.
 """
 from dataclasses import dataclass
 import json
@@ -33,7 +36,7 @@ import subprocess
 import threading
 import time
 
-from accelerator_runtime import is_apple_silicon
+import accelerator_runtime
 
 ENABLED = os.environ.get("GPU_DECODE", "1").strip() != "0"
 RENDER = ENABLED and os.environ.get("GPU_DECODE_RENDER", "1").strip() != "0"
@@ -41,16 +44,11 @@ MIN_FREE_MB = int(os.environ.get("GPU_DECODE_MIN_FREE_MB", "2500") or 0)
 
 HW_ARGS = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
 DOWNLOAD = "hwdownload,format=nv12,format=yuv420p"
-VIDEOTOOLBOX_HW_ARGS = [
-    "-hwaccel", "videotoolbox",
-    "-hwaccel_output_format", "videotoolbox_vld",
-]
 _CODECS = {"h264", "hevc"}
 _BACKENDS = {"auto", "cuda", "videotoolbox", "cpu"}
 
 _lock = threading.Lock()
 _probe_cache = {}
-_videotoolbox_probe_cache = {}
 _free = {"t": 0.0, "mb": None}
 STATS = {"gpu": 0, "fallback": 0, "skipped": 0}
 
@@ -72,10 +70,26 @@ def _attempt(backend, render=False):
     if backend == "cuda":
         return DecodeAttempt(
             backend, tuple(HW_ARGS), DOWNLOAD, True, bool(render))
-    if backend == "videotoolbox":
-        return DecodeAttempt(
-            backend, tuple(VIDEOTOOLBOX_HW_ARGS), DOWNLOAD, True, bool(render))
     return DecodeAttempt("cpu", (), "", False, bool(render))
+
+
+def _macos_ffmpeg_adapter():
+    """Load VideoToolbox details only after the policy activates Apple support."""
+    if not accelerator_runtime.apple_acceleration_active():
+        return None
+    from platforms.macos import ffmpeg as adapter
+
+    return adapter
+
+
+def _attempt_from_macos_plan(plan, render=False):
+    return DecodeAttempt(
+        plan.backend,
+        tuple(plan.input_args),
+        plan.download_filter,
+        bool(plan.is_hardware),
+        bool(render),
+    )
 
 
 def _as_attempt(value, render=False):
@@ -162,88 +176,6 @@ def usable(path, render=False):
     return True
 
 
-def _videotoolbox_probe_key(path, info):
-    key = _file_key(path)
-    if not key or not info:
-        return None
-    rotation = tuple(
-        int(float(side.get("rotation") or 0))
-        for side in info.get("side_data_list") or []
-    )
-    return key + (
-        info.get("index"),
-        info.get("codec_name"),
-        info.get("profile"),
-        info.get("pix_fmt"),
-        info.get("width"),
-        info.get("height"),
-        rotation,
-    )
-
-
-def _probe_videotoolbox(path, info):
-    """Prove that the actual source produced a VideoToolbox hardware frame.
-
-    FFmpeg may report a VideoToolbox initialization error, decode in software
-    and still exit zero. The forced ``hwdownload`` makes that fallback fail,
-    while the verbose filter input supplies positive hardware-surface evidence.
-    """
-    key = _videotoolbox_probe_key(path, info)
-    if not key:
-        return False
-    with _lock:
-        if key in _videotoolbox_probe_cache:
-            return _videotoolbox_probe_cache[key]
-
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "verbose",
-        *VIDEOTOOLBOX_HW_ARGS, "-i", path,
-        "-map", "0:v:0", "-frames:v", "1",
-        "-vf", DOWNLOAD, "-pix_fmt", "yuv420p", "-f", "rawvideo", "-",
-    ]
-    ok = False
-    try:
-        result = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        stderr = (result.stderr or b"").decode(errors="replace").lower()
-        expected = int(info.get("width") or 0) * int(info.get("height") or 0) * 3 // 2
-        rejected = (
-            "videotoolbox malfunction",
-            "failed setup for format videotoolbox_vld",
-            "hwaccel initialisation returned error",
-            "videotoolbox session not available",
-            "videotoolbox does not support this format",
-            "videotoolbox decoder for this format not found",
-        )
-        ok = (
-            result.returncode == 0
-            and expected > 0
-            and len(result.stdout or b"") >= expected
-            and "pixfmt:videotoolbox_vld" in stderr
-            and not any(term in stderr for term in rejected)
-        )
-    except Exception:
-        ok = False
-
-    with _lock:
-        _videotoolbox_probe_cache[key] = ok
-    return ok
-
-
-def videotoolbox_usable(path, render=False):
-    if not (RENDER if render else ENABLED):
-        return False
-    if not is_apple_silicon():
-        return False
-    info = _probe(path)
-    if not _supported(info):
-        return False
-    if not _probe_videotoolbox(path, info):
-        _count("skipped")
-        return False
-    return True
-
-
 def select_attempt(path=None, render=False, backend=None):
     """Choose a source-qualified decode attempt without changing CUDA policy."""
     requested = (
@@ -254,22 +186,31 @@ def select_attempt(path=None, render=False, backend=None):
     if requested not in _BACKENDS:
         raise DecodeConfigurationError(
             "VIDEO_DECODE_BACKEND must be auto, cuda, videotoolbox, or cpu")
+    if requested == "videotoolbox":
+        accelerator_runtime.require_apple_acceleration(
+            "VIDEO_DECODE_BACKEND=videotoolbox")
     if not (RENDER if render else ENABLED) or requested == "cpu" or not path:
         return _attempt("cpu", render)
     if requested == "auto":
-        requested = "videotoolbox" if is_apple_silicon() else "cuda"
+        # N4's measured Apple route deliberately remains CPU: OpenShorts needs
+        # CPU-readable frames for CV and software filter graphs.
+        if accelerator_runtime.apple_acceleration_state() != "not_apple":
+            return _attempt("cpu", render)
+        requested = "cuda"
     if requested == "videotoolbox":
-        return (
-            _attempt("videotoolbox", render)
-            if videotoolbox_usable(path, render=render)
-            else _attempt("cpu", render)
-        )
+        adapter = _macos_ffmpeg_adapter()
+        if adapter is None:
+            raise RuntimeError("VideoToolbox adapter was not selected")
+        plan = adapter.decode_plan(path, enabled=True)
+        if plan is None:
+            _count("skipped")
+            return _attempt("cpu", render)
+        return _attempt_from_macos_plan(plan, render)
     return (
         _attempt("cuda", render)
         if usable(path, render=render)
         else _attempt("cpu", render)
     )
-
 
 def input_args(attempt):
     """Options to put right before the video's ``-i``."""

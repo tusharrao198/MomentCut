@@ -8,6 +8,11 @@ import pytest
 import transcribe_backends as tb
 
 
+@pytest.fixture(autouse=True)
+def _default_apple_gate(monkeypatch):
+    monkeypatch.delenv("APPLE_SILICON_ACCELERATION", raising=False)
+
+
 class FakeFloat(float):
     """Stands in for numpy scalar types (float subclasses) from onnx-asr."""
 
@@ -293,6 +298,22 @@ def test_run_whisper_transcription_materializes_segments(fake_faster_whisper, mo
     segments, info = tb.run_whisper_transcription("video.mp4")
     assert isinstance(segments, list)
     assert info.language == "es"
+
+
+def test_disabled_apple_auto_never_imports_the_mlx_adapter(monkeypatch):
+    import accelerator_runtime
+
+    sentinel = {"text": "portable", "language": "en", "segments": []}
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    monkeypatch.setenv("APPLE_SILICON_ACCELERATION", "disabled")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_faster_whisper", lambda path, force_cpu=False: sentinel)
+    monkeypatch.setattr(
+        tb, "_mac_asr", lambda: pytest.fail("disabled Apple must not load MLX"))
+
+    assert tb._transcribe_with_whisper("video.mp4") is sentinel
 
 
 def test_whisper_auto_keeps_faster_whisper_off_apple(monkeypatch):
