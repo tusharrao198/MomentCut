@@ -52,6 +52,13 @@ def model_name() -> str:
     return (os.environ.get("LLM_MODEL") or "").strip() or DEFAULT_MODEL
 
 
+def thinking_disabled() -> bool:
+    """Whether to send Qwen's portable non-thinking prompt control."""
+    return (os.environ.get("LLM_THINKING") or "").strip().lower() in {
+        "off", "false", "0", "no",
+    }
+
+
 def active() -> bool:
     """True when the moment picker should call the OpenAI-compatible server."""
     return provider() == "openai" and bool(base_url())
@@ -118,9 +125,14 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
 
     url = f"{base_url()}/chat/completions"
     model = model or model_name()
+    user_prompt = prompt
+    if thinking_disabled():
+        # Qwen3 accepts this in a normal chat prompt, unlike a provider-specific
+        # API field that other OpenAI-compatible servers may reject.
+        user_prompt = f"{prompt}\n/no_think"
     messages = [
         {"role": "system", "content": "You answer with a single JSON object and nothing else."},
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": user_prompt},
     ]
     last_rejection: Optional[str] = None
     with _client() as client:

@@ -19,6 +19,7 @@ def local(monkeypatch):
     monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
     monkeypatch.setenv("LLM_MODEL", "qwen2.5:14b")
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_THINKING", raising=False)
 
 
 def _serve(handler, monkeypatch):
@@ -72,10 +73,29 @@ def test_returns_validated_payload_and_zero_cost(local, monkeypatch):
     assert seen["url"] == "http://llm.test/v1/chat/completions"
     assert seen["body"]["model"] == "qwen2.5:14b"
     assert seen["body"]["response_format"]["type"] == "json_schema"
+    assert seen["body"]["messages"][1]["content"] == "prompt"
     assert seen["auth"] == "Bearer ollama"  # documented placeholder when no key is set
     assert parsed["windows"][0]["score"] == 88
     assert cost["total_cost"] == 0.0 and cost["local"] is True
     assert cost["input_tokens"] == 120 and cost["output_tokens"] == 40
+
+
+def test_appends_qwen_no_think_control_when_configured(local, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return _completion({
+            "windows": [{
+                "id": "w0", "start": 0, "end": 90, "score": 88, "reason": "hook",
+            }]
+        })
+
+    monkeypatch.setenv("LLM_THINKING", "off")
+    _serve(handler, monkeypatch)
+    llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+
+    assert seen["body"]["messages"][1]["content"] == "prompt\n/no_think"
 
 
 def test_falls_back_to_json_object_when_schema_mode_is_rejected(local, monkeypatch):
