@@ -15,10 +15,17 @@ import pytest
 
 import gpu_decode
 import reframe_v2
+from platforms.macos import ffmpeg as macos_ffmpeg
 
 CPU = gpu_decode._attempt("cpu")
 CUDA = gpu_decode._attempt("cuda")
-VIDEOTOOLBOX = gpu_decode._attempt("videotoolbox")
+VIDEOTOOLBOX = gpu_decode.DecodeAttempt(
+    "videotoolbox", macos_ffmpeg.HW_ARGS, macos_ffmpeg.DOWNLOAD, True, False)
+
+
+@pytest.fixture(autouse=True)
+def _default_apple_gate(monkeypatch):
+    monkeypatch.delenv("APPLE_SILICON_ACCELERATION", raising=False)
 
 
 # --- command rewrites -------------------------------------------------------
@@ -36,7 +43,7 @@ def test_vf_chain_starts_with_the_download():
 
 
 def test_videotoolbox_attempt_uses_the_same_cpu_readable_bridge():
-    assert gpu_decode.input_args(VIDEOTOOLBOX) == gpu_decode.VIDEOTOOLBOX_HW_ARGS
+    assert gpu_decode.input_args(VIDEOTOOLBOX) == list(macos_ffmpeg.HW_ARGS)
     assert gpu_decode.vf("scale=48:27", VIDEOTOOLBOX) == (
         f"{gpu_decode.DOWNLOAD},scale=48:27")
     with pytest.raises(FrozenInstanceError):
@@ -97,22 +104,59 @@ def test_run_stays_on_the_cpu_when_the_card_is_not_usable(monkeypatch):
     assert calls == ["cpu"]
 
 
-def test_auto_selects_videotoolbox_on_apple_without_checking_cuda(monkeypatch):
-    monkeypatch.setattr(gpu_decode, "is_apple_silicon", lambda: True)
-    monkeypatch.setattr(gpu_decode, "videotoolbox_usable", lambda path, render=False: True)
+def test_auto_selects_cpu_on_apple_without_probing_hardware(monkeypatch):
+    monkeypatch.setattr(gpu_decode.accelerator_runtime, "is_apple_silicon", lambda: True)
     monkeypatch.setattr(
         gpu_decode, "usable",
         lambda path, render=False: pytest.fail("Apple auto must not probe CUDA"))
-    assert gpu_decode.select_attempt("clip.mp4").backend == "videotoolbox"
+    monkeypatch.setattr(
+        macos_ffmpeg, "decode_plan",
+        lambda path, render=False: pytest.fail(
+            "Apple auto must not probe VideoToolbox"))
+    assert gpu_decode.select_attempt("clip.mp4").backend == "cpu"
+
+
+def test_explicit_videotoolbox_remains_available_on_apple(monkeypatch):
+    monkeypatch.setattr(gpu_decode.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(
+        macos_ffmpeg, "decode_plan",
+        lambda path, enabled=True: macos_ffmpeg.DecodePlan(
+            "videotoolbox", macos_ffmpeg.HW_ARGS, macos_ffmpeg.DOWNLOAD, True))
+    monkeypatch.setattr(
+        gpu_decode, "usable",
+        lambda path, render=False: pytest.fail(
+            "Explicit VideoToolbox must not probe CUDA"))
+    assert gpu_decode.select_attempt(
+        "clip.mp4", backend="videotoolbox").backend == "videotoolbox"
 
 
 def test_auto_preserves_cuda_selection_off_apple(monkeypatch):
-    monkeypatch.setattr(gpu_decode, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(gpu_decode.accelerator_runtime, "is_apple_silicon", lambda: False)
     monkeypatch.setattr(gpu_decode, "usable", lambda path, render=False: True)
     monkeypatch.setattr(
-        gpu_decode, "videotoolbox_usable",
+        macos_ffmpeg, "decode_plan",
         lambda path, render=False: pytest.fail("NVIDIA auto must not probe VideoToolbox"))
     assert gpu_decode.select_attempt("clip.mp4").backend == "cuda"
+
+
+def test_disabled_apple_auto_keeps_cpu_without_hardware_probe(monkeypatch):
+    monkeypatch.setattr(gpu_decode.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setenv("APPLE_SILICON_ACCELERATION", "disabled")
+    monkeypatch.setattr(
+        gpu_decode, "usable",
+        lambda *_args, **_kwargs: pytest.fail("disabled Apple must not probe CUDA"))
+    monkeypatch.setattr(
+        macos_ffmpeg, "decode_plan",
+        lambda *_args, **_kwargs: pytest.fail(
+            "disabled Apple must not probe VideoToolbox"))
+    assert gpu_decode.select_attempt("clip.mp4", backend="auto").backend == "cpu"
+
+
+def test_explicit_videotoolbox_requires_active_apple_gate(monkeypatch):
+    monkeypatch.setattr(gpu_decode.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setenv("APPLE_SILICON_ACCELERATION", "disabled")
+    with pytest.raises(gpu_decode.accelerator_runtime.AcceleratorConfigurationError):
+        gpu_decode.select_attempt("clip.mp4", backend="videotoolbox")
 
 
 def test_explicit_cpu_never_probes_hardware(monkeypatch):
@@ -120,7 +164,7 @@ def test_explicit_cpu_never_probes_hardware(monkeypatch):
         gpu_decode, "usable",
         lambda path, render=False: pytest.fail("CPU route must not probe CUDA"))
     monkeypatch.setattr(
-        gpu_decode, "videotoolbox_usable",
+        macos_ffmpeg, "decode_plan",
         lambda path, render=False: pytest.fail("CPU route must not probe VideoToolbox"))
     assert gpu_decode.select_attempt("clip.mp4", backend="cpu").backend == "cpu"
 
@@ -131,7 +175,7 @@ def test_videotoolbox_probe_rejects_software_fallback_with_exit_zero(
     source.write_bytes(b"source")
     info = {"index": 0, "codec_name": "h264", "profile": "High",
             "pix_fmt": "yuv420p", "width": 16, "height": 16}
-    gpu_decode._videotoolbox_probe_cache.clear()
+    macos_ffmpeg._decode_probe_cache.clear()
     expected = b"\0" * (16 * 16 * 3 // 2)
     stderr = (
         b"graph input pixfmt:videotoolbox_vld\n"
@@ -140,10 +184,10 @@ def test_videotoolbox_probe_rejects_software_fallback_with_exit_zero(
         b"hwaccel initialisation returned error.\n"
     )
     monkeypatch.setattr(
-        gpu_decode.subprocess, "run",
+        macos_ffmpeg.subprocess, "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args[0], 0, expected, stderr))
-    assert not gpu_decode._probe_videotoolbox(str(source), info)
+    assert not macos_ffmpeg._probe_decode(str(source), info)
 
 
 def test_videotoolbox_probe_requires_positive_hardware_surface_and_caches(
@@ -152,7 +196,7 @@ def test_videotoolbox_probe_requires_positive_hardware_surface_and_caches(
     source.write_bytes(b"source")
     info = {"index": 0, "codec_name": "h264", "profile": "High",
             "pix_fmt": "yuv420p", "width": 16, "height": 16}
-    gpu_decode._videotoolbox_probe_cache.clear()
+    macos_ffmpeg._decode_probe_cache.clear()
     calls = []
 
     def run(command, **kwargs):
@@ -161,9 +205,9 @@ def test_videotoolbox_probe_requires_positive_hardware_surface_and_caches(
             command, 0, b"\0" * (16 * 16 * 3 // 2),
             b"graph input pixfmt:videotoolbox_vld")
 
-    monkeypatch.setattr(gpu_decode.subprocess, "run", run)
-    assert gpu_decode._probe_videotoolbox(str(source), info)
-    assert gpu_decode._probe_videotoolbox(str(source), info)
+    monkeypatch.setattr(macos_ffmpeg.subprocess, "run", run)
+    assert macos_ffmpeg._probe_decode(str(source), info)
+    assert macos_ffmpeg._probe_decode(str(source), info)
     assert len(calls) == 1
 
 
@@ -172,7 +216,7 @@ def test_videotoolbox_probe_cache_includes_stream_properties(monkeypatch, tmp_pa
     source.write_bytes(b"source")
     base = {"index": 0, "codec_name": "h264", "pix_fmt": "yuv420p",
             "width": 16, "height": 16}
-    gpu_decode._videotoolbox_probe_cache.clear()
+    macos_ffmpeg._decode_probe_cache.clear()
     calls = []
 
     def run(command, **kwargs):
@@ -181,10 +225,10 @@ def test_videotoolbox_probe_cache_includes_stream_properties(monkeypatch, tmp_pa
             command, 0, b"\0" * (16 * 16 * 3 // 2),
             b"graph input pixfmt:videotoolbox_vld")
 
-    monkeypatch.setattr(gpu_decode.subprocess, "run", run)
-    assert gpu_decode._probe_videotoolbox(
+    monkeypatch.setattr(macos_ffmpeg.subprocess, "run", run)
+    assert macos_ffmpeg._probe_decode(
         str(source), {**base, "profile": "High"})
-    assert gpu_decode._probe_videotoolbox(
+    assert macos_ffmpeg._probe_decode(
         str(source), {**base, "profile": "Main"})
     assert len(calls) == 2
 

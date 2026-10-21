@@ -22,6 +22,54 @@ def is_apple_silicon(*, system=None, machine=None) -> bool:
     return system == "darwin" and machine.lower() in {"arm64", "aarch64"}
 
 
+def apple_acceleration_state(value=None) -> str:
+    """Return whether Apple-only acceleration adapters may be used.
+
+    ``auto`` enables them only on Apple Silicon. ``enabled`` makes a
+    non-Apple host configuration error visible at startup. ``disabled`` keeps
+    the portable routes even on an Apple Silicon host.
+    """
+    requested = (
+        os.environ.get("APPLE_SILICON_ACCELERATION", "auto")
+        if value is None else value
+    )
+    requested = str(requested or "auto").strip().lower()
+    if requested not in {"auto", "enabled", "disabled"}:
+        raise AcceleratorConfigurationError(
+            "APPLE_SILICON_ACCELERATION must be auto, enabled, or disabled"
+        )
+    apple = is_apple_silicon()
+    if requested == "enabled" and not apple:
+        raise AcceleratorConfigurationError(
+            "APPLE_SILICON_ACCELERATION=enabled requires an Apple Silicon Mac"
+        )
+    if apple and requested != "disabled":
+        return "active"
+    if apple:
+        return "disabled"
+    return "not_apple"
+
+
+def apple_acceleration_active() -> bool:
+    """True only when the Mac adapter feature is enabled on Apple Silicon."""
+    return apple_acceleration_state() == "active"
+
+
+def require_apple_acceleration(feature: str) -> None:
+    """Reject an explicit Apple-only choice when its feature gate is inactive."""
+    state = apple_acceleration_state()
+    if state == "active":
+        return
+    if state == "disabled":
+        raise AcceleratorConfigurationError(
+            f"{feature} requires Apple acceleration; set "
+            "APPLE_SILICON_ACCELERATION=auto or enabled"
+        )
+    raise AcceleratorConfigurationError(
+        f"{feature} requires an Apple Silicon Mac"
+    )
+
+
 def platform_kind() -> str:
     """Return host identity without importing Torch, MLX or CTranslate2."""
     if is_apple_silicon():
@@ -42,13 +90,16 @@ def resolve_memory_admission_backend(value=None) -> str:
         raise AcceleratorConfigurationError(
             "MEMORY_ADMISSION_BACKEND must be auto, nvidia, macos, or count"
         )
+    if requested == "macos":
+        require_apple_acceleration("MEMORY_ADMISSION_BACKEND=macos")
+        return requested
     if requested != "auto":
         return requested
+    if apple_acceleration_active():
+        return "macos"
     kind = platform_kind()
     if kind == "nvidia":
         return "nvidia"
-    if kind == "apple":
-        return "macos"
     return "count"
 
 
@@ -74,16 +125,6 @@ def nvidia_free_mb():
     return None
 
 
-def host_available_mb():
-    """Read host-available memory in MiB, or return None when unavailable."""
-    try:
-        import psutil
-
-        return int(psutil.virtual_memory().available // (1024 * 1024))
-    except Exception:
-        return None
-
-
 def resolve_whisper_engine(value=None) -> str:
     """Resolve the N1 engine while leaving every non-Apple host unchanged."""
     requested = (
@@ -95,11 +136,9 @@ def resolve_whisper_engine(value=None) -> str:
             "WHISPER_ENGINE must be auto, faster-whisper, or mlx"
         )
     if requested == "auto":
-        return "mlx" if is_apple_silicon() else "faster-whisper"
-    if requested == "mlx" and not is_apple_silicon():
-        raise AcceleratorConfigurationError(
-            "WHISPER_ENGINE=mlx requires an Apple Silicon Mac"
-        )
+        return "mlx" if apple_acceleration_active() else "faster-whisper"
+    if requested == "mlx":
+        require_apple_acceleration("WHISPER_ENGINE=mlx")
     return requested
 
 
@@ -114,9 +153,7 @@ def resolve_parakeet_engine(value=None) -> str:
             "PARAKEET_ENGINE must be auto, onnx, or mlx"
         )
     if requested == "auto":
-        return "mlx" if is_apple_silicon() else "onnx"
-    if requested == "mlx" and not is_apple_silicon():
-        raise AcceleratorConfigurationError(
-            "PARAKEET_ENGINE=mlx requires an Apple Silicon Mac"
-        )
+        return "mlx" if apple_acceleration_active() else "onnx"
+    if requested == "mlx":
+        require_apple_acceleration("PARAKEET_ENGINE=mlx")
     return requested

@@ -5,6 +5,7 @@ import pytest
 
 import ffmpeg_utils
 import gpu_decode
+from platforms.macos import ffmpeg as macos_ffmpeg
 from ffmpeg_utils import (
     AI_DISCLOSURE,
     DELIVERY,
@@ -23,6 +24,7 @@ from ffmpeg_utils import (
 
 @pytest.fixture(autouse=True)
 def _clean_encoder_state(monkeypatch):
+    monkeypatch.delenv("APPLE_SILICON_ACCELERATION", raising=False)
     monkeypatch.delenv("FFMPEG_ENCODER", raising=False)
     monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_sources", {})
     reset_encoder_cache()
@@ -30,13 +32,50 @@ def _clean_encoder_state(monkeypatch):
     reset_encoder_cache()
 
 
-def test_default_args_pin_historical_x264_settings():
+def test_default_args_pin_historical_x264_settings(monkeypatch):
+    monkeypatch.setenv("FFMPEG_ENCODER", "x264")
     assert video_encode_args(QUALITY) == [
         "-c:v", "libx264", "-preset", "medium", "-crf", "18"]
     assert video_encode_args(QUALITY_FAST) == [
         "-c:v", "libx264", "-preset", "fast", "-crf", "18"]
     assert video_encode_args(DELIVERY) == [
         "-c:v", "libx264", "-preset", "fast", "-crf", "22"]
+
+
+def test_unset_encoder_auto_selects_only_on_apple(monkeypatch):
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
+    assert ffmpeg_utils.configured_encoder_mode() == "auto"
+    assert selected_video_encoder(QUALITY) == "videotoolbox"
+
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(
+        ffmpeg_utils, "_probe_nvenc",
+        lambda: pytest.fail("Non-Apple unset mode must keep x264"))
+    assert ffmpeg_utils.configured_encoder_mode() == "x264"
+    assert selected_video_encoder(QUALITY) == "x264"
+
+
+def test_disabled_apple_auto_keeps_x264_without_mac_or_nvenc_probe(monkeypatch):
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setenv("APPLE_SILICON_ACCELERATION", "disabled")
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setattr(
+        macos_ffmpeg, "_probe_encoder",
+        lambda: pytest.fail("disabled Apple must not probe VideoToolbox"))
+    monkeypatch.setattr(
+        ffmpeg_utils, "_probe_nvenc",
+        lambda: pytest.fail("disabled Apple must not probe NVENC"))
+
+    assert selected_video_encoder(QUALITY) == "x264"
+
+
+def test_explicit_videotoolbox_requires_active_apple_gate(monkeypatch):
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setenv("APPLE_SILICON_ACCELERATION", "disabled")
+    monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
+    with pytest.raises(ffmpeg_utils.accelerator_runtime.AcceleratorConfigurationError):
+        selected_video_encoder(QUALITY)
 
 
 def test_unknown_tier_raises():
@@ -70,7 +109,7 @@ def test_auto_probes_only_once(monkeypatch):
         return True
 
     monkeypatch.setenv("FFMPEG_ENCODER", "auto")
-    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: False)
     monkeypatch.setattr(ffmpeg_utils, "_probe_nvenc", fake_probe)
     for _ in range(3):
         video_encode_args(QUALITY_FAST)
@@ -79,8 +118,8 @@ def test_auto_probes_only_once(monkeypatch):
 
 def test_auto_selects_videotoolbox_only_on_apple(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "auto")
-    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
     monkeypatch.setattr(
         ffmpeg_utils, "_probe_nvenc",
         lambda: pytest.fail("Apple auto must not probe NVENC"))
@@ -95,8 +134,8 @@ def test_auto_selects_videotoolbox_only_on_apple(monkeypatch):
 
 def test_apple_intermediate_stays_on_x264(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "auto")
-    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
 
     assert selected_video_encoder(INTERMEDIATE) == "x264"
     assert video_encode_args(INTERMEDIATE) == [
@@ -105,8 +144,8 @@ def test_apple_intermediate_stays_on_x264(monkeypatch):
 
 def test_each_effective_encoder_is_announced_once(monkeypatch, capsys):
     monkeypatch.setenv("FFMPEG_ENCODER", "auto")
-    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
 
     video_encode_args(INTERMEDIATE)
     video_encode_args(INTERMEDIATE)
@@ -122,7 +161,7 @@ def test_videotoolbox_probe_is_cached_independently(monkeypatch):
     calls = []
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
     monkeypatch.setattr(
-        ffmpeg_utils, "_probe_videotoolbox",
+        macos_ffmpeg, "_probe_encoder",
         lambda: (calls.append(1), True)[1])
     monkeypatch.setattr(
         ffmpeg_utils, "_probe_nvenc",
@@ -135,7 +174,7 @@ def test_videotoolbox_probe_is_cached_independently(monkeypatch):
 
 def test_videotoolbox_probe_failure_uses_x264(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: False)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: False)
     assert selected_video_encoder(QUALITY) == "x264"
 
 
@@ -145,7 +184,7 @@ def test_videotoolbox_failure_replays_complete_operation_with_x264(
     attempts = []
     removed = []
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
 
     def build(args):
         return [*args, str(output)]
@@ -175,7 +214,7 @@ def test_videotoolbox_failure_replays_complete_operation_with_x264(
 
 def test_videotoolbox_encoder_fallback_can_force_cpu_decode(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
     primary = []
     cpu = []
 
@@ -202,7 +241,7 @@ def test_videotoolbox_encoder_fallback_can_force_cpu_decode(monkeypatch):
 
 def test_invalid_decode_configuration_is_not_hidden_as_encoder_fallback(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
     fallbacks = []
 
     with pytest.raises(gpu_decode.DecodeConfigurationError):
@@ -219,7 +258,7 @@ def test_invalid_decode_configuration_is_not_hidden_as_encoder_fallback(monkeypa
 
 def test_command_build_error_is_not_replayed_as_encoder_failure(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
     runs = []
 
     def broken_build(_args):
@@ -237,7 +276,7 @@ def test_command_build_error_is_not_replayed_as_encoder_failure(monkeypatch):
 
 def test_videotoolbox_process_error_replays_with_x264(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
     attempts = []
 
     def run(command):
@@ -261,7 +300,7 @@ def test_videotoolbox_process_error_replays_with_x264(monkeypatch):
 
 def test_failed_x264_replay_does_not_disable_videotoolbox(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "videotoolbox")
-    monkeypatch.setattr(ffmpeg_utils, "_probe_videotoolbox", lambda: True)
+    monkeypatch.setattr(macos_ffmpeg, "_probe_encoder", lambda: True)
     attempts = []
 
     result = run_encode(
@@ -301,7 +340,7 @@ def test_nvenc_runtime_failure_is_not_replayed_with_x264(monkeypatch):
 
 def test_apple_auto_cut_does_not_probe_nvenc(monkeypatch):
     monkeypatch.setenv("FFMPEG_ENCODER", "auto")
-    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
     monkeypatch.setattr(
         ffmpeg_utils, "_probe_nvenc",
         lambda: pytest.fail("Apple intermediate cut must not probe NVENC"))
@@ -500,11 +539,13 @@ def test_apple_cut_uses_videotoolbox_decode_and_x264(monkeypatch, tmp_path):
     output = tmp_path / "temp_clip.mp4"
     fake = _FakeRun([(0, 5_000_000, "")])
     monkeypatch.setenv("FFMPEG_ENCODER", "x264")
-    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
     monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_ok", lambda path: False)
     monkeypatch.setattr(
         gpu_decode, "select_attempt",
-        lambda path, render=True, backend=None: gpu_decode._attempt("videotoolbox"))
+        lambda path, render=True, backend=None: gpu_decode.DecodeAttempt(
+            "videotoolbox", macos_ffmpeg.HW_ARGS, macos_ffmpeg.DOWNLOAD,
+            True, bool(render)))
     monkeypatch.setattr(ffmpeg_utils.subprocess, "run", fake)
 
     ffmpeg_utils.cut_clip("source.mp4", str(output), 1.5, 12.0, 4)
@@ -524,11 +565,13 @@ def test_failed_videotoolbox_cut_replays_complete_cpu_x264(
         (0, 5_000_000, ""),
     ])
     monkeypatch.setenv("FFMPEG_ENCODER", "x264")
-    monkeypatch.setattr(ffmpeg_utils, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ffmpeg_utils.accelerator_runtime, "is_apple_silicon", lambda: True)
     monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_ok", lambda path: False)
     monkeypatch.setattr(
         gpu_decode, "select_attempt",
-        lambda path, render=True, backend=None: gpu_decode._attempt("videotoolbox"))
+        lambda path, render=True, backend=None: gpu_decode.DecodeAttempt(
+            "videotoolbox", macos_ffmpeg.HW_ARGS, macos_ffmpeg.DOWNLOAD,
+            True, bool(render)))
     monkeypatch.setattr(ffmpeg_utils.subprocess, "run", fake)
 
     ffmpeg_utils.cut_clip("source.mp4", str(output), 1.5, 12.0, 4)

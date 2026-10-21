@@ -263,8 +263,15 @@ def _transcribe_with_faster_whisper(media_path, force_cpu=False):
     return _faster_whisper_transcript(segments, info)
 
 
+def _mac_asr():
+    """Load the Apple ASR adapter only after an MLX route was selected."""
+    from platforms.macos import asr
+
+    return asr
+
+
 def _release_loaded_mlx_models():
-    module = sys.modules.get("mac_asr")
+    module = sys.modules.get("platforms.macos.asr")
     if module is None:
         return False
     try:
@@ -286,17 +293,17 @@ def _cleanup_failed_mlx():
 
 
 def _run_mlx_whisper(audio, params, show_progress):
-    import mac_asr
+    adapter = _mac_asr()
 
     try:
         with _ASR_GATE:
-            transcript = mac_asr.transcribe_whisper(audio, **params)
+            transcript = adapter.transcribe_whisper(audio, **params)
     except Exception:
         _cleanup_failed_mlx()
         raise
 
     if show_progress:
-        progress = _TranscribeProgress(mac_asr.audio_duration_seconds(audio))
+        progress = _TranscribeProgress(adapter.audio_duration_seconds(audio))
         for segment in transcript["segments"]:
             progress.update(segment["end"])
         progress.update(progress.total)
@@ -319,8 +326,7 @@ def whisper_config_identity():
         "params": dict(WHISPER_TRANSCRIBE_PARAMS),
     }
     if engine == "mlx":
-        from mac_asr import resolve_whisper_model
-        repository, revision = resolve_whisper_model()
+        repository, revision = _mac_asr().resolve_whisper_model()
         identity.update({"model": repository, "revision": revision})
     else:
         identity.update(get_whisper_config())
@@ -342,8 +348,7 @@ def parakeet_config_identity():
         "resolved_parakeet_engine": engine,
     }
     if engine == "mlx":
-        from mac_asr import resolve_parakeet_model
-        repository, revision = resolve_parakeet_model()
+        repository, revision = _mac_asr().resolve_parakeet_model()
         identity.update({
             "model": repository,
             "revision": revision,
@@ -360,8 +365,10 @@ def parakeet_config_identity():
 
 def _transcribe_with_whisper(media_path):
     """Use MLX on Apple Silicon and preserve faster-whisper everywhere else."""
-    from accelerator_runtime import resolve_whisper_engine
-    from mac_asr import MacASRConfigurationError
+    from accelerator_runtime import (
+        AcceleratorConfigurationError,
+        resolve_whisper_engine,
+    )
 
     requested = _requested_whisper_engine()
     engine = resolve_whisper_engine(requested)
@@ -374,7 +381,7 @@ def _transcribe_with_whisper(media_path):
         print(f"🎙️ [ASR] mlx-whisper ok: lang={transcript['language']} "
               f"segments={len(transcript['segments'])}")
         return transcript
-    except MacASRConfigurationError:
+    except AcceleratorConfigurationError:
         raise
     except Exception as e:
         if requested == "mlx":
@@ -590,7 +597,7 @@ def _transcribe_with_parakeet(media_path):
 
 
 def _run_mlx_parakeet(wav_path, progress):
-    import mac_asr
+    adapter = _mac_asr()
 
     def update(current, total):
         if total:
@@ -598,7 +605,7 @@ def _run_mlx_parakeet(wav_path, progress):
 
     try:
         with _ASR_GATE:
-            transcript = mac_asr.transcribe_parakeet(
+            transcript = adapter.transcribe_parakeet(
                 wav_path, chunk_callback=update)
     except Exception:
         _cleanup_failed_mlx()
@@ -727,8 +734,10 @@ def _whisper_span(audio, language):
     Calls the selected engine without full-file progress output.  Apple
     ``auto`` uses MLX; every non-Apple route remains faster-whisper.
     """
-    from accelerator_runtime import resolve_whisper_engine
-    from mac_asr import MacASRConfigurationError
+    from accelerator_runtime import (
+        AcceleratorConfigurationError,
+        resolve_whisper_engine,
+    )
 
     requested = _requested_whisper_engine()
     if resolve_whisper_engine(requested) == "faster-whisper":
@@ -743,7 +752,7 @@ def _whisper_span(audio, language):
             for word in segment.get("words", [])
         ]
         return transcript["text"], merge_continuation_words(words)
-    except MacASRConfigurationError:
+    except AcceleratorConfigurationError:
         raise
     except Exception as e:
         if requested == "mlx":
@@ -867,7 +876,6 @@ def _transcribe_media(media_path):
 
     if backend == "parakeet":
         from accelerator_runtime import AcceleratorConfigurationError
-        from mac_asr import MacASRConfigurationError
 
         requested = _requested_parakeet_engine()
         try:
@@ -879,7 +887,7 @@ def _transcribe_media(media_path):
                 return transcript
             print(f"⚠️ [ASR] parakeet result rejected ({reason}) — "
                   f"falling back to whisper")
-        except (MacASRConfigurationError, AcceleratorConfigurationError):
+        except AcceleratorConfigurationError:
             raise
         except Exception as e:
             if requested != "auto":
