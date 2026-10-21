@@ -381,8 +381,21 @@ def _transcribe_with_whisper(media_path):
         print(f"🎙️ [ASR] mlx-whisper ok: lang={transcript['language']} "
               f"segments={len(transcript['segments'])}")
         return transcript
-    except AcceleratorConfigurationError:
-        raise
+    except AcceleratorConfigurationError as error:
+        # ``auto`` keeps a portable faster-whisper route available for normal
+        # model aliases (for example ``base``) without a tested MLX mapping.
+        # An explicit MLX repository/revision is deliberate operator input, so
+        # leave those configuration errors visible instead of ignoring them.
+        explicit_mlx_model = any(
+            os.environ.get(name, "").strip()
+            for name in ("WHISPER_MLX_MODEL", "WHISPER_MLX_MODEL_REVISION")
+        )
+        if requested != "auto" or explicit_mlx_model:
+            raise
+        print(f"⚠️ [ASR] mlx-whisper configuration unavailable "
+              f"({type(error).__name__}: {error}) — "
+              "falling back to faster-whisper on CPU")
+        return _transcribe_with_faster_whisper(media_path, force_cpu=True)
     except Exception as e:
         if requested == "mlx":
             raise

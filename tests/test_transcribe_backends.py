@@ -364,6 +364,47 @@ def test_whisper_auto_falls_back_to_faster_whisper_cpu(monkeypatch):
     assert calls == [True]
 
 
+def test_whisper_auto_falls_back_when_model_has_no_mlx_mapping(monkeypatch):
+    import accelerator_runtime
+
+    sentinel = {"text": "cpu", "language": "en", "segments": []}
+    calls = []
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    monkeypatch.setenv("WHISPER_MODEL", "base")
+    monkeypatch.delenv("WHISPER_MLX_MODEL", raising=False)
+    monkeypatch.delenv("WHISPER_MLX_MODEL_REVISION", raising=False)
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        tb, "_run_mlx_whisper",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            accelerator_runtime.AcceleratorConfigurationError("no base mapping")))
+    monkeypatch.setattr(
+        tb, "_transcribe_with_faster_whisper",
+        lambda path, force_cpu=False: (calls.append(force_cpu), sentinel)[1])
+
+    assert tb._transcribe_with_whisper("video.mp4") is sentinel
+    assert calls == [True]
+
+
+def test_whisper_auto_keeps_explicit_mlx_config_errors_visible(monkeypatch):
+    import accelerator_runtime
+
+    monkeypatch.setenv("WHISPER_ENGINE", "auto")
+    monkeypatch.setenv("WHISPER_MLX_MODEL", "owner/custom-whisper")
+    monkeypatch.setenv("WHISPER_MLX_MODEL_REVISION", "not-a-sha")
+    monkeypatch.setattr(
+        accelerator_runtime, "is_apple_silicon", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        tb, "_run_mlx_whisper",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            accelerator_runtime.AcceleratorConfigurationError("bad pin")))
+
+    with pytest.raises(accelerator_runtime.AcceleratorConfigurationError,
+                       match="bad pin"):
+        tb._transcribe_with_whisper("video.mp4")
+
+
 def test_faster_whisper_cuda_failure_keeps_existing_sticky_cpu_fallback(
         monkeypatch):
     calls = []
