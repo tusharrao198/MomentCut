@@ -261,7 +261,7 @@ WHISPER_MODEL=large-v3-turbo
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE=float16
 FFMPEG_ENCODER=auto           # VideoToolbox on Apple Silicon, NVENC elsewhere, then x264
-VIDEO_DECODE_BACKEND=auto     # VideoToolbox on Apple Silicon, CUDA/NVDEC elsewhere, then CPU
+VIDEO_DECODE_BACKEND=auto     # CPU on Apple Silicon, CUDA/NVDEC elsewhere, then CPU
 TRANSCRIBE_BACKEND=parakeet   # optional: ~2x faster than whisper, 25 European languages, auto-falls back to whisper
 ASR_GPU_CONCURRENCY=1
 ```
@@ -284,7 +284,8 @@ default. Point it at any OpenAI-compatible server instead:
 ```bash
 # .env
 LLM_BASE_URL=http://host.docker.internal:11434/v1   # Ollama on the host
-LLM_MODEL=qwen2.5:7b                                 # any chat model that follows instructions
+LLM_MODEL=qwen3:8b                                   # any chat model that follows instructions
+LLM_THINKING=off                                     # Qwen3: request direct JSON, not a reasoning trace
 LLM_DETAIL_FALLBACK_WINDOWS=8                        # bounded recovery below the clip floor
 # LLM_API_KEY=...                                    # only if your server checks one (vLLM --api-key, OpenRouter)
 ```
