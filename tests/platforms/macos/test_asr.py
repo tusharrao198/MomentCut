@@ -107,7 +107,9 @@ def test_mlx_transcript_is_normalised_without_importing_at_module_load(
     )
 
     assert calls["path_or_hf_repo"] == str(snapshot)
-    assert calls["beam_size"] == 5
+    # mlx-whisper currently implements greedy decoding only; passing any
+    # beam_size raises NotImplementedError in its DecodingTask constructor.
+    assert "beam_size" not in calls
     assert "vad_filter" not in calls
     assert result["segments"][0]["words"] == [
         {"word": " Hello", "start": 0.0, "end": 0.4},
