@@ -132,8 +132,10 @@ def _mlx_kwargs(params):
     }
     if params.get("language"):
         translated["language"] = params["language"]
-    if params.get("beam_size") is not None:
-        translated["beam_size"] = int(params["beam_size"])
+    # mlx-whisper 0.4.3 implements greedy decoding only: passing a
+    # ``beam_size`` (including 1) raises NotImplementedError. Keep the
+    # upstream faster-whisper setting on its own route, but omit it here so
+    # the Mac adapter can use mlx-whisper's supported greedy decoder.
     # mlx-whisper has no Silero ``vad_filter`` argument.  Its native
     # no-speech filtering remains enabled for both full media and repair spans.
     return translated
