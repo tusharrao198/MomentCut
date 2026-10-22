@@ -22,11 +22,10 @@ Environment variables:
 import os
 import subprocess
 import threading
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from scenedetect import open_video, SceneManager, FrameTimecode
-from scenedetect.detectors import ContentDetector
 
 import accelerator_runtime
 import gpu_decode
@@ -40,10 +39,38 @@ _TN2_LOCK = threading.Lock()
 _tn2_model = None
 
 
+@dataclass(frozen=True)
+class FrameMarker:
+    """Lightweight scene boundary compatible with OpenShorts consumers."""
+
+    frame: int
+    fps: float
+
+    def get_frames(self):
+        return self.frame
+
+    def get_seconds(self):
+        return self.frame / self.fps if self.fps else 0.0
+
+
+def frame_marker(frame, fps):
+    """Create a lightweight frame boundary for the active Mac route."""
+    return FrameMarker(int(frame), float(fps))
+
+
+def scene_boundary(frame, fps):
+    """Preserve legacy FrameTimecode outside the active Mac route."""
+    if accelerator_runtime.apple_acceleration_active():
+        return frame_marker(frame, fps)
+    from scenedetect import FrameTimecode
+    return FrameTimecode(int(frame), float(fps))
+
+
 def detect_scenes(video_path):
     """Detect scenes. Returns (scene_list, fps) where scene_list is a list of
-    (FrameTimecode, FrameTimecode) pairs — the same contract PySceneDetect's
-    SceneManager.get_scene_list() has always given callers."""
+    boundary pairs. Each boundary supplies ``get_frames()`` and
+    ``get_seconds()``. The active Mac TransNetV2 route returns lightweight
+    markers; all other routes retain PySceneDetect's FrameTimecode objects."""
     engine = os.environ.get("SCENE_ENGINE", "transnetv2").strip().lower()
     if engine != "pyscenedetect":
         try:
@@ -57,6 +84,11 @@ def detect_scenes(video_path):
 # --- legacy engine ----------------------------------------------------------
 
 def _detect_pyscenedetect(video_path):
+    # PySceneDetect imports PyAV, which ships a second FFmpeg bundle alongside
+    # OpenCV on macOS. Keep it off the default TransNetV2 path.
+    from scenedetect import open_video, SceneManager
+    from scenedetect.detectors import ContentDetector
+
     video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector())
@@ -129,8 +161,11 @@ def _extract_frames_small(video_path):
         raise RuntimeError("ffmpeg produced no frames")
     if gpu_decode.one_frame_per_decoded_frame(proc.stderr):
         gpu_decode.remember_count(video_path, n)
+    # subprocess stdout is immutable. Make one writable RGB buffer before
+    # passing it to PyTorch; a non-writable numpy view has undefined behavior
+    # if a future model implementation writes to its input tensor.
     return np.frombuffer(proc.stdout[:n * frame_bytes],
-                         dtype=np.uint8).reshape(n, _TN2_H, _TN2_W, 3)
+                         dtype=np.uint8).copy().reshape(n, _TN2_H, _TN2_W, 3)
 
 
 def _detect_transnetv2(video_path):
@@ -146,7 +181,7 @@ def _detect_transnetv2(video_path):
     threshold = float(os.environ.get("TRANSNETV2_THRESHOLD", "0.5"))
 
     with _TN2_LOCK, torch.no_grad():
-        tensor = torch.from_numpy(np.ascontiguousarray(frames)).to(model.device)
+        tensor = torch.from_numpy(frames).to(model.device)
         single_frame_pred, _ = model.predict_frames(tensor, quiet=True)
         single_frame_pred = single_frame_pred.cpu()
         del tensor
@@ -163,13 +198,15 @@ def _detect_transnetv2(video_path):
 
     # cv2's frame count can differ by a few frames from what ffmpeg decodes;
     # downstream loops run to the decoder's count, so cover the gap.
-    if total_frames > bounds[-1][1]:
+    if not bounds:
+        bounds = [(0, max(total_frames, len(frames)))]
+    elif total_frames > bounds[-1][1]:
         bounds[-1] = (bounds[-1][0], total_frames)
 
     min_sec = float(os.environ.get("SCENE_MIN_SEC", "0.4"))
     bounds = _merge_short_scenes(bounds, fps, min_sec)
 
-    scene_list = [(FrameTimecode(s, fps), FrameTimecode(e, fps))
+    scene_list = [(scene_boundary(s, fps), scene_boundary(e, fps))
                   for s, e in bounds]
     print(f"   🎬 Scene engine: TransNetV2 — {len(scene_list)} scenes")
     return scene_list, fps

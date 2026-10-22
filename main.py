@@ -9,8 +9,6 @@ import threading
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from scenedetect import open_video, SceneManager
-from scenedetect.detectors import ContentDetector
 from ultralytics import YOLO
 import torch
 import os
@@ -34,6 +32,8 @@ import layout_picker
 import llm_backend
 import vision_backend
 import worker_failure
+import scene_detection
+import accelerator_runtime
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             apply_global_candidate_ranking, clip_duration_bounds,
                             dedupe_overlapping, dedupe_ranked_with_floor,
@@ -93,15 +93,14 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
 }}
 """
 
-# Load the YOLO model once (Keep for backup or scene analysis if needed)
-# YOLO_MODEL_PATH lets deployments point at a pre-downloaded weights file so a
-# volume mounted over the workdir doesn't trigger a re-download at startup.
-model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+# Native detector construction is deliberately lazy: startup does not need a
+# graphics context or downloaded weights until a render actually needs them.
+model = None
 
 # --- MediaPipe Setup ---
 # Use standard Face Detection (BlazeFace) for speed
 mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+face_detection = None
 
 # Consecutive detections a large target move must survive before the camera
 # follows it (see SmoothedCameraman.update_target). Env-overridable so the
@@ -426,6 +425,25 @@ DETECT_STRIDE = max(int(os.environ.get("DETECT_STRIDE", "4")), 1)
 YOLO_FALLBACK_STRIDE = DETECT_STRIDE * 2
 
 
+def _face_detector():
+    """Return the shared MediaPipe detector, constructing it on first use."""
+    global face_detection
+    with DETECT_LOCK:
+        if face_detection is None:
+            face_detection = mp_face_detection.FaceDetection(
+                model_selection=1, min_detection_confidence=0.5)
+        return face_detection
+
+
+def _yolo_model():
+    """Return the shared YOLO fallback, downloading weights only when needed."""
+    global model
+    with DETECT_LOCK:
+        if model is None:
+            model = YOLO(os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt"))
+        return model
+
+
 def _detection_frame(frame):
     """Downscaled copy for detectors. Returns (small_frame, scale) with
     scale mapping small-frame pixel coords back to the original frame."""
@@ -447,8 +465,9 @@ def detect_face_candidates(frame):
     height, width, _ = frame.shape
     small, _scale = _detection_frame(frame)
     rgb_frame = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    detector = _face_detector()
     with DETECT_LOCK:
-        results = face_detection.process(rgb_frame)
+        results = detector.process(rgb_frame)
     
     candidates = []
     
@@ -476,9 +495,9 @@ def detect_person_yolo(frame):
     ORIGINAL frame coordinates (inference runs on a downscaled copy).
     """
     small, scale = _detection_frame(frame)
-    # Use the globally loaded model
+    detector = _yolo_model()
     with DETECT_LOCK:
-        results = model(small, verbose=False, classes=[0]) # class 0 is person
+        results = detector(small, verbose=False, classes=[0]) # class 0 is person
 
     if not results:
         return None
@@ -641,7 +660,6 @@ def analyze_scenes_strategy(video_path, scenes):
     return strategies
 
 def detect_scenes(video_path):
-    import scene_detection
     return scene_detection.detect_scenes(video_path)
 
 def get_video_resolution(video_path):
@@ -851,6 +869,14 @@ def _content_block(error_text):
     return None
 
 
+def _macos_ytdlp_options():
+    """Return Mac-only yt-dlp settings without changing portable downloads."""
+    if not accelerator_runtime.apple_acceleration_active():
+        return {}
+    from platforms.macos.ytdlp import javascript_runtime_options
+    return javascript_runtime_options()
+
+
 def download_youtube_video(url, output_dir=".", on_audio=None):
     """
     Downloads a YouTube video using yt-dlp.
@@ -877,6 +903,9 @@ def download_youtube_video(url, output_dir=".", on_audio=None):
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
     print("📥 Downloading video from YouTube...")
+    macos_ytdlp_options = _macos_ytdlp_options()
+    if macos_ytdlp_options:
+        print("🧩 yt-dlp: using the configured local Node runtime on macOS.")
     step_start_time = time.time()
 
     cookies_path = '/app/cookies.txt'
@@ -895,7 +924,7 @@ def download_youtube_video(url, output_dir=".", on_audio=None):
             cookies_path = None
     else:
         cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+        print("ℹ️ YOUTUBE_COOKIES is not set; downloading public video anonymously.")
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
     # (self-host) goes direct as before.
@@ -959,6 +988,7 @@ def download_youtube_video(url, output_dir=".", on_audio=None):
             # playlist's), paying for all of them and keeping the last.
             'noplaylist': True,
             'extractor_args': extractor_args,
+            **macos_ytdlp_options,
             'http_headers': {
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -1679,8 +1709,8 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
         probe = cv2.VideoCapture(input_video)
         span = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
         probe.release()
-        from scenedetect import FrameTimecode
-        scenes = [(FrameTimecode(0, fps), FrameTimecode(span, fps))]
+        scenes = [(scene_detection.scene_boundary(0, fps),
+                   scene_detection.scene_boundary(span, fps))]
 
     print(f"   ✅ Found {len(scenes)} scenes.")
 
