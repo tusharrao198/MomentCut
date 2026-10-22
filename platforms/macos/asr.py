@@ -85,16 +85,24 @@ def resolve_parakeet_model():
     return repository, revision
 
 
-def _snapshot_path(repository, revision):
+def _snapshot_path(repository, revision, *, local_files_only=False):
     from huggingface_hub import snapshot_download
 
-    path = Path(snapshot_download(repo_id=repository, revision=revision))
+    kwargs = {"repo_id": repository, "revision": revision}
+    if local_files_only:
+        kwargs["local_files_only"] = True
+    path = Path(snapshot_download(**kwargs))
     resolved = path.resolve()
     if resolved.name != revision:
         raise MacASRConfigurationError(
             f"Resolved MLX snapshot {resolved.name!r} does not match {revision!r}"
         )
     return str(resolved)
+
+
+def cached_snapshot_path(repository, revision):
+    """Return a pinned local snapshot path without downloading anything."""
+    return _snapshot_path(repository, revision, local_files_only=True)
 
 
 def _import_mlx_package(name):
