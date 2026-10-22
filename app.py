@@ -42,6 +42,7 @@ import recut
 import layout_ranges
 import watermarked
 import media_auth
+import worker_failure
 from gemini_feature_flags import clip_ai_thumbnails_enabled
 
 load_dotenv()
@@ -2131,6 +2132,7 @@ async def run_job_wrapper(job_id):
 # policy block) fail as before: retrying cannot fix them.
 AUTO_RETRY_LIMIT = int(os.environ.get("AUTO_RETRY_LIMIT", "1"))
 AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("AUTO_RETRY_DELAY_SECONDS", "30"))
+WORKER_FAILURE_CONFIGURATION_REVISION = 1
 _TRANSIENT_MARKERS = (
     "out of memory", "outofmemory", "cuda", "cublas", "cudnn", "nvenc",
     "generic error in an external library", "exit code 187", "broken pipe",
@@ -2146,8 +2148,10 @@ _PERMANENT_MARKERS = (
 )
 
 
-def is_transient_failure(logs) -> bool:
-    """Whether a failed job's logs describe something a second run can fix."""
+def is_transient_failure(logs, worker_record=None) -> bool:
+    """Whether a failed job's observed outcome warrants one automatic retry."""
+    if worker_record is not None:
+        return worker_failure.should_auto_retry(worker_record)
     text = _job_error_text(list(logs or [])).lower()
     if any(m in text for m in _PERMANENT_MARKERS):
         return False
@@ -2157,7 +2161,41 @@ def is_transient_failure(logs) -> bool:
 def _should_auto_retry(job) -> bool:
     return bool(job and job.get('status') == 'failed' and not _draining
                 and int(job.get('auto_retries') or 0) < AUTO_RETRY_LIMIT
-                and job.get('cmd') and is_transient_failure(job.get('logs')))
+                and job.get('cmd') and is_transient_failure(
+                    job.get('logs'), job.get('worker_failure')))
+
+
+def _prepare_worker_failure(job_id, job):
+    """Give one worker execution a fresh, identity-bound failure record."""
+    names = (
+        "OPENSHORTS_WORKER_FAILURE_JOB_ID",
+        "OPENSHORTS_WORKER_FAILURE_CONFIGURATION_REVISION",
+        "OPENSHORTS_WORKER_FAILURE_EXECUTION_GENERATION",
+    )
+    env = job['env']
+    if not worker_failure.records_enabled():
+        for name in names:
+            env.pop(name, None)
+        job.pop('worker_failure', None)
+        return None
+    generation = int(job.get('worker_failure_generation') or 0) + 1
+    identity = worker_failure.FailureIdentity(
+        job_id, WORKER_FAILURE_CONFIGURATION_REVISION, generation)
+    worker_failure.clear_record(job['output_dir'])
+    job['worker_failure_generation'] = generation
+    job.pop('worker_failure', None)
+    env.update({
+        names[0]: identity.job_id,
+        names[1]: str(identity.configuration_revision),
+        names[2]: str(identity.execution_generation),
+    })
+    return identity
+
+
+def _read_worker_failure(job, identity):
+    if identity is None:
+        return None
+    return worker_failure.read_record(job['output_dir'], identity)
 
 
 def _clean_for_retry(output_dir):
@@ -2869,6 +2907,7 @@ async def run_job(job_id, job_data):
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
+        failure_identity = _prepare_worker_failure(job_id, job_data)
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -2943,7 +2982,20 @@ async def run_job(job_id, job_data):
                 pass
 
         returncode = process.returncode
-        
+        worker_record = _read_worker_failure(job_data, failure_identity)
+        if worker_record is not None:
+            job_data['worker_failure'] = worker_record
+            job_data['logs'].append(
+                "⚠️ Worker failure: "
+                f"{worker_record['stage']} {worker_record['code']} "
+                f"({worker_record['backend']}).")
+            if returncode == 0:
+                # A matching record is a terminal worker declaration. Do not
+                # treat an unexpectedly swallowed worker exception as success.
+                returncode = 1
+                job_data['logs'].append(
+                    "⚠️ Worker reported a terminal failure despite exit code 0.")
+
         if returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
