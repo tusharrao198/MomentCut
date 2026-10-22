@@ -369,10 +369,14 @@ def test_ollama_transport_failure_still_fails_fast_and_attempts_unload(
         lambda *_args: ([10.0], ["image"]),
     )
     responses = iter((_clip(), vision.LocalVisionError("second window timed out")))
-    monkeypatch.setattr(
-        vision, "_window_response",
-        lambda *_args: next(responses),
-    )
+
+    def next_response(*_args):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(vision, "_window_response", next_response)
     unloaded = []
     monkeypatch.setattr(vision, "_unload", lambda *_args: unloaded.append(True))
 
@@ -503,7 +507,13 @@ def test_invalid_structured_response_is_skipped_when_later_window_succeeds(
         ),
         _clip(70, 100),
     ))
-    monkeypatch.setattr(vision, "_window_response", lambda *_args: next(responses))
+    def next_response(*_args):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(vision, "_window_response", next_response)
     monkeypatch.setattr(vision, "_unload", lambda *_args: None)
 
     result = vision.select_clips("source.mp4", 180, "en", 1, 3, 15, 60)
