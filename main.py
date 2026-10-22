@@ -33,6 +33,7 @@ import hook_grounding
 import layout_picker
 import llm_backend
 import vision_backend
+import worker_failure
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             apply_global_candidate_ranking, clip_duration_bounds,
                             dedupe_overlapping, dedupe_ranked_with_floor,
@@ -2893,6 +2894,11 @@ if __name__ == '__main__':
             else:
                 output_dir = os.path.dirname(input_video)
 
+    failure_reporter = worker_failure.reporter_from_environment(output_dir)
+    if failure_reporter is not None:
+        failure_reporter.install_uncaught_exception_hook()
+        failure_reporter.set_context("input")
+
     if not os.path.exists(input_video):
         print(f"❌ Input file not found: {input_video}")
         exit(1)
@@ -3012,6 +3018,17 @@ if __name__ == '__main__':
                 print(f"♻️ Reusing the transcript from the interrupted run "
                       f"({len(transcript['segments'])} segments) — skipping transcription.")
         if transcript is None:
+            if failure_reporter is not None:
+                transcription = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
+                transcription = "parakeet" if transcription == "parakeet" else "whisper"
+                failure_reporter.set_context(transcription)
+                if transcription == "parakeet":
+                    from accelerator_runtime import resolve_parakeet_engine
+                    backend = resolve_parakeet_engine()
+                else:
+                    from accelerator_runtime import resolve_whisper_engine
+                    backend = resolve_whisper_engine()
+                failure_reporter.set_context(transcription, backend, (backend,))
             try:
                 transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
@@ -3027,6 +3044,12 @@ if __name__ == '__main__':
             transcript = None
 
         # 4. Clip analysis (transcript-driven, or visual for silent videos)
+        if failure_reporter is not None:
+            selector_is_ollama = (
+                llm_backend.active() if transcript is not None else vision_backend.active()
+            )
+            backend = "ollama" if selector_is_ollama else "gemini"
+            failure_reporter.set_context("clip_selection", backend, (backend,))
         early_clips = (early_state or {}).get("clips") if early_state else None
         if (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):
@@ -3065,6 +3088,9 @@ if __name__ == '__main__':
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
+            if failure_reporter is not None:
+                failure_reporter.set_context("render", "ffmpeg", ("ffmpeg",))
+
             def _process_one_clip(i, clip):
                 start = clip['start']
                 end = clip['end']
@@ -3169,6 +3195,7 @@ if __name__ == '__main__':
             # condition on a busy card (22-sep-2026: 2 of 3 clips of a job "never
             # rendered" during a CUDA OOM burst). Try each one once more, alone,
             # after a pause and with the cache freed, before giving up on it.
+            final_failures = []
             for i in sorted(failed, key=lambda k: clip_render_order(shorts).index(k)):
                 print(f"   🔁 Retrying clip {i+1} once…")
                 time.sleep(CLIP_RETRY_PAUSE_SECONDS)
@@ -3176,8 +3203,14 @@ if __name__ == '__main__':
                 try:
                     if not _process_one_clip(i, shorts[i]):
                         print(f"   ❌ Clip {i+1} failed again.")
+                        final_failures.append(i)
                 except Exception as e:
                     print(f"   ❌ Clip {i+1} failed again: {type(e).__name__}: {e}")
+                    final_failures.append(i)
+
+            if failure_reporter is not None and len(final_failures) == len(shorts):
+                raise worker_failure.WorkerFailure(
+                    "incomplete_output", "render", "ffmpeg", ("ffmpeg",))
 
             # Persist per-clip render results added by the workers (auto_hook)
             # so the editor can see what is already burned into each clip.

@@ -139,6 +139,143 @@ class TestWrapper:
         assert sem._value == 1
 
 
+class TestStructuredWorkerFailures:
+    def test_disabled_records_preserve_legacy_retry_policy(self, env, monkeypatch):
+        root, _calls = env
+        _directory, job = _job(root, "n9-legacy", ["❌ CUDA out of memory"])
+        monkeypatch.setattr(app_module.worker_failure, "records_enabled", lambda: False)
+
+        assert app_module._prepare_worker_failure("n9-legacy", job) is None
+        job["status"] = "failed"
+        assert app_module._should_auto_retry(job) is True
+
+    def test_valid_record_controls_retry_policy(self, env, monkeypatch):
+        root, _calls = env
+        directory, job = _job(root, "n9-known", ["❌ CUDA out of memory"])
+        monkeypatch.setattr(app_module.worker_failure, "records_enabled", lambda: True)
+        identity = app_module._prepare_worker_failure("n9-known", job)
+        app_module.worker_failure.write_record(
+            directory,
+            identity,
+            app_module.worker_failure.WorkerFailure(
+                "backend_unavailable", "whisper", "mlx", ("mlx",)),
+        )
+        job["status"] = "failed"
+        job["worker_failure"] = app_module._read_worker_failure(job, identity)
+
+        assert app_module._should_auto_retry(job) is False
+
+    def test_incomplete_output_retries_once(self, env, monkeypatch):
+        root, _calls = env
+        directory, job = _job(root, "n9-render", [])
+        monkeypatch.setattr(app_module.worker_failure, "records_enabled", lambda: True)
+        identity = app_module._prepare_worker_failure("n9-render", job)
+        app_module.worker_failure.write_record(
+            directory,
+            identity,
+            app_module.worker_failure.WorkerFailure("incomplete_output", "render", "ffmpeg"),
+        )
+        job["status"] = "failed"
+        job["worker_failure"] = app_module._read_worker_failure(job, identity)
+
+        assert app_module._should_auto_retry(job) is True
+
+    def test_new_execution_clears_the_previous_record(self, env, monkeypatch):
+        root, _calls = env
+        directory, job = _job(root, "n9-next", [])
+        monkeypatch.setattr(app_module.worker_failure, "records_enabled", lambda: True)
+        first = app_module._prepare_worker_failure("n9-next", job)
+        app_module.worker_failure.write_record(
+            directory, first,
+            app_module.worker_failure.WorkerFailure("service_unavailable", "clip_selection", "ollama"),
+        )
+
+        second = app_module._prepare_worker_failure("n9-next", job)
+
+        assert second.execution_generation == first.execution_generation + 1
+        assert app_module.worker_failure.read_record(directory, first) is None
+        assert job["env"]["OPENSHORTS_WORKER_FAILURE_EXECUTION_GENERATION"] == "2"
+
+    def test_run_job_reads_only_a_matching_record(self, env, monkeypatch):
+        root, _calls = env
+        directory, job = _job(root, "n9-worker", [])
+        monkeypatch.setattr(app_module.worker_failure, "records_enabled", lambda: True)
+
+        class Output:
+            def readline(self):
+                return b""
+
+            def close(self):
+                return None
+
+        class Process:
+            stdout = Output()
+            returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+        def fake_popen(*_args, **kwargs):
+            env = kwargs["env"]
+            identity = app_module.worker_failure.FailureIdentity(
+                env["OPENSHORTS_WORKER_FAILURE_JOB_ID"],
+                int(env["OPENSHORTS_WORKER_FAILURE_CONFIGURATION_REVISION"]),
+                int(env["OPENSHORTS_WORKER_FAILURE_EXECUTION_GENERATION"]),
+            )
+            app_module.worker_failure.write_record(
+                directory, identity,
+                app_module.worker_failure.WorkerFailure(
+                    "service_unavailable", "clip_selection", "ollama", ("ollama",)),
+            )
+            return Process()
+
+        monkeypatch.setattr(app_module.subprocess, "Popen", fake_popen)
+        asyncio.run(app_module.run_job("n9-worker", job))
+
+        assert job["status"] == "failed"
+        assert job["worker_failure"]["code"] == "service_unavailable"
+        assert app_module._should_auto_retry(job) is True
+
+    def test_terminal_record_overrides_a_zero_exit_status(self, env, monkeypatch):
+        root, _calls = env
+        directory, job = _job(root, "n9-zero-exit", [])
+        monkeypatch.setattr(app_module.worker_failure, "records_enabled", lambda: True)
+
+        class Output:
+            def readline(self):
+                return b""
+
+            def close(self):
+                return None
+
+        class Process:
+            stdout = Output()
+            returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+        def fake_popen(*_args, **kwargs):
+            env = kwargs["env"]
+            identity = app_module.worker_failure.FailureIdentity(
+                env["OPENSHORTS_WORKER_FAILURE_JOB_ID"],
+                int(env["OPENSHORTS_WORKER_FAILURE_CONFIGURATION_REVISION"]),
+                int(env["OPENSHORTS_WORKER_FAILURE_EXECUTION_GENERATION"]),
+            )
+            app_module.worker_failure.write_record(
+                directory, identity,
+                app_module.worker_failure.WorkerFailure(
+                    "service_unavailable", "clip_selection", "ollama", ("ollama",)),
+            )
+            return Process()
+
+        monkeypatch.setattr(app_module.subprocess, "Popen", fake_popen)
+        asyncio.run(app_module.run_job("n9-zero-exit", job))
+
+        assert job["status"] == "failed"
+        assert app_module._should_auto_retry(job) is True
+
+
 class TestResumeMidRender:
     def test_manifest_with_metadata_is_resumed_not_recovered(self, env, monkeypatch):
         root, calls = env
