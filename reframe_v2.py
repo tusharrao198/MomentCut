@@ -662,8 +662,8 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
         cap = cv2.VideoCapture(input_video)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-        from scenedetect import FrameTimecode
-        scenes = [(FrameTimecode(0, fps), FrameTimecode(total, fps))]
+        scenes = [(m.scene_detection.scene_boundary(0, fps),
+                   m.scene_detection.scene_boundary(total, fps))]
 
     scene_boundaries = [(s.get_frames(), e.get_frames()) for s, e in scenes]
     # A source shot vertical is already the output: nothing to reframe. The
