@@ -29,8 +29,10 @@ const readVideoDuration = (file) => new Promise((resolve) => {
     } catch { resolve(null); }
 });
 
-export default function MediaInput({ onProcess, isProcessing }) {
+export default function MediaInput({ onProcess, isProcessing, resumeRequest = null, resumeNotice = '', onResumeConsumed }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
+    const [sourceContextConfig, setSourceContextConfig] = useState(null);
+    const [sourceContext, setSourceContext] = useState('');
     // File upload is the primary path; the link is secondary.
     const [mode, setMode] = useState('file'); // 'file' | 'url'
     const [url, setUrl] = useState('');
@@ -95,9 +97,22 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     setYoutubeUrlEnabled(false);
                     setMode('file');
                 }
+                setSourceContextConfig(cfg?.sourceContext || null);
             })
             .catch(() => {});
     }, []);
+
+    useEffect(() => {
+        if (!resumeRequest?.payload) return;
+        if (resumeRequest.type === 'url') {
+            setMode('url');
+            setUrl(resumeRequest.payload);
+        } else if (resumeRequest.type === 'file') {
+            setMode('file');
+            setFile(resumeRequest.payload);
+        }
+        onResumeConsumed?.();
+    }, [resumeRequest, onResumeConsumed]);
 
     // A link pasted in the landing hero: preload it here so the user picks up
     // where they left off. Not auto-submitted — the rights attestation below
@@ -131,9 +146,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_layout', layout);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
-            onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
+            onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, sourceContext: sourceContext.trim(), ...advanced });
         } else if (mode === 'file' && file && !fileTooShort) {
-            onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, ...advanced });
+            onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, sourceContext: sourceContext.trim(), ...advanced });
         }
     };
 
@@ -251,6 +266,28 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 <p className="readout mt-2">MP4, MOV up to 500MB · at least {MIN_SOURCE_SECONDS}s long</p>
                             </label>
                         )}
+                    </div>
+                )}
+
+                {sourceContextConfig?.enabled && (
+                    <div className="mt-5">
+                        <label className="eyebrow mb-2 block" htmlFor="source-context">
+                            Video context / metadata (optional)
+                        </label>
+                        <textarea
+                            id="source-context"
+                            value={sourceContext}
+                            onChange={(e) => setSourceContext(e.target.value.slice(0, sourceContextConfig.manualMaxChars || 2000))}
+                            maxLength={sourceContextConfig.manualMaxChars || 2000}
+                            rows="4"
+                            className="input-field resize-y"
+                            placeholder="Game: GTA V&#10;Mission: The Big Score&#10;Focus on funny fails and clutch moments."
+                        />
+                        <p className="mt-1.5 text-[11px] text-muted leading-relaxed">
+                            Optional notes help clip selection. A pasted video URL also contributes its public title, description and tags.
+                            {' '}{sourceContext.length}/{sourceContextConfig.manualMaxChars || 2000}
+                        </p>
+                        {resumeNotice && <p className="mt-2 text-xs text-warn">{resumeNotice}</p>}
                     </div>
                 )}
 

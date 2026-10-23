@@ -173,3 +173,33 @@ def test_url_wins_over_session_id(dirs, session, monkeypatch):
     assert "-u" in job["cmd"]
     assert "--transcript" not in job["cmd"]
     assert job["attestation"]["source"] == "url"
+
+
+def test_source_context_is_sealed_and_replayed(dirs, session, monkeypatch):
+    monkeypatch.setenv("SOURCE_CONTEXT_MODE", "metadata")
+    note = "Game: GTA V\nPrioritize chase sequences."
+    resp = _post_process({
+        "thumbnail_session_id": "sess1",
+        "source_context": note,
+        "acknowledged": True,
+    })
+    job_id, job = _submitted_job(resp)
+    artifact_path = os.path.join(job["output_dir"], "source_context.json")
+    assert job["cmd"][job["cmd"].index("--source-context-file") + 1] == artifact_path
+    config = app_module.job_state.load_job_config(job["output_dir"])
+    assert config["source_context"]["enabled"] is True
+    assert config["source_context"]["artifact_relative_path"] == "source_context.json"
+    assert note not in json.dumps(config)
+    assert os.path.isfile(artifact_path)
+    rebuilt = app_module.build_job_command({
+        **config,
+        "_execution_generation": 0,
+    })
+    assert rebuilt == job["cmd"]
+    rebuilt_env = app_module.build_job_child_env(
+        config, job.get("runtime_secrets") or {},
+    )
+    assert rebuilt_env["SOURCE_CONTEXT_MODE"] == "metadata"
+    assert app_module.source_context_feature.load_artifact(artifact_path)[
+        "request"
+    ]["creator_context"] == note

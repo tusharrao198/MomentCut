@@ -18,6 +18,7 @@ def test_normalise_metadata_never_rejects_an_otherwise_valid_clip():
 
     assert clip["youtube_description_intro"] == "Hello world\n\nSecond paragraph"
     assert clip["youtube_tags"] == ["Gaming", "Boss Fight"]
+    assert clip["source_youtube_tags"] == []
     assert clip["youtube_hashtags"] == ["#shorts", "#GAMING"]
     assert clip["thumbnail_brief"]["subject"] == "Hero"
     assert len(clip["thumbnail_brief"]["thumbnail_text"]) == 40
@@ -50,6 +51,21 @@ def test_channel_profile_stays_confined_and_metadata_is_bounded(tmp_path, monkey
     profile, warning = packaging.load_youtube_channel_profile()
     assert profile == {"default_tags": [], "default_hashtags": [], "description_sections": []}
     assert "inside OpenShorts/config" in warning
+
+
+def test_source_youtube_tags_are_copied_into_description_not_posting_tags():
+    description, tags, truncated, warning = packaging.compose_youtube_metadata({
+        "youtube_description_intro": "A close call ends with a clean escape.",
+        "youtube_tags": ["clip-specific moment"],
+        "source_youtube_tags": ["GTA V Gameplay", "#GrandTheftAutoV", "GTA V Gameplay"],
+        "youtube_hashtags": ["#shorts"],
+    })
+
+    assert "Source video tags: GTA V Gameplay, GrandTheftAutoV" in description
+    assert "#shorts" in description
+    assert tags == ["clip-specific moment"]
+    assert truncated is False
+    assert warning is None
 
 
 def test_clip_transcript_excerpt_uses_only_overlapping_clip_words():

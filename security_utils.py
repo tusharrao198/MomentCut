@@ -77,6 +77,8 @@ def assert_public_url(url: str) -> str:
         raise UnsafeURLError("Empty URL")
 
     parsed = urlparse(url.strip())
+    if parsed.username or parsed.password:
+        raise UnsafeURLError("URL credentials are not allowed")
     if parsed.scheme.lower() not in ("http", "https"):
         raise UnsafeURLError(f"Unsupported URL scheme: {parsed.scheme!r}")
 

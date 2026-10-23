@@ -50,6 +50,12 @@ def test_literal_tailnet_urls_are_refused(url):
         assert_public_url(url)
 
 
+def test_url_credentials_are_refused_before_dns(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: pytest.fail("DNS must not run"))
+    with pytest.raises(UnsafeURLError, match="credentials"):
+        assert_public_url("https://user:password@example.com/video.mp4")
+
+
 def test_hostname_resolving_to_tailnet_is_refused(monkeypatch):
     """MagicDNS names (``db-host``) or a public name pointed at 100.x."""
     def fake_getaddrinfo(host, port, *a, **k):
