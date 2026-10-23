@@ -147,6 +147,9 @@ def normalise_clip_packaging_metadata(clip: dict) -> dict:
         preserve_newlines=True,
     )
     result["youtube_tags"] = normalise_tags(result.get("youtube_tags"))
+    result["source_youtube_tags"] = normalise_tags(
+        result.get("source_youtube_tags"), maximum_items=MAX_TOTAL_TAGS
+    )
     result["youtube_hashtags"] = normalise_hashtags(result.get("youtube_hashtags"))
     result["thumbnail_brief"] = normalise_thumbnail_brief(result.get("thumbnail_brief"))
     result["why"] = _clean_text(result.get("why"), 320)
@@ -241,8 +244,13 @@ def compose_youtube_metadata(clip: dict) -> tuple[str, list[str], bool, str | No
     hashtags = normalise_hashtags(
         normalised["youtube_hashtags"] + profile["default_hashtags"]
     )
+    source_tag_line = (
+        "Source video tags: " + ", ".join(normalised["source_youtube_tags"])
+        if normalised["source_youtube_tags"] else ""
+    )
     sections = [
         normalised["youtube_description_intro"],
+        source_tag_line,
         " ".join(hashtags),
         *profile["description_sections"],
     ]

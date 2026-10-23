@@ -100,8 +100,18 @@ let pendingJobInMemory = null;
 
 function stashPendingJob(data) {
   const stamp = Date.now();
-  const entry = { stamp, data: { ...data, payload: typeof data?.payload === 'string' ? data.payload : null } };
-  pendingJobInMemory = { stamp, data };
+  // Creator notes can be sensitive. Preserve the URL but never browser-persist
+  // the notes or keep them in the same-document resume copy.
+  const memoryData = {
+    ...data,
+    sourceContext: '',
+    sourceContextOmitted: Boolean(data?.sourceContext?.trim()),
+  };
+  const entry = { stamp, data: {
+    ...memoryData,
+    payload: typeof data?.payload === 'string' ? data.payload : null,
+  } };
+  pendingJobInMemory = { stamp, data: memoryData };
   try {
     localStorage.setItem(PENDING_JOB_KEY, JSON.stringify(entry));
   } catch (_) { /* private mode: the in-memory copy still covers same-document flows */ }
@@ -401,6 +411,7 @@ function App() {
   // Debounced sync of each clip's browser-only edit state (Remotion layers +
   // current server file) to the backend, so a reopened project resumes intact.
   const clipStateSync = useRef({ jobId: null, pending: {}, files: {}, timer: null });
+  const [resumeSourceContext, setResumeSourceContext] = useState(null);
   // Read by in-flight async chases to notice that the user moved on to another job.
   const jobIdRef = useRef(jobId);
   useEffect(() => { jobIdRef.current = jobId; }, [jobId]);
@@ -1085,6 +1096,7 @@ function App() {
           acknowledged: !!data.acknowledged,
           output_format: data.outputFormat || 'auto',
           force_low_quality: forceLowQuality,
+          source_context: data.sourceContext || undefined,
           ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
         });
       } else if (data.type === 'thumbnail_session') {
@@ -1102,6 +1114,7 @@ function App() {
         formData.append('file', data.payload);
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
         formData.append('output_format', data.outputFormat || 'auto');
+        if (data.sourceContext) formData.append('source_context', data.sourceContext);
         for (const [k, v] of Object.entries(advanced)) {
           if (v != null) formData.append(k, v);
         }
@@ -1188,6 +1201,15 @@ function App() {
     const pending = peekPendingJob();
     if (!pending || pending.stamp === resumedStampRef.current) return;
     resumedStampRef.current = pending.stamp;
+    if (pending.data?.sourceContextOmitted) {
+      clearPendingJob();
+      setResumeSourceContext({
+        type: pending.data?.type,
+        payload: pending.data?.payload,
+        notice: 'Paste your optional video context again before generating clips.',
+      });
+      return;
+    }
     track('JobResumedAfterSignin', { props: { type: pending.data?.type || 'unknown' } });
     handleProcessRef.current(pending.data);
   }, [billingEnabled, isSignedIn]);
@@ -2027,7 +2049,13 @@ function App() {
                   )}
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                <MediaInput
+                  onProcess={handleProcess}
+                  isProcessing={status === 'processing'}
+                  resumeRequest={resumeSourceContext}
+                  resumeNotice={resumeSourceContext?.notice}
+                  onResumeConsumed={() => setResumeSourceContext(null)}
+                />
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-xs sm:text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

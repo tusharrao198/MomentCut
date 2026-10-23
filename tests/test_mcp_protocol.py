@@ -78,6 +78,12 @@ class TestTools:
         assert by_name["publish_clip"]["openWorldHint"] is True
         assert by_name["get_quota"]["readOnlyHint"] is True
 
+    def test_process_video_accepts_optional_source_context(self):
+        process = next(tool for tool in TOOLS if tool["name"] == "process_video")
+        field = process["inputSchema"]["properties"]["source_context"]
+        assert field["type"] == "string"
+        assert field["maxLength"] == 2000
+
     def test_call_wraps_result_as_text_and_structured(self):
         resp = _run({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                      "params": {"name": "get_quota", "arguments": {"a": 1}}})

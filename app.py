@@ -8,6 +8,7 @@ load_dotenv()
 
 import copy
 import accelerator_runtime
+import source_context as source_context_feature
 import clip_packaging
 import clip_thumbnail_image
 import llm_backend
@@ -248,6 +249,11 @@ def build_job_command(job_config: dict) -> list[str]:
             raise job_state.JobStateError(
                 "The precomputed transcript is unavailable or changed"
             )
+    source_context_path = source_context_feature.artifact_path_from_job_config(
+        job_config, project_dir,
+    )
+    if source_context_path:
+        command.extend(["--source-context-file", source_context_path])
     command.extend([
         "-o", project_dir,
         "--project-dir", project_dir,
@@ -277,6 +283,7 @@ def _resolved_job_config(
     clip_min_seconds,
     clip_max_seconds,
     checkpointing_enabled: bool,
+    source_context_config: dict | None = None,
 ) -> dict:
     from transcribe_backends import checkpoint_asr_config
 
@@ -330,6 +337,7 @@ def _resolved_job_config(
         "configuration_revision": 1,
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "source": source,
+        "source_context": dict(source_context_config or {"enabled": False}),
         "pipeline": {
             "output_format": output_format,
             "layouts": sorted(layouts or []),
@@ -4526,6 +4534,9 @@ async def get_config():
         # A non-secret feature capability. The dashboard never receives the
         # Gemini key; self-hosted users may keep it only in the backend env.
         "clipAiThumbnailsEnabled": False if BILLING_ENABLED else clip_ai_thumbnails_enabled(),
+        # This deliberately exposes only mode/length capability. The VLM URL,
+        # model name and creator text remain backend-only.
+        "sourceContext": {"enabled": False, "mode": "disabled", "manualMaxChars": 0} if BILLING_ENABLED else source_context_feature.public_config(),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -4815,6 +4826,7 @@ async def process_endpoint(
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
     max_minutes: Optional[str] = Form(None),
+    source_context: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -4850,6 +4862,7 @@ async def process_endpoint(
         captions = body.get("captions")
         upload_id = body.get("upload_id")
         max_minutes = body.get("max_minutes")
+        source_context = body.get("source_context")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -4922,6 +4935,34 @@ async def process_endpoint(
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
+
+    # Optional source context is stored only in this job's retention-bound
+    # artifact. It never enters logs, the child environment, or the resume
+    # manifest (which holds the artifact path, not its contents).
+    try:
+        context_settings = source_context_feature.SourceContextSettings.from_env()
+        creator_context = source_context_feature.normalize_creator_context(
+            source_context, context_settings.manual_max_chars)
+        if creator_context and not context_settings.enabled:
+            shutil.rmtree(job_output_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=409,
+                detail="Source context is disabled on this deployment.",
+            )
+        context_file = ""
+        if context_settings.enabled:
+            context_file = source_context_feature.artifact_path(job_output_dir)
+            source_context_feature.write_artifact_atomic(
+                context_file,
+                source_context_feature.new_pending_artifact(
+                    context_settings, creator_context, attestation["source"]),
+            )
+    except source_context_feature.SourceContextError as exc:
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Invalid source context: {exc}") from exc
+    context_job_config = source_context_feature.durable_job_config(
+        context_settings, job_output_dir, creator_context, context_file,
+    )
 
     # Prepare Command
     # sys.executable, not "python": bare "python" resolves against PATH, which
@@ -5079,6 +5120,8 @@ async def process_endpoint(
         cmd.extend(["-i", input_path])
 
     cmd.extend(["-o", job_output_dir])
+    if context_file:
+        cmd.extend(["--source-context-file", context_file])
     if output_format and output_format != "auto":
         cmd.extend(["--format", output_format])
 
@@ -5184,6 +5227,7 @@ async def process_endpoint(
         clip_min_seconds=min_secs,
         clip_max_seconds=max_secs,
         checkpointing_enabled=PIPELINE_CHECKPOINTS_ENABLED,
+        source_context_config=context_job_config,
     )
     durable_state = {
         "schema_version": 1,
@@ -5477,6 +5521,19 @@ async def get_source_video(job_id: str, request: Request,
     if not source_path:
         raise HTTPException(status_code=404, detail="Source not found")
     return FileResponse(source_path, media_type="video/mp4")
+
+@app.get("/api/source-context/{job_id}")
+async def get_source_context(job_id: str, request: Request):
+    """Return a safe summary of the optional per-job context artifact."""
+    record = _job_record(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, record)
+    artifact = source_context_feature.load_artifact(
+        source_context_feature.artifact_path(os.path.join(OUTPUT_DIR, job_id)))
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Source context not found")
+    return source_context_feature.safe_artifact_view(artifact)
 
 
 @app.get("/api/jobs/{job_id}/download-all")
