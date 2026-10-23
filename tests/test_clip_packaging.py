@@ -25,6 +25,24 @@ def test_normalise_metadata_never_rejects_an_otherwise_valid_clip():
     assert clip["thumbnail_brief"]["must_include"] == ["sword"]
 
 
+def test_multiline_youtube_intro_is_preserved_in_the_final_description():
+    description, _tags, truncated, _warning = packaging.compose_youtube_metadata({
+        "youtube_description_intro": (
+            "Grand Theft Auto V provides the wider mission context.\n"
+            "This clip captures the exact high-speed escape described in the commentary.\n"
+            "The chase builds toward a clean last-second getaway."
+        ),
+        "youtube_hashtags": ["#shorts"],
+    })
+
+    assert description.splitlines()[:3] == [
+        "Grand Theft Auto V provides the wider mission context.",
+        "This clip captures the exact high-speed escape described in the commentary.",
+        "The chase builds toward a clean last-second getaway.",
+    ]
+    assert truncated is False
+
+
 def test_channel_profile_stays_confined_and_metadata_is_bounded(tmp_path, monkeypatch):
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -53,7 +71,7 @@ def test_channel_profile_stays_confined_and_metadata_is_bounded(tmp_path, monkey
     assert "inside OpenShorts/config" in warning
 
 
-def test_source_youtube_tags_are_copied_into_description_not_posting_tags():
+def test_source_youtube_tags_are_copied_into_description_and_posting_tags():
     description, tags, truncated, warning = packaging.compose_youtube_metadata({
         "youtube_description_intro": "A close call ends with a clean escape.",
         "youtube_tags": ["clip-specific moment"],
@@ -63,9 +81,21 @@ def test_source_youtube_tags_are_copied_into_description_not_posting_tags():
 
     assert "Source video tags: GTA V Gameplay, GrandTheftAutoV" in description
     assert "#shorts" in description
-    assert tags == ["clip-specific moment"]
+    assert tags == ["GTA V Gameplay", "GrandTheftAutoV", "clip-specific moment"]
     assert truncated is False
     assert warning is None
+
+
+def test_source_youtube_tags_take_priority_until_youtube_tag_budget_is_full():
+    source_tags = [f"source-{index}-{'x' * 51}" for index in range(8)]
+    description, tags, _truncated, _warning = packaging.compose_youtube_metadata({
+        "youtube_tags": ["clip-specific moment"],
+        "source_youtube_tags": source_tags,
+    })
+
+    assert "Source video tags:" in description
+    assert tags == source_tags
+    assert len(",".join(tags)) <= packaging.TAG_LIST_LIMIT_CHARS
 
 
 def test_clip_transcript_excerpt_uses_only_overlapping_clip_words():

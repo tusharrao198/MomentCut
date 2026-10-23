@@ -6,6 +6,7 @@ bytes) -> per-GB paid proxy (720p cost cap) -> conservative fallback. The
 720p format cap and the PROXY_BYTES monthly counter).
 """
 import pytest
+import json
 
 main = pytest.importorskip("main")
 
@@ -70,6 +71,24 @@ def test_direct_file_urls_skip_the_proxy_chain():
     assert main.is_youtube_url("https://youtu.be/x")
     assert not main.is_youtube_url("https://litter.catbox.moe/u90j4q.mp4")
     assert not main.is_youtube_url("https://tmpfiles.org/dl/1/2/v.mp4")
+
+
+def test_downloaded_video_summary_reports_the_actual_merged_stream(monkeypatch):
+    class Completed:
+        stdout = json.dumps({
+            "streams": [{
+                "codec_name": "h264",
+                "width": 1920,
+                "height": 1080,
+                "avg_frame_rate": "60000/1001",
+            }],
+            "format": {"size": "10485760"},
+        })
+
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    assert main.downloaded_video_summary("/tmp/source.mp4") == \
+        "1920x1080 · h264 · 59.94 fps · 10.0 MiB"
 
 
 class TestSkipStatics:

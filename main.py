@@ -796,6 +796,28 @@ def plan_download_attempts(direct_first, statics, paid, have_hd, youtube=True,
     return plan
 
 
+def downloaded_video_summary(video_path):
+    """Return actual stream facts for a completed YouTube download."""
+    try:
+        completed = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,width,height,avg_frame_rate:format=size",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+        data = json.loads(completed.stdout)
+        stream = (data.get("streams") or [{}])[0]
+        width, height = int(stream["width"]), int(stream["height"])
+        numerator, denominator = str(stream["avg_frame_rate"]).split("/", 1)
+        fps = float(numerator) / float(denominator) if float(denominator) else 0
+        size_mib = int((data.get("format") or {}).get("size") or 0) / (1024 * 1024)
+        return (f"{width}x{height} · {stream.get('codec_name', 'unknown')} · "
+                f"{fps:.2f} fps · {size_mib:.1f} MiB")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError,
+            subprocess.SubprocessError, OSError):
+        return None
+
+
 def cap_source_duration(input_video, max_minutes, safety=False):
     """Cut ``input_video`` down to its first ``max_minutes`` minutes, in place.
 
@@ -1244,6 +1266,8 @@ Technical Details: {str(last_err)}
         if os.path.abspath(downloaded_file) != destination_path:
             os.replace(downloaded_file, destination_path)
         downloaded_file = destination_path
+    summary = downloaded_video_summary(downloaded_file)
+    print(f"📺 Downloaded source: {summary or 'resolution unavailable'}")
     print(f"✅ Video downloaded in {time.time() - step_start_time:.2f}s: {downloaded_file}")
     return downloaded_file, sanitized_title
 
