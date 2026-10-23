@@ -47,6 +47,12 @@ def test_technical_lines_are_hidden():
     assert friendly_log_line("yt-dlp downloading format 137") is None
 
 
+def test_source_quality_is_visible_without_the_source_path():
+    assert friendly_log_line(
+        "📺 Downloaded source: 1920x1080 · h264 · 59.94 fps · 10.0 MiB"
+    ) == "📺 Source quality: 1920x1080 · h264 · 59.94 fps · 10.0 MiB"
+
+
 def test_errors_kept_without_paths():
     assert friendly_log_line("Process failed with exit code 1") == \
         "Process failed with exit code 1"

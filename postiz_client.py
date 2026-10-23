@@ -318,7 +318,7 @@ def create_youtube_post(
         # Postiz validates both display text and canonical value. They are the
         # same for OpenShorts' already-normalised plain-string tags.
         {"label": label, "value": label}
-        for label in normalise_tags(tags or [], maximum_items=20)
+        for label in normalise_tags(tags or [], maximum_items=100)
     ]
 
     thumbnail_settings = {}
