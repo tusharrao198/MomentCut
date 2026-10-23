@@ -102,6 +102,16 @@ PIPELINE_ENV_NAMES = (
     "DETECT_STRIDE", "JUMP_CONFIRM_FRAMES", "SCENE_CUT_RESET",
     "CLIP_WORKERS", "CLIP_RETRY_PAUSE_SECONDS", "EARLY_AUDIO",
     "MAX_SOURCE_MINUTES", "SOURCE_CAP_MINUTES", "DOWNLOAD_SKIP_STATICS",
+    "SOURCE_CONTEXT_MODE", "SOURCE_CONTEXT_MANUAL_MAX_CHARS",
+    "SOURCE_CONTEXT_DESCRIPTION_MAX_CHARS", "SOURCE_CONTEXT_TAG_MAX_ITEMS",
+    "SOURCE_CONTEXT_TAG_MAX_CHARS", "SOURCE_CONTEXT_PROMPT_MAX_CHARS",
+    "SOURCE_CONTEXT_VISION_PROVIDER", "SOURCE_CONTEXT_VISION_BASE_URL",
+    "SOURCE_CONTEXT_VISION_MODEL", "SOURCE_CONTEXT_VISION_TIMEOUT_SECONDS",
+    "SOURCE_CONTEXT_VISION_RETRY_ATTEMPTS", "SOURCE_CONTEXT_VISION_CONCURRENCY",
+    "SOURCE_CONTEXT_VISION_LOCK_TIMEOUT_SECONDS", "SOURCE_CONTEXT_VISION_LOCK_DIR",
+    "SOURCE_CONTEXT_FRAME_COUNT", "SOURCE_CONTEXT_MAX_FRAME_WIDTH",
+    "SOURCE_CONTEXT_NUM_CTX", "SOURCE_CONTEXT_VISION_REQUEST_MAX_BYTES",
+    "SOURCE_CONTEXT_VISION_RESPONSE_MAX_BYTES",
 )
 
 
@@ -243,7 +253,7 @@ def expected_clip_plan_key(
         "route": route_context,
         "resolved_stage_config": _stage_config(
             job_config, "pipeline", "selection", "asr", "scene_detection",
-            "text_selection", "vision_selection",
+            "text_selection", "vision_selection", "source_context",
         ),
         "expected_upstream_compatibility_keys": upstream,
         "semantic_input_hashes": [],

@@ -9,3 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # variable, so this must be set here — before any test module imports app — or
 # the suite's behavior would depend on the developer's personal .env.
 os.environ["BILLING_ENABLED"] = "0"
+# Test modules opt into source context themselves. Keep a developer's .env
+# from turning it on for otherwise unrelated API and pipeline tests.
+os.environ["SOURCE_CONTEXT_MODE"] = "disabled"

@@ -45,6 +45,7 @@ def _client(models):
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     monkeypatch.setattr(main.time, "sleep", lambda *_: None)
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
 
 
 def test_recovers_from_a_single_empty_body(monkeypatch):

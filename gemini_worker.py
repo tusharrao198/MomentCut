@@ -322,6 +322,16 @@ def _log(message: str) -> None:
         stream.write(safe_text + "\n")
     stream.flush()
 
+def with_source_context(prompt, source_context, marker):
+    """Insert one bounded untrusted-reference block before a stable prompt marker."""
+    if not source_context:
+        return prompt
+    position = prompt.find(marker)
+    if position < 0:
+        raise ValueError(f"Source-context insertion marker missing: {marker}")
+    return f"{prompt[:position]}{source_context}\n\n{prompt[position:]}"
+
+
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
 RANK these candidate windows by how well each would work as a standalone short.

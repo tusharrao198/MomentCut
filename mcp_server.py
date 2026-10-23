@@ -135,6 +135,11 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Set true to proceed after a needs_confirmation low-resolution warning.",
                 },
+                "source_context": {
+                    "type": "string",
+                    "maxLength": 2000,
+                    "description": "Optional creator notes or identifiers for clip selection. It is stored only with this job and is unavailable when the server disables source context.",
+                },
                 "target_clips": {
                     "type": "integer", "minimum": 1, "maximum": 15,
                     "description": "How many clips to aim for. A target, not a guarantee: "
@@ -393,7 +398,7 @@ async def _tool_process_video(client, args):
         "webhook_url": args.get("webhook_url"),
         "webhook_secret": args.get("webhook_secret"),
     }
-    for k in ("target_clips", "clip_min_seconds", "clip_max_seconds", "captions"):
+    for k in ("target_clips", "clip_min_seconds", "clip_max_seconds", "captions", "source_context"):
         if args.get(k) is not None:
             body[k] = args[k]
     # Same default as the dashboard: hook on unless the caller opts out. The

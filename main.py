@@ -43,6 +43,8 @@ import vision_backend
 import worker_failure
 import scene_detection
 import accelerator_runtime
+import source_context as source_context_feature
+import source_context_vision
 import checkpoint_store
 import job_state
 from clip_selection import (build_transcript_windows, clip_count_targets,
@@ -885,6 +887,7 @@ def download_youtube_video(
     output_dir=".",
     on_audio=None,
     destination_path=None,
+    on_source_metadata=None,
 ):
     """
     Downloads a YouTube video using yt-dlp.
@@ -1008,6 +1011,7 @@ def download_youtube_video(
     # Wire bytes actually pulled through the (paid) proxy, summed across
     # fragments/streams. Reported to app.py via the PROXY_BYTES= line below.
     _dl_bytes = {"total": 0, "partial": 0}
+    metadata_sent = False
 
     def _progress_hook(d):
         if d.get('status') == 'downloading':
@@ -1062,6 +1066,7 @@ def download_youtube_video(
                   f"transcribing once the video is in.")
 
     def _attempt(extractor_args, fmt, proxy, cookies=True):
+        nonlocal metadata_sent
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
         # Extracted ONCE, unprocessed, and handed to the download below: a
@@ -1069,6 +1074,15 @@ def download_youtube_video(
         # clients, API JSON, m3u8), 4-9 s of round trips per attempt.
         with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
             info = ydl.extract_info(url, download=False, process=False)
+        if on_source_metadata and not metadata_sent:
+            try:
+                on_source_metadata(info)
+                metadata_sent = True
+            except Exception as exc:
+                print(
+                    "   ℹ️ Source metadata context skipped "
+                    f"({type(exc).__name__}: {exc})."
+                )
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
         # Only when the whole source is far bigger than what was paid for: a
         # ranged fetch goes through ffmpeg at ~1-2.5x realtime, while a native
@@ -2087,8 +2101,9 @@ def local_detail_fallback_limit():
 
 
 def _local_window_detail_prompt(window, *, video_duration, language,
-                                min_secs, max_secs, correction=""):
-    return gemini_worker.LOCAL_WINDOW_DETAIL_PROMPT_TEMPLATE.format(
+                                min_secs, max_secs, correction="",
+                                source_context_prompt=""):
+    prompt = gemini_worker.LOCAL_WINDOW_DETAIL_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
         language=language,
         min_secs=min_secs,
@@ -2099,6 +2114,8 @@ def _local_window_detail_prompt(window, *, video_duration, language,
         window_text=window["text"],
         correction=correction,
     )
+    return gemini_worker.with_source_context(
+        prompt, source_context_prompt, "WINDOW_ID:")
 
 
 def _selection_unit_key(stage, job_config, source_identity, route, payload,
@@ -2113,6 +2130,7 @@ def _selection_unit_key(stage, job_config, source_identity, route, payload,
             "configuration_revision": job_config["configuration_revision"],
             "selection": job_config.get("selection") or {},
             "text_selection": job_config.get("text_selection") or {},
+            "source_context": job_config.get("source_context") or {},
         },
         "expected_upstream_compatibility_keys": [],
         "semantic_input_hashes": list(semantic_inputs or []) + [
@@ -2121,6 +2139,12 @@ def _selection_unit_key(stage, job_config, source_identity, route, payload,
             )
         ],
     })
+
+
+def _source_context_semantic_inputs(source_context_prompt):
+    if not source_context_prompt:
+        return []
+    return [checkpoint_store.sha256_bytes(source_context_prompt.encode("utf-8"))]
 
 
 def _source_analysis_key(stage, job_config, source_identity, config, inputs):
@@ -2148,7 +2172,8 @@ def _source_analysis_key(stage, job_config, source_identity, config, inputs):
 def _run_local_detail_window(client, model_name, window, *, video_duration,
                              language, min_secs, max_secs, costs, label,
                              words=None, checkpoint_store_instance=None,
-                             job_config=None, source_identity=None):
+                             job_config=None, source_identity=None,
+                             source_context_prompt=""):
     """Ask the local model for zero-or-one clip and validate it immediately."""
     detail_key = None
     reusable = bool(
@@ -2172,6 +2197,9 @@ def _run_local_detail_window(client, model_name, window, *, video_duration,
                 "clip_min_seconds": min_secs,
                 "clip_max_seconds": max_secs,
             },
+            semantic_inputs=_source_context_semantic_inputs(
+                source_context_prompt
+            ),
         )
         cached = checkpoint_store_instance.load_keyed(
             "text-detail", detail_key,
@@ -2193,6 +2221,7 @@ def _run_local_detail_window(client, model_name, window, *, video_duration,
             min_secs=min_secs,
             max_secs=max_secs,
             correction=correction,
+            source_context_prompt=source_context_prompt,
         )
         try:
             parsed, cost = _run_gemini_stage(
@@ -2301,7 +2330,7 @@ def _run_local_detail_windows(client, model_name, primary_windows,
                               min_secs, max_secs, min_clips, costs,
                               max_clips=None, words=None,
                               checkpoint_store_instance=None, job_config=None,
-                              source_identity=None):
+                              source_identity=None, source_context_prompt=""):
     """Collect one validated candidate per primary window, then bounded fallback."""
     candidates = []
     for window in primary_windows:
@@ -2319,6 +2348,7 @@ def _run_local_detail_windows(client, model_name, primary_windows,
             checkpoint_store_instance=checkpoint_store_instance,
             job_config=job_config,
             source_identity=source_identity,
+            source_context_prompt=source_context_prompt,
         )
         if candidate:
             candidates.append(candidate)
@@ -2357,6 +2387,7 @@ def _run_local_detail_windows(client, model_name, primary_windows,
             checkpoint_store_instance=checkpoint_store_instance,
             job_config=job_config,
             source_identity=source_identity,
+            source_context_prompt=source_context_prompt,
         )
         if candidate:
             candidates.append(candidate)
@@ -2368,7 +2399,7 @@ def _run_local_detail_windows(client, model_name, primary_windows,
 def _rank_local_candidates(client, model_name, candidates, *,
                            transcript_result=None, language="unknown", costs,
                            checkpoint_store_instance=None, job_config=None,
-                           source_identity=None):
+                           source_identity=None, source_context_prompt=""):
     """Globally compare independent window picks; fall back without data loss."""
     prepared = []
     payload = []
@@ -2417,6 +2448,9 @@ def _rank_local_candidates(client, model_name, candidates, *,
             source_identity,
             "speech-local",
             {"candidates": payload, "language": language},
+            semantic_inputs=_source_context_semantic_inputs(
+                source_context_prompt
+            ),
         )
         cached = checkpoint_store_instance.load_fixed("text-rank", rank_key)
         if cached is not None and isinstance(
@@ -2430,6 +2464,8 @@ def _rank_local_candidates(client, model_name, candidates, *,
         language=language,
         candidates_json=json.dumps(payload, ensure_ascii=False),
     )
+    prompt = gemini_worker.with_source_context(
+        prompt, source_context_prompt, "CANDIDATES_JSON:")
     try:
         parsed, cost = _run_gemini_stage(
             client,
@@ -2467,7 +2503,7 @@ def _rank_local_candidates(client, model_name, candidates, *,
 
 def get_viral_clips(transcript_result, video_duration, *,
                     checkpoint_store_instance=None, job_config=None,
-                    source_identity=None):
+                    source_identity=None, source_context_prompt=""):
     """Windowed clip selection: score candidates, then extract/rank the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2534,9 +2570,11 @@ def get_viral_clips(transcript_result, video_duration, *,
             return [{"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]} for w in ws]
 
         def _score_prompt(ws):
-            return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
+            prompt = gemini_worker.SCORE_PROMPT_TEMPLATE.format(
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+            return gemini_worker.with_source_context(
+                prompt, source_context_prompt, "WINDOWS_JSON:")
 
         reusable_local = bool(
             llm_backend.active()
@@ -2559,6 +2597,9 @@ def get_viral_clips(transcript_result, video_duration, *,
                         source_identity,
                         "speech-local",
                         {"window": window, "language": language},
+                        semantic_inputs=_source_context_semantic_inputs(
+                            source_context_prompt
+                        ),
                     )
                     score_keys[window["id"]] = key
                     cached = checkpoint_store_instance.load_keyed(
@@ -2649,11 +2690,13 @@ def get_viral_clips(transcript_result, video_duration, *,
             # A split batch keeps the full clip-count band: a short list can
             # still hold the best clips, and the model returns fewer anyway.
             def build(ws):
-                return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
+                prompt = gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
                     video_duration=video_duration, language=language,
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
+                return gemini_worker.with_source_context(
+                    prompt, source_context_prompt, "CANDIDATE_WINDOWS_JSON:")
             return build
 
         if llm_backend.active():
@@ -2679,6 +2722,7 @@ def get_viral_clips(transcript_result, video_duration, *,
                 checkpoint_store_instance=checkpoint_store_instance,
                 job_config=job_config,
                 source_identity=source_identity,
+                source_context_prompt=source_context_prompt,
             )
             shorts = _rank_local_candidates(
                 client,
@@ -2690,6 +2734,7 @@ def get_viral_clips(transcript_result, video_duration, *,
                 checkpoint_store_instance=checkpoint_store_instance,
                 job_config=job_config,
                 source_identity=source_identity,
+                source_context_prompt=source_context_prompt,
             )
             # Rank before overlap removal so the globally stronger version of
             # a repeated moment survives. Keep the best-first order until the
@@ -3089,6 +3134,26 @@ def _sanitized_endpoint_identity(value):
         return None
 
 
+def _source_context_config_for_args(args):
+    """Seal an explicit CLI source-context artifact when checkpointing."""
+    path = getattr(args, "source_context_file", "")
+    if not path:
+        return None
+    settings = source_context_feature.SourceContextSettings.from_env()
+    artifact = source_context_feature.load_artifact(path)
+    if not settings.enabled or artifact is None:
+        raise checkpoint_store.CheckpointError(
+            "An explicit --source-context-file needs an enabled, valid artifact"
+        )
+    creator_context = (artifact.get("request") or {}).get("creator_context") or ""
+    return source_context_feature.durable_job_config(
+        settings,
+        getattr(args, "project_dir", None) or os.path.dirname(path) or ".",
+        creator_context,
+        path,
+    )
+
+
 def _resolved_job_config(
     job_id,
     args,
@@ -3156,6 +3221,7 @@ def _resolved_job_config(
             "immutable_model_revision": None,
             "immutable_revision_available": False,
         }
+    source_context_config = _source_context_config_for_args(args)
     config = {
         "schema_version": 1,
         "job_id": job_id,
@@ -3249,6 +3315,8 @@ def _resolved_job_config(
             "private_source": False,
         },
     }
+    if source_context_config is not None:
+        config["source_context"] = source_context_config
     return job_state.seal_job_config(config)
 
 
@@ -3427,6 +3495,74 @@ def transcribe_video_with_provenance(video_path):
     return result
 
 
+def _load_source_context_artifact(path, output_dir, job_config=None):
+    """Load only the sealed job-local artifact used by this execution."""
+    expected = None
+    if job_config:
+        expected = source_context_feature.artifact_path_from_job_config(
+            job_config, output_dir,
+        )
+        if expected is None:
+            if path:
+                raise source_context_feature.SourceContextError(
+                    "This job does not permit a source-context artifact."
+                )
+            return None, None
+    elif path:
+        expected = os.path.realpath(source_context_feature.artifact_path(output_dir))
+    else:
+        return None, None
+    if not path or os.path.realpath(path) != expected:
+        raise source_context_feature.SourceContextError(
+            "Source-context artifact must be the job-local source_context.json file."
+        )
+    settings = source_context_feature.SourceContextSettings.from_env()
+    if not settings.enabled:
+        raise source_context_feature.SourceContextError(
+            "Source context was disabled after this job was accepted."
+        )
+    artifact = source_context_feature.load_artifact(expected)
+    if artifact is None:
+        raise source_context_feature.SourceContextError(
+            "The requested source-context artifact is missing or invalid."
+        )
+    if job_config and not source_context_feature.artifact_matches_job_config(
+            artifact, job_config):
+        raise source_context_feature.SourceContextError(
+            "The source-context artifact does not match this accepted job."
+        )
+    return settings, artifact
+
+
+def _finish_spoken_source_context(path, settings, artifact, input_video, duration):
+    block, report = source_context_feature.complete_spoken_context(
+        path, settings, artifact, input_video, duration,
+        source_context_vision.build_visual_source_context,
+    )
+    if report["state"] == "reused":
+        print("🧭 Source context: reusing the completed local artifact.")
+    elif report["state"] == "ready":
+        if report.get("visual_status") == "available":
+            print(
+                "🧭 Source context: local visual observations completed "
+                f"({report['frame_count']} frames, {report['elapsed_seconds']:.1f}s)."
+            )
+        for warning in report.get("warnings") or []:
+            print(
+                f"⚠️ Source context: {warning}; continuing with "
+                "metadata/manual context."
+            )
+        used = ", ".join(report.get("sources_used") or []) or "none"
+        print(f"🧭 Source context: ready (sources={used}).")
+    return block
+
+
+def _finish_unused_source_context(path, settings, artifact, input_video, duration):
+    source_context_feature.complete_unused_context(
+        path, settings, artifact, input_video, duration,
+    )
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
@@ -3441,6 +3577,8 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--source-context-file', type=str,
+                        help="Path to the API-created optional source-context artifact.")
     parser.add_argument('--project-dir', type=str,
                         help="Dedicated persistent project directory for checkpointed runs.")
     parser.add_argument('--job-id', type=str,
@@ -3669,7 +3807,13 @@ if __name__ == '__main__':
                 output_dir = os.path.dirname(args.output) or "."
             else:
                 output_dir = "."
-        
+        source_context_settings, source_context_artifact = \
+            _load_source_context_artifact(
+                args.source_context_file,
+                output_dir,
+                checkpoint_job_config,
+            )
+
         # Transcription (and the Gemini pick) start on the audio track while the
         # video is still downloading; see download_youtube_video(on_audio=).
         # Not for a MAX_SOURCE_MINUTES job (the video is always cut, so the
@@ -3698,7 +3842,8 @@ if __name__ == '__main__':
                     )
                 early["asr_result"] = result
                 early["transcript"] = t
-                if audio_duration and not speech_is_sparse(t, audio_duration):
+                if (not source_context_artifact and audio_duration
+                        and not speech_is_sparse(t, audio_duration)):
                     early["clips"] = get_viral_clips(t, audio_duration)
             except Exception as e:
                 print(f"   ℹ️ Early transcription skipped ({type(e).__name__}: {e}).")
@@ -3723,6 +3868,17 @@ if __name__ == '__main__':
                      and not args.skip_analysis and not args.transcript
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip())
+        def _on_source_metadata(info):
+            if source_context_artifact is None:
+                return
+            source_context_artifact["url_metadata"] = \
+                source_context_feature.url_metadata_from_info(
+                    info, source_context_settings,
+                )
+            source_context_feature.write_artifact_atomic(
+                args.source_context_file, source_context_artifact,
+            )
+
         if retained_source_path is not None:
             input_video = retained_source_path
             video_title = args.job_id or "source"
@@ -3738,6 +3894,9 @@ if __name__ == '__main__':
                 output_dir,
                 on_audio=_on_audio if use_early else None,
                 destination_path=destination,
+                on_source_metadata=(
+                    _on_source_metadata if source_context_artifact else None
+                ),
             )
     else:
         input_video = retained_source_path or args.input
@@ -3773,6 +3932,12 @@ if __name__ == '__main__':
                 output_dir = os.path.dirname(args.output) or os.path.dirname(input_video)
             else:
                 output_dir = os.path.dirname(input_video)
+        source_context_settings, source_context_artifact = \
+            _load_source_context_artifact(
+                args.source_context_file,
+                output_dir,
+                checkpoint_job_config,
+            )
 
     failure_reporter = worker_failure.reporter_from_environment(output_dir)
     if failure_reporter is not None:
@@ -4239,6 +4404,24 @@ if __name__ == '__main__':
                 },
             )
 
+        source_context_prompt = ""
+        if clips_data is None and transcript is not None:
+            source_context_prompt = _finish_spoken_source_context(
+                args.source_context_file,
+                source_context_settings,
+                source_context_artifact,
+                input_video,
+                duration,
+            )
+        elif clips_data is None:
+            _finish_unused_source_context(
+                args.source_context_file,
+                source_context_settings,
+                source_context_artifact,
+                input_video,
+                duration,
+            )
+
         # 4. Clip analysis (transcript-driven, or visual for silent videos)
         if failure_reporter is not None:
             selector_is_ollama = (
@@ -4260,6 +4443,7 @@ if __name__ == '__main__':
                 checkpoint_store_instance=compute_checkpoint_store,
                 job_config=checkpoint_job_config,
                 source_identity=source_identity,
+                source_context_prompt=source_context_prompt,
             )
         else:
             clips_data = get_visual_clips(
@@ -4281,6 +4465,13 @@ if __name__ == '__main__':
             selection_descriptor = clips_data.pop(
                 "_checkpoint_model_descriptor", None,
             )
+            source_youtube_tags = source_context_feature.youtube_tags_from_metadata(
+                (source_context_artifact or {}).get("url_metadata"),
+            )
+            if source_youtube_tags:
+                for clip in clips_data["shorts"]:
+                    if isinstance(clip, dict):
+                        clip["source_youtube_tags"] = list(source_youtube_tags)
 
             # Save metadata. Silent videos have no transcript → no subtitles,
             # which is correct (there's no speech to caption).
