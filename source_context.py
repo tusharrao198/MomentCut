@@ -142,7 +142,7 @@ class SourceContextSettings:
         if mode == "disabled":
             return cls(
                 mode=mode, manual_max_chars=2000, description_max_chars=2400,
-                tag_max_items=20, tag_max_chars=80, prompt_max_chars=2400,
+                tag_max_items=100, tag_max_chars=80, prompt_max_chars=2400,
                 vision_provider="ollama", vision_base_url="",
                 vision_model="qwen2.5vl:3b", vision_timeout_seconds=90.0,
                 vision_retry_attempts=1, vision_concurrency=1,
@@ -195,7 +195,7 @@ class SourceContextSettings:
             mode=mode,
             manual_max_chars=_bounded_int("SOURCE_CONTEXT_MANUAL_MAX_CHARS", 2000, 1, 10000),
             description_max_chars=_bounded_int("SOURCE_CONTEXT_DESCRIPTION_MAX_CHARS", 2400, 0, 10000),
-            tag_max_items=_bounded_int("SOURCE_CONTEXT_TAG_MAX_ITEMS", 20, 0, 100),
+            tag_max_items=_bounded_int("SOURCE_CONTEXT_TAG_MAX_ITEMS", 100, 0, 100),
             tag_max_chars=_bounded_int("SOURCE_CONTEXT_TAG_MAX_CHARS", 80, 1, 500),
             prompt_max_chars=_bounded_int("SOURCE_CONTEXT_PROMPT_MAX_CHARS", 2400, 256, 12000),
             vision_provider=provider,

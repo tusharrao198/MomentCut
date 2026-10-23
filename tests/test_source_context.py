@@ -240,6 +240,8 @@ def test_local_detail_prompt_includes_context_without_changing_empty_prompt():
         window, **common, source_context_prompt="SOURCE_CONTEXT_JSON\n{}")
 
     assert enriched.replace("SOURCE_CONTEXT_JSON\n{}\n\n", "") == plain
+    assert "3-4 short factual sentences, one sentence" in enriched
+    assert "use it only to corroborate relevant source identity or context" in enriched
 
 
 def test_context_changes_invalidate_local_selection_key(tmp_path, monkeypatch):

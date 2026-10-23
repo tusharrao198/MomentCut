@@ -18,7 +18,7 @@ MODEL_DESCRIPTION_LIMIT_BYTES = 1_200
 TAG_LIMIT_BYTES = 60
 TAG_LIST_LIMIT_CHARS = 500
 MAX_MODEL_TAGS = 15
-MAX_TOTAL_TAGS = 20
+MAX_TOTAL_TAGS = 100
 MAX_HASHTAGS = 5
 MAX_PROFILE_BYTES = 64 * 1024
 MAX_PROFILE_SECTIONS = 12
@@ -244,10 +244,8 @@ def compose_youtube_metadata(clip: dict) -> tuple[str, list[str], bool, str | No
     hashtags = normalise_hashtags(
         normalised["youtube_hashtags"] + profile["default_hashtags"]
     )
-    source_tag_line = (
-        "Source video tags: " + ", ".join(normalised["source_youtube_tags"])
-        if normalised["source_youtube_tags"] else ""
-    )
+    source_tags = _fit_youtube_tags(normalised["source_youtube_tags"])
+    source_tag_line = "Source video tags: " + ", ".join(source_tags) if source_tags else ""
     sections = [
         normalised["youtube_description_intro"],
         source_tag_line,
@@ -257,7 +255,9 @@ def compose_youtube_metadata(clip: dict) -> tuple[str, list[str], bool, str | No
     description = "\n\n".join(section for section in sections if section).strip()
     truncated = len(description.encode("utf-8")) > DESCRIPTION_LIMIT_BYTES
     description = _utf8_limit(description, DESCRIPTION_LIMIT_BYTES)
-    tags = _fit_youtube_tags(normalised["youtube_tags"] + profile["default_tags"])
+    tags = _fit_youtube_tags(
+        source_tags + normalised["youtube_tags"] + profile["default_tags"]
+    )
     return description, tags, truncated, warning
 
 

@@ -258,6 +258,29 @@ def test_create_post_serializes_youtube_tags_as_postiz_tag_objects(monkeypatch):
     ]
 
 
+def test_create_post_preserves_more_than_twenty_youtube_tags(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(201, json=[{"postId": "post-123"}])
+
+    _install_transport(monkeypatch, handler)
+    tags = [f"source-{index}" for index in range(21)]
+    pc.create_youtube_post(
+        pc.configuration(),
+        "yt-1",
+        {"id": "media-1", "path": "/uploads/clip.mp4"},
+        "A valid title",
+        "Description",
+        tags=tags,
+    )
+
+    assert seen["body"]["posts"][0]["settings"]["tags"] == [
+        {"label": tag, "value": tag} for tag in tags
+    ]
+
+
 def test_update_draft_thumbnail_uses_settings_endpoint(monkeypatch):
     seen = {}
 

@@ -30,6 +30,7 @@ _RULES = [
     (re.compile(r'\[download\]\s+(\d+)(?:\.\d+)?% of'), '📥 Downloading video… {0}%', 'download'),
     (re.compile(r'downloading only the first (\d+) min'),
      '✂️ Long video: downloading the first {0} min', None),
+    (re.compile(r'📺 Downloaded source: (.+)'), '📺 Source quality: {0}', None),
     (re.compile(r'Video downloaded in'), '✅ Video downloaded', None),
     (re.compile(r'Audio ready ahead of the video'),
      '🎧 Audio ready — transcribing while the video downloads', None),
