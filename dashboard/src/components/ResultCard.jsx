@@ -28,6 +28,23 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
+const INVALID_DOWNLOAD_FILENAME = new RegExp(
+    `[<>:"/\\|?*${String.fromCharCode(0)}-${String.fromCharCode(31)}]`, 'g'
+);
+
+function downloadFilename(clip, index) {
+    const fallback = `clip-${index + 1}`;
+    const title = String(clip.video_title_for_youtube_short || clip.title || '')
+        .normalize('NFKC')
+        .replace(/\.mp4$/i, '')
+        .replace(INVALID_DOWNLOAD_FILENAME, '_')
+        .replace(/\s+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^[._]+|[._]+$/g, '');
+    const reserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(title);
+    return `${title && !reserved ? title.slice(0, 100) : fallback}.mp4`;
+}
+
 export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, elevenLabsKey, isManaged, postizConfigured, postizPostType, clipAiThumbnailsEnabled, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
@@ -115,7 +132,7 @@ export default function ResultCard({ clip, index, jobId, durable, geminiApiKey, 
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = `clip-${index + 1}.mp4`;
+            a.download = downloadFilename(clip, index);
             document.body.appendChild(a);
             a.click();
             window.URL.revokeObjectURL(url);
