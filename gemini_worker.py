@@ -351,6 +351,10 @@ Rules:
   work with prior context score low.
 - Prefer windows with strong hooks, conflict, surprise, outrage, emotion,
   novelty, big numbers, or a clear payoff.
+- A window can include `audio_events`: timestamped classifier probabilities.
+  They are supporting timing evidence, not verified facts. They never make
+  otherwise weak material a good Short. Prefer transcript meaning when it
+  conflicts with weak audio evidence.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
@@ -401,6 +405,11 @@ CLIP RULES:
   story, or land the same joke — even across different windows. Pick the
   stronger one and drop the other. Two clips on the same broad topic are fine
   as long as each lands its own moment.
+- Candidate `audio_events` are probabilistic timing evidence only. Use them to
+  notice a possible payoff, but do not state an event label as fact unless the
+  transcript or visible material independently establishes it. Prefer transcript
+  meaning when it conflicts with weak audio evidence; every result is one
+  continuous range, never a montage of separate moments.
 
 HOOK PLAYBOOK — pick the strongest fitting pattern for `viral_hook_text` (max 10 words):
 - Open question: "Why does everyone get this wrong?"
@@ -508,6 +517,10 @@ CLIP RULES:
 - `youtube_hashtags` contains 3-5 relevant hashtag strings.
 - `thumbnail_brief` stays grounded in this transcript. Never invent a game,
   movie, person, hardware specification, result, or event.
+- `AUDIO_EVENT_EVIDENCE`, when present in the transcript field, is probabilistic
+  timing evidence only. It may help locate a payoff but cannot establish a fact.
+  Prefer transcript meaning when it conflicts with weak audio evidence. Select
+  one continuous range only; never combine separate moments.
 {correction}
 
 TRANSCRIPT_LANGUAGE: {language}
@@ -566,6 +579,9 @@ Rules:
 - Penalize clips that need missing context, repeat another candidate's point,
   or end before the payoff.
 - Judge the clip transcript and moment, not the writing quality of its title.
+- `audio_events`, when present, are probabilistic timing evidence only. They
+  can support a possible payoff but do not establish an event as fact. Prefer
+  transcript meaning when it conflicts with weak audio evidence.
 - Return only valid JSON.
 
 TRANSCRIPT_LANGUAGE: {language}

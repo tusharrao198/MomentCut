@@ -12,3 +12,9 @@ os.environ["BILLING_ENABLED"] = "0"
 # Test modules opt into source context themselves. Keep a developer's .env
 # from turning it on for otherwise unrelated API and pipeline tests.
 os.environ["SOURCE_CONTEXT_MODE"] = "disabled"
+# Hook-grounding fixtures exercise the upstream Gemini-enabled default. Keep a
+# developer's local-only setting from turning that model call into a no-op.
+os.environ["GEMINI_CLIP_ANALYSIS_ENABLED"] = "true"
+# CED is an explicit macOS opt-in. Keep a developer's native .env from
+# affecting unrelated checkpoint, API, or portable-route tests.
+os.environ["AUDIO_EVENTS_MODE"] = "disabled"

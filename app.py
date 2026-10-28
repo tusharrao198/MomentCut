@@ -51,11 +51,34 @@ import layout_ranges
 import watermarked
 import media_auth
 import worker_failure
+import audio_events
 import checkpoint_store
 import job_state
 from gemini_feature_flags import clip_ai_thumbnails_enabled, clip_analysis_enabled
 
 PIPELINE_CHECKPOINTS_ENABLED = checkpoint_store.pipeline_checkpoints_enabled()
+
+
+def _audio_events_config(env: dict, checkpointing_enabled: bool) -> dict:
+    """Resolve the opt-in Mac CED configuration before a job is accepted."""
+    settings = audio_events.AudioEventSettings.from_env(env)
+    if not settings.enabled:
+        return settings.durable_config()
+    if not checkpointing_enabled:
+        raise ValueError("AUDIO_EVENTS_MODE=ced requires PIPELINE_CHECKPOINTS_ENABLED=true")
+    if MAX_CONCURRENT_JOBS != 1:
+        raise ValueError("AUDIO_EVENTS_MODE=ced requires MAX_CONCURRENT_JOBS=1")
+    if not audio_events.runtime_enabled(env):
+        raise ValueError(
+            "AUDIO_EVENTS_MODE=ced requires AUDIO_EVENTS_RUNTIME_ENABLED=true"
+        )
+    from platforms.macos import audio_events as macos_audio_events
+    # Job acceptance must not load CED while another queued job may be using
+    # ASR, CED, or Qwen. The explicit N7 checker performs the bounded Metal
+    # probe; the actual one-worker stage verifies its observed device.
+    return macos_audio_events.resolve_settings(
+        settings, verify_execution=False,
+    ).durable_config()
 
 
 class MissingTerminalCredentials(RuntimeError):
@@ -158,6 +181,11 @@ def build_job_child_env(job_config: dict, runtime_secrets: dict) -> dict[str, st
     )
     env["PIPELINE_CHECKPOINTS_ENABLED"] = (
         "true" if effective_checkpointing else "false"
+    )
+    # This switch is deliberately live rather than sealed: the server's current
+    # setting must govern every worker launch and resume.
+    env["AUDIO_EVENTS_RUNTIME_ENABLED"] = os.environ.get(
+        "AUDIO_EVENTS_RUNTIME_ENABLED", "true"
     )
     # Privacy-sensitive model enablement follows the same kill-switch rule:
     # current deployment disablement wins, while a restart cannot turn Gemini
@@ -284,6 +312,7 @@ def _resolved_job_config(
     clip_max_seconds,
     checkpointing_enabled: bool,
     source_context_config: dict | None = None,
+    audio_events_config: dict | None = None,
 ) -> dict:
     from transcribe_backends import checkpoint_asr_config
 
@@ -338,6 +367,11 @@ def _resolved_job_config(
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "source": source,
         "source_context": dict(source_context_config or {"enabled": False}),
+        "audio_events": dict(
+            audio_events_config
+            if audio_events_config is not None
+            else _audio_events_config(env, checkpointing_enabled)
+        ),
         "pipeline": {
             "output_format": output_format,
             "layouts": sorted(layouts or []),
@@ -4058,6 +4092,15 @@ def _purge_local_jobs_for_user(user_id) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Validate active CED execution before serving.  When the live kill switch
+    # is off, the server stays available to render/reuse already-valid cached
+    # work, while new CED jobs are rejected at acceptance time.
+    audio_event_env = dict(os.environ)
+    startup_audio_events = audio_events.AudioEventSettings.from_env(audio_event_env)
+    if startup_audio_events.enabled and audio_events.runtime_enabled(audio_event_env):
+        await asyncio.to_thread(
+            _audio_events_config, audio_event_env, PIPELINE_CHECKPOINTS_ENABLED,
+        )
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
     # Re-enqueue jobs that were mid-processing when we stopped (redeploy). Their
@@ -5213,6 +5256,14 @@ async def process_endpoint(
             if "transcript_path" in locals() else None
         ),
     }
+    try:
+        accepted_audio_events_config = await asyncio.to_thread(
+            _audio_events_config, dict(env), PIPELINE_CHECKPOINTS_ENABLED,
+        )
+    except (ValueError, audio_events.AudioEventError) as error:
+        await _drop_unstarted_job(reservation_id, job_output_dir)
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
     durable_config = _resolved_job_config(
         job_id,
         job_output_dir,
@@ -5228,6 +5279,7 @@ async def process_endpoint(
         clip_max_seconds=max_secs,
         checkpointing_enabled=PIPELINE_CHECKPOINTS_ENABLED,
         source_context_config=context_job_config,
+        audio_events_config=accepted_audio_events_config,
     )
     durable_state = {
         "schema_version": 1,
