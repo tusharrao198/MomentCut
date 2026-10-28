@@ -144,3 +144,13 @@ def test_invalid_gate_is_reported_not_raised(monkeypatch):
     assert report["ready"] is False
     assert report["host"]["apple_acceleration"] == "unresolved"
     assert report["host"]["configuration_error"] == "ValueError: bad gate"
+
+def test_main_loads_checkout_env_before_collect(monkeypatch, capsys):
+    loaded = []
+    monkeypatch.setattr(
+        capabilities, "_load_repository_env", lambda: loaded.append(True))
+    monkeypatch.setattr(capabilities, "collect", lambda: {"ready": True})
+
+    assert capabilities.main() == 0
+    assert loaded == [True]
+    assert '"ready": true' in capsys.readouterr().out

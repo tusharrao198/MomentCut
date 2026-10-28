@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import audio_events
 import job_state
 
 
@@ -26,6 +27,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _FIXED_STAGES = {
     "source": "source.json",
     "asr": "asr.json",
+    "audio-events": "audio-events.json",
     "source-layout": "source-layout.json",
     "source-subtitles": "source-subtitles.json",
     "source-scenes": "source-scenes.json",
@@ -42,6 +44,7 @@ _KEYED_STAGES = {
 _IMPLEMENTATION_VERSIONS = {
     "source": "source-v1",
     "asr": "asr-v1",
+    "audio-events": "audio-events-v1",
     "source-layout": "source-layout-v1",
     "source-subtitles": "source-subtitles-v1",
     "source-scenes": "source-scenes-v1",
@@ -112,7 +115,7 @@ PIPELINE_ENV_NAMES = (
     "SOURCE_CONTEXT_FRAME_COUNT", "SOURCE_CONTEXT_MAX_FRAME_WIDTH",
     "SOURCE_CONTEXT_NUM_CTX", "SOURCE_CONTEXT_VISION_REQUEST_MAX_BYTES",
     "SOURCE_CONTEXT_VISION_RESPONSE_MAX_BYTES",
-)
+) + audio_events.AUDIO_EVENT_ENV_NAMES
 
 
 def pipeline_checkpoints_enabled(env: dict | None = None) -> bool:
@@ -237,6 +240,29 @@ def expected_asr_key(
     })
 
 
+def expected_audio_events_key(
+    job_config: dict,
+    source_identity: dict,
+    asr_effective_route: str,
+) -> str:
+    config = job_config.get("audio_events")
+    if not audio_events.valid_durable_config(config) or not config.get("enabled"):
+        raise CheckpointError("Audio-event checkpoint requires an enabled sealed configuration")
+    route = audio_events.effective_route(
+        audio_events.AudioEventSettings.from_durable_config(config)
+    )
+    return compatibility_key("audio-events", {
+        "source_content_identity": _content_identity(source_identity),
+        "route": route,
+        "resolved_stage_config": _stage_config(job_config, "asr", "audio_events"),
+        "expected_upstream_compatibility_keys": [
+            expected_source_request_key(job_config),
+            expected_asr_key(job_config, source_identity, asr_effective_route),
+        ],
+        "semantic_input_hashes": [],
+    })
+
+
 def expected_clip_plan_key(
     job_config: dict,
     source_identity: dict,
@@ -248,13 +274,32 @@ def expected_clip_plan_key(
     asr_route = route_context.get("asr_effective_route")
     if asr_route:
         upstream.append(expected_asr_key(job_config, source_identity, asr_route))
+    audio_config = job_config.get("audio_events")
+    audio_event_route = (
+        audio_events.effective_route(
+            audio_events.AudioEventSettings.from_durable_config(audio_config)
+        )
+        if audio_events.valid_durable_config(audio_config)
+        and audio_config.get("enabled")
+        else None
+    )
+    if (
+        audio_event_route is not None
+        and route_context.get("audio_events_effective_route") == audio_event_route
+    ):
+        upstream.append(expected_audio_events_key(
+            job_config, source_identity, asr_route,
+        ))
+    stage_names = (
+        "pipeline", "selection", "asr", "scene_detection", "text_selection",
+        "vision_selection", "source_context",
+    )
+    if audio_events.valid_durable_config(audio_config) and audio_config.get("enabled"):
+        stage_names += ("audio_events",)
     return compatibility_key("clip-plan", {
         "source_content_identity": _content_identity(source_identity),
         "route": route_context,
-        "resolved_stage_config": _stage_config(
-            job_config, "pipeline", "selection", "asr", "scene_detection",
-            "text_selection", "vision_selection", "source_context",
-        ),
+        "resolved_stage_config": _stage_config(job_config, *stage_names),
         "expected_upstream_compatibility_keys": upstream,
         "semantic_input_hashes": [],
     })
@@ -898,6 +943,10 @@ def _valid_stage_payload(
         return False
     if stage == "source":
         return _valid_source_payload(payload)
+    if stage == "audio-events":
+        return isinstance(payload.get("artifact"), dict) and isinstance(
+            payload.get("qualified_event_count"), int
+        ) and payload["qualified_event_count"] >= 0
     if stage == "asr":
         source_duration = None
         try:
@@ -1083,6 +1132,10 @@ class CheckpointStore:
                 return False
             if not _valid_stage_payload(
                 stage, envelope.get("payload"), self.source_identity
+            ):
+                return False
+            if stage == "audio-events" and not self._valid_audio_events_payload(
+                envelope.get("payload")
             ):
                 return False
             if not source_optional:
@@ -1342,6 +1395,54 @@ class CheckpointStore:
             return None
         return path
 
+    def validate_json_artifact(self, descriptor: dict, *, maximum_bytes: int) -> dict | None:
+        """Return bounded JSON only when its descriptor is job-local and exact."""
+        try:
+            relative = descriptor.get("relative_path") if isinstance(descriptor, dict) else None
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or os.path.isabs(relative)
+                or relative != os.path.basename(relative)
+                or relative.startswith(".")
+            ):
+                return None
+            path = self._resolved_artifact_path(descriptor)
+            if path is None or os.path.islink(path) or not os.path.isfile(path):
+                return None
+            size = os.path.getsize(path)
+            if size <= 0 or size > maximum_bytes or size != descriptor.get("size"):
+                return None
+            if not _SHA256_RE.fullmatch(str(descriptor.get("sha256") or "")):
+                return None
+            if sha256_file(path) != descriptor["sha256"]:
+                return None
+            return job_state.read_json(path, max_bytes=maximum_bytes)
+        except Exception:
+            return None
+
+    def _valid_audio_events_payload(self, payload: Any) -> bool:
+        if not isinstance(payload, dict) or set(payload) != {"artifact", "qualified_event_count"}:
+            return False
+        descriptor = payload.get("artifact")
+        if not isinstance(payload.get("qualified_event_count"), int) or payload["qualified_event_count"] < 0:
+            return False
+        config = self.job_config.get("audio_events") or {}
+        if not audio_events.valid_durable_config(config) or not config.get("enabled"):
+            return False
+        artifact = self.validate_json_artifact(
+            descriptor, maximum_bytes=int(config["max_raw_bytes"]),
+        )
+        try:
+            settings = audio_events.AudioEventSettings.from_durable_config(config)
+        except audio_events.AudioEventError:
+            return False
+        if not audio_events.validate_event_artifact(
+            artifact, settings=settings, source_identity=self.source_identity,
+        ):
+            return False
+        return artifact["summary"]["qualified_event_count"] == payload["qualified_event_count"]
+
     def validate_artifact(self, descriptor: dict) -> bool:
         try:
             path = self._resolved_artifact_path(descriptor)
@@ -1415,6 +1516,37 @@ class CheckpointStore:
                 raise CheckpointError("unknown ASR route")
             if value.get("asr_outcome") not in ASR_OUTCOMES:
                 raise CheckpointError("unknown ASR outcome")
+            event_fields = {
+                "audio_events_effective_route",
+                "audio_events_compatibility_key",
+                "audio_events_has_qualified_events",
+            }
+            present = event_fields.intersection(value)
+            if present and present != event_fields:
+                raise CheckpointError("incomplete audio-event clip-plan route")
+            if present:
+                configured_audio_events = self.job_config.get("audio_events")
+                if (
+                    not audio_events.valid_durable_config(configured_audio_events)
+                    or not configured_audio_events.get("enabled")
+                    or value.get("audio_events_effective_route")
+                    != audio_events.effective_route(
+                        audio_events.AudioEventSettings.from_durable_config(
+                            configured_audio_events
+                        )
+                    )
+                ):
+                    raise CheckpointError("unknown audio-event route")
+                if not _SHA256_RE.fullmatch(str(value.get("audio_events_compatibility_key") or "")):
+                    raise CheckpointError("invalid audio-event checkpoint key")
+                if not isinstance(value.get("audio_events_has_qualified_events"), bool):
+                    raise CheckpointError("invalid audio-event completion state")
+                expected_event_key = expected_audio_events_key(
+                    self.job_config, self.source_identity,
+                    value.get("asr_effective_route"),
+                )
+                if value["audio_events_compatibility_key"] != expected_event_key:
+                    raise CheckpointError("audio-event checkpoint key does not match route")
             revision = value.get("selection_model_revision")
             if revision is not None and (
                 not isinstance(revision, str)
@@ -1506,8 +1638,41 @@ class CheckpointStore:
             "speech-local", "speech-gemini",
         }
         outcome = route.get("asr_outcome")
-        if speech_route != (outcome == "speech"):
+        configured_audio_events = self.job_config.get("audio_events")
+        event_backed = (
+            audio_events.valid_durable_config(configured_audio_events)
+            and configured_audio_events.get("enabled")
+            and route.get("audio_events_effective_route")
+            == audio_events.effective_route(
+                audio_events.AudioEventSettings.from_durable_config(
+                    configured_audio_events
+                )
+            )
+        )
+        supplied_sparse_transcript = (
+            outcome == "sparse_speech"
+            and route.get("asr_effective_route") == "precomputed-transcript"
+        )
+        if speech_route != (
+            outcome == "speech"
+            or (outcome == "sparse_speech" and (
+                event_backed or supplied_sparse_transcript
+            ))
+        ):
             return False
+        if outcome == "sparse_speech" and not supplied_sparse_transcript:
+            if not event_backed or route.get("audio_events_has_qualified_events") is not True:
+                return False
+            try:
+                event_key = expected_audio_events_key(
+                    self.job_config, self.source_identity,
+                    route.get("asr_effective_route"),
+                )
+            except Exception:
+                return False
+            event_stage = self.load_fixed("audio-events", event_key)
+            if event_stage is None or (event_stage.get("payload") or {}).get("qualified_event_count", 0) <= 0:
+                return False
         if route.get("asr_effective_route") == "no-audio" \
                 and outcome != "no_audio":
             return False
@@ -1581,7 +1746,27 @@ def completed_selection_boundary(
         outcome = (asr or {}).get("payload", {}).get("outcome")
         if outcome == "speech":
             return "speech"
-        if outcome in {"no_audio", "sparse_speech"}:
+        if outcome == "sparse_speech":
+            asr_route = (asr or {}).get("route_context")
+            if not asr_route:
+                return None
+            if asr_route == "precomputed-transcript":
+                return "speech"
+            try:
+                event_key = expected_audio_events_key(
+                    config, store.source_identity, asr_route,
+                )
+                event_stage = store.load_fixed("audio-events", event_key)
+                if event_stage is None:
+                    return None
+                if (event_stage.get("payload") or {}).get(
+                    "qualified_event_count", 0
+                ) > 0:
+                    return "speech"
+                return "silent"
+            except Exception:
+                return None
+        if outcome == "no_audio":
             return "silent"
     except Exception:
         pass

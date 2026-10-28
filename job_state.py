@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
+import audio_events
+
 
 class JobStateError(RuntimeError):
     pass
@@ -340,6 +342,10 @@ def _validate_job_config(config: dict) -> bool:
             and bool(_SHA256_RE.fullmatch(transcript_sha256))
         )
         and isinstance(config.get("pipeline"), dict)
+        and (
+            "audio_events" not in config
+            or audio_events.valid_durable_config(config.get("audio_events"))
+        )
         and isinstance(environment, dict)
         and all(
             isinstance(name, str)

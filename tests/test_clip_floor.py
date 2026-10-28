@@ -10,6 +10,8 @@ import re
 
 import pytest
 
+import audio_events
+
 main = pytest.importorskip("main")
 
 
@@ -35,15 +37,16 @@ def _clip(start, window_id, score=80):
     }
 
 
-def _run(monkeypatch, detail_responses, stage_cost=None, return_result=False):
+def _run(monkeypatch, detail_responses, stage_cost=None, return_result=False,
+         audio_event_artifact=None, use_local=False):
     """Drive get_viral_clips with canned stage results; returns (clips, calls)."""
     calls = []
 
     def fake_stage(client, model, prompt, schema):
         if schema is main.gemini_worker.LocalWindowDetailResponse:
-            match = re.search(r"^WINDOW_ID: (window_\d+)$", prompt, re.M)
+            match = re.search(r"^WINDOW_ID: ([A-Za-z0-9_]+)$", prompt, re.M)
             window_id = match.group(1)
-            calls.append(("detail-window", [window_id]))
+            calls.append(("detail-window", [window_id], prompt))
             available = detail_responses[0] if detail_responses else []
             clip = next(
                 (
@@ -75,7 +78,7 @@ def _run(monkeypatch, detail_responses, stage_cost=None, return_result=False):
                              if "WINDOWS_JSON:" in prompt else "[]")
         if schema is main.gemini_worker.ScoreResponse:
             ids = [w["id"] for w in payload]
-            calls.append(("score", ids))
+            calls.append(("score", ids, payload))
             # The prompt asks for every window to be scored.
             return {"windows": [{"id": i, "start": 0, "end": 90, "score": 90 - n,
                                  "reason": "r"}
@@ -87,10 +90,77 @@ def _run(monkeypatch, detail_responses, stage_cost=None, return_result=False):
         return {"shorts": detail_responses.pop(0)}, stage_cost
 
     monkeypatch.setattr(main, "_run_gemini_stage", fake_stage)
+    if use_local:
+        # The local aggregation test deliberately exercises the OpenAI-style
+        # route with a canned stage response.
+        monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
+        monkeypatch.setenv("LLM_MODEL", "qwen2.5:7b")
+    else:
+        # The Gemini-stage fixtures must not inherit a developer's local
+        # Ollama configuration or disabled Gemini feature flag.
+        for name in ("LLM_BASE_URL", "LLM_MODEL", "LLM_PROVIDER"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("GEMINI_CLIP_ANALYSIS_ENABLED", "true")
+        # Score every fixture window together so the canned order maps to the
+        # candidate ownership asserted below.
+        monkeypatch.setenv("LLM_SCORE_BATCH", "10")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(main.genai, "Client", lambda api_key=None: object())
-    out = main.get_viral_clips(_transcript(), 600.0)
+    out = main.get_viral_clips(
+        _transcript(), 600.0, audio_event_artifact=audio_event_artifact,
+    )
     return (out if return_result else (out or {}).get("shorts", [])), calls
+
+
+def _audio_event_artifact():
+    return {
+        "schema_version": 1,
+        "provider": "ced",
+        "profile": {
+            "id": "gameplay-v1", "version": 1,
+            "sha256": audio_events._profile_digest(),
+        },
+        "identity": {
+            "source_sha256": "a" * 64,
+            "model_sha256": "b" * 64,
+            "worker_build": "test", "sample_rate_hz": 16000,
+        },
+        "runtime": {"requested_device": "metal", "observed_device": "MTL0"},
+        "audio_stream": {
+            "absolute_stream_index": 0, "start_seconds": 0.0,
+            "selection_rule": "default",
+        },
+        "events": [{
+            "label": "Explosion", "start_seconds": 120.0,
+            "end_seconds": 130.0, "max_score": 0.9,
+        }],
+        "summary": {
+            "qualified_event_count": 1, "window_count": 1,
+            "gpu_residency_note": "test",
+        },
+    }
+
+
+@pytest.mark.parametrize("use_local", [False, True])
+def test_ced_evidence_reaches_each_selector_payload(monkeypatch, use_local):
+    enough = [_clip(i * 60, f"window_{i + 1:03d}") for i in range(6)]
+    _clips, calls = _run(
+        monkeypatch,
+        [enough],
+        audio_event_artifact=_audio_event_artifact(),
+        use_local=use_local,
+    )
+    score_payloads = [entry[2] for entry in calls if entry[0] == "score"]
+    assert any(
+        item.get("audio_events")
+        for payload in score_payloads
+        for item in payload
+    )
+    if use_local:
+        assert any(
+            "AUDIO_EVENT_EVIDENCE" in entry[2]
+            for entry in calls if entry[0] == "detail-window"
+        )
 
 
 def test_a_short_detail_result_asks_the_unused_windows(monkeypatch):
@@ -149,6 +219,7 @@ def test_local_cost_metadata_survives_two_pass_aggregation(monkeypatch):
         [enough],
         stage_cost=local_cost,
         return_result=True,
+        use_local=True,
     )
     assert result["cost_analysis"]["local"] is True
     assert result["cost_analysis"]["model"] == "qwen2.5:7b"

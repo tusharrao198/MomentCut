@@ -43,6 +43,7 @@ import vision_backend
 import worker_failure
 import scene_detection
 import accelerator_runtime
+import audio_events
 import source_context as source_context_feature
 import source_context_vision
 import checkpoint_store
@@ -2127,6 +2128,13 @@ def local_detail_fallback_limit():
 def _local_window_detail_prompt(window, *, video_duration, language,
                                 min_secs, max_secs, correction="",
                                 source_context_prompt=""):
+    evidence = audio_events.selection_prompt_evidence(window)
+    window_text = window["text"]
+    if evidence:
+        window_text += (
+            "\n\nAUDIO_EVENT_EVIDENCE (probabilistic, not verified facts): "
+            + json.dumps(evidence)
+        )
     prompt = gemini_worker.LOCAL_WINDOW_DETAIL_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
         language=language,
@@ -2135,7 +2143,7 @@ def _local_window_detail_prompt(window, *, video_duration, language,
         window_id=window["id"],
         window_start=window["start"],
         window_end=window["end"],
-        window_text=window["text"],
+        window_text=window_text,
         correction=correction,
     )
     return gemini_worker.with_source_context(
@@ -2300,7 +2308,7 @@ def _run_local_detail_window(client, model_name, window, *, video_duration,
         )
         if valid:
             candidate = valid[0]
-            if words:
+            if words and window.get("word_snapping_allowed", True):
                 candidate["proposed"] = [
                     candidate.get("start", 0),
                     candidate.get("end", 0),
@@ -2423,7 +2431,8 @@ def _run_local_detail_windows(client, model_name, primary_windows,
 def _rank_local_candidates(client, model_name, candidates, *,
                            transcript_result=None, language="unknown", costs,
                            checkpoint_store_instance=None, job_config=None,
-                           source_identity=None, source_context_prompt=""):
+                           source_identity=None, source_context_prompt="",
+                           audio_event_artifact=None):
     """Globally compare independent window picks; fall back without data loss."""
     prepared = []
     payload = []
@@ -2451,6 +2460,9 @@ def _rank_local_candidates(client, model_name, candidates, *,
             # Keep ten candidates plus schema comfortably inside an 8k
             # context. The exact cut timestamps retain the full source truth.
             "clip_transcript": excerpt[:600],
+            **({"audio_events": audio_events.event_evidence_for_range(
+                audio_event_artifact, entry.get("start"), entry.get("end"),
+            )} if audio_event_artifact else {}),
         })
 
     if len(prepared) < 2:
@@ -2527,7 +2539,8 @@ def _rank_local_candidates(client, model_name, candidates, *,
 
 def get_viral_clips(transcript_result, video_duration, *,
                     checkpoint_store_instance=None, job_config=None,
-                    source_identity=None, source_context_prompt=""):
+                    source_identity=None, source_context_prompt="",
+                    audio_event_artifact=None):
     """Windowed clip selection: score candidates, then extract/rank the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
@@ -2571,9 +2584,21 @@ def get_viral_clips(transcript_result, video_duration, *,
         # the requested band — a user asking for 60-90s clips on the default
         # 90s windows would get clips squeezed against the window walls.
         min_secs, max_secs = clip_duration_bounds()
-        windows = build_transcript_windows(
+        transcript_windows = build_transcript_windows(
             transcript_result, video_duration,
             window_seconds=max(90, int(max_secs * 1.5)))
+        windows = (
+            audio_events.build_selection_windows(
+                transcript_windows,
+                audio_event_artifact,
+                source_duration_seconds=video_duration,
+                maximum_windows=(job_config or {}).get("audio_events", {}).get(
+                    "max_candidate_windows", 24,
+                ),
+                minimum_window_seconds=max(90, int(max_secs * 1.5)),
+            )
+            if audio_event_artifact else transcript_windows
+        )
         print(f"   Built {len(windows)} scoring window(s).")
         costs = []
 
@@ -2591,7 +2616,19 @@ def get_viral_clips(transcript_result, video_duration, *,
         target = shortlist_target(video_duration)
 
         def _payload(ws):
-            return [{"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]} for w in ws]
+            payload = []
+            for window in ws:
+                entry = {
+                    "id": window["id"],
+                    "start": window["start"],
+                    "end": window["end"],
+                    "text": window["text"],
+                }
+                evidence = audio_events.selection_prompt_evidence(window)
+                if evidence:
+                    entry["audio_events"] = evidence
+                payload.append(entry)
+            return payload
 
         def _score_prompt(ws):
             prompt = gemini_worker.SCORE_PROMPT_TEMPLATE.format(
@@ -2759,6 +2796,7 @@ def get_viral_clips(transcript_result, video_duration, *,
                 job_config=job_config,
                 source_identity=source_identity,
                 source_context_prompt=source_context_prompt,
+                audio_event_artifact=audio_event_artifact,
             )
             # Rank before overlap removal so the globally stronger version of
             # a repeated moment survives. Keep the best-first order until the
@@ -2833,13 +2871,16 @@ def get_viral_clips(transcript_result, video_duration, *,
             # Keep the model's raw proposal: it is how boundary accuracy is
             # measured (distance to the nearest word before the snap; p90 was
             # 0.4-0.5 s on 8 talks, 21-sep-2026, so the snap reaches it).
+            source_window = by_id.get(s.get("source_window_id"))
+            if source_window and not source_window.get("word_snapping_allowed", True):
+                continue
             s["proposed"] = [s.get("start", 0), s.get("end", 0)]
             ns, ne = snap_clip_to_words_in_window(
                 s.get("start", 0),
                 s.get("end", 0),
                 words,
                 video_duration,
-                by_id.get(s.get("source_window_id")),
+                source_window,
                 min_duration=min_secs,
                 max_duration=max_secs,
             )
@@ -3261,6 +3302,7 @@ def _resolved_job_config(
             "download_skip_statics": env("DOWNLOAD_SKIP_STATICS", "0") == "1",
             "downloader_policy": "yt-dlp-v1",
         },
+        "audio_events": {"enabled": False},
         "pipeline": {
             "output_format": args.format,
             "layouts": sorted(
@@ -3402,6 +3444,106 @@ def _checkpointed_selection_boundary(config):
         config,
         current_enablement=checkpoint_store.pipeline_checkpoints_enabled(),
     )
+
+
+def _audio_events_for_job(config):
+    """Return sealed CED settings without resolving a removed local toolchain."""
+    if not isinstance(config, dict):
+        return audio_events.AudioEventSettings.from_env()
+    durable = config.get("audio_events") or {"enabled": False}
+    if not durable.get("enabled"):
+        return audio_events.AudioEventSettings.from_durable_config(durable)
+    from platforms.macos import audio_events as macos_audio_events
+    return macos_audio_events.settings_for_execution(durable)
+
+
+def _run_audio_events_stage(
+    settings, *, input_video, duration, source_identity, asr_provenance,
+    checkpoint_store_instance, checkpoint_job_config, checkpoint_project,
+):
+    """Run or reuse CED after ASR and before source context/selection."""
+    if not settings.enabled:
+        return None, None, False
+    if checkpoint_store_instance is None or checkpoint_job_config is None:
+        raise RuntimeError("Audio-event analysis requires a managed checkpointed job")
+    asr_route = asr_provenance.get("effective_route") if isinstance(asr_provenance, dict) else None
+    if not isinstance(asr_route, str):
+        raise RuntimeError("Audio-event analysis needs a completed ASR route")
+    event_key = checkpoint_store.expected_audio_events_key(
+        checkpoint_job_config, source_identity, asr_route,
+    )
+    cached = checkpoint_store_instance.load_fixed("audio-events", event_key)
+    if cached is not None:
+        payload = cached.get("payload") or {}
+        artifact = checkpoint_store_instance.validate_json_artifact(
+            payload.get("artifact") or {}, maximum_bytes=settings.max_raw_bytes,
+        )
+        if audio_events.validate_event_artifact(
+            artifact, settings=settings, source_identity=source_identity,
+        ):
+            print(
+                "♻️ Reusing completed audio-event analysis "
+                f"({artifact['summary']['qualified_event_count']} qualified event(s))."
+            )
+            return artifact, event_key, True
+
+    stream = audio_events.probe_audio_stream("ffprobe", input_video)
+    if stream is None:
+        print("🔇 No decodable source audio stream for CED analysis.")
+        return None, None, False
+    if not audio_events.runtime_enabled():
+        raise RuntimeError(
+            "Audio-event analysis is disabled by AUDIO_EVENTS_RUNTIME_ENABLED; "
+            "the completed ASR checkpoint is retained for retry."
+        )
+    from platforms.macos import audio_events as macos_audio_events
+    print(f"🔊 Analyzing gameplay audio with native CED {settings.device.title()}...")
+    raw = macos_audio_events.run(
+        settings,
+        source_file=input_video,
+        source_duration_seconds=duration,
+        audio_stream=stream,
+        project_dir=checkpoint_project,
+    )
+    artifact = audio_events.normalize_ced_output(
+        raw, settings, source_identity=source_identity,
+        source_duration_seconds=duration, audio_stream=stream,
+    )
+    raw_name = "audio-events.raw.json"
+    artifact_name = "audio-events.json"
+    job_state.atomic_write_json(os.path.join(checkpoint_project, raw_name), raw)
+    artifact_path = os.path.join(checkpoint_project, artifact_name)
+    job_state.atomic_write_json(artifact_path, artifact)
+    descriptor = {
+        "relative_path": artifact_name,
+        "size": os.path.getsize(artifact_path),
+        "sha256": checkpoint_store.sha256_file(artifact_path),
+    }
+    saved = checkpoint_store_instance.save_fixed(
+        "audio-events", event_key,
+        {
+            "artifact": descriptor,
+            "qualified_event_count": artifact["summary"]["qualified_event_count"],
+        },
+        {
+            "route_context": audio_events.effective_route(settings),
+            "provenance_hashes": [
+                checkpoint_store.sha256_bytes(
+                    checkpoint_store.canonical_json_bytes({
+                        "worker_build": settings.worker_build,
+                        "model_sha256": settings.model_sha256,
+                    })
+                )
+            ],
+        },
+    )
+    if not saved:
+        raise RuntimeError("Audio-event analysis completed but its checkpoint could not be saved")
+    print(
+        "🔊 CED found "
+        f"{artifact['summary']['qualified_event_count']} qualified gameplay-audio event(s)."
+    )
+    return artifact, event_key, True
 
 
 def _probe_source(path):
@@ -3614,6 +3756,12 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     checkpoints_enabled = checkpoint_store.pipeline_checkpoints_enabled()
+    direct_audio_event_settings = audio_events.AudioEventSettings.from_env()
+    if direct_audio_event_settings.enabled and not args.managed_job:
+        parser.error(
+            "AUDIO_EVENTS_MODE=ced requires a managed queued job; direct "
+            "main.py runs cannot serialize ASR, CED, and selector models"
+        )
     if checkpoints_enabled and not args.project_dir:
         parser.error(
             "--project-dir is required when PIPELINE_CHECKPOINTS_ENABLED=true"
@@ -3773,6 +3921,19 @@ if __name__ == '__main__':
         if checkpoint_store_instance.enabled:
             compute_checkpoint_store = checkpoint_store_instance
 
+    audio_event_settings = _audio_events_for_job(checkpoint_job_config)
+    if audio_event_settings.enabled and not args.managed_job:
+        parser.error("AUDIO_EVENTS_MODE=ced requires a managed queued job")
+    if audio_event_settings.enabled and compute_checkpoint_store is None:
+        parser.error("AUDIO_EVENTS_MODE=ced requires PIPELINE_CHECKPOINTS_ENABLED=true")
+    if audio_event_settings.enabled:
+        try:
+            active_job_slots = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
+        except ValueError:
+            parser.error("MAX_CONCURRENT_JOBS must be an integer for AUDIO_EVENTS_MODE=ced")
+        if active_job_slots != 1:
+            parser.error("AUDIO_EVENTS_MODE=ced requires MAX_CONCURRENT_JOBS=1")
+
     output_format = args.format
 
     script_start_time = time.time()
@@ -3891,7 +4052,8 @@ if __name__ == '__main__':
         use_early = (retained_source_path is None
                      and not args.skip_analysis and not args.transcript
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
-                     and not os.environ.get("MAX_SOURCE_MINUTES", "").strip())
+                     and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
+                     and not audio_event_settings.enabled)
         def _on_source_metadata(info):
             if source_context_artifact is None:
                 return
@@ -4253,6 +4415,9 @@ if __name__ == '__main__':
         transcript = None
         asr_payload = None
         asr_provenance = None
+        audio_event_artifact = None
+        audio_event_key = None
+        audio_event_stream_available = None
         clips_data = None
         if clip_plan_envelope is not None:
             # Rendering enriches each clip with layout/hook metadata. Keep the
@@ -4392,17 +4557,23 @@ if __name__ == '__main__':
                     "switching to visual analysis."
                 )
 
-        # Music-only or wordless footage transcribes to a handful of words.
-        # Clip it by what is on screen instead, like a video with no audio.
+        # Sparse ASR is retained until optional CED has inspected the same
+        # source sequentially. Disabled jobs keep the existing visual route.
+        sparse_speech = False
         if clips_data is None and transcript is not None \
                 and speech_is_sparse(transcript, duration):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
-            print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
-                  f"switching to visual analysis.")
+            sparse_speech = True
             if asr_payload is not None:
                 asr_payload["outcome"] = "sparse_speech"
                 asr_payload["word_count"] = n_words
-            transcript = None
+            if audio_event_settings.enabled:
+                print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
+                      "checking gameplay audio before visual analysis.")
+            else:
+                print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
+                      "switching to visual analysis.")
+                transcript = None
 
         if clips_data is None and asr_payload is not None \
                 and compute_checkpoint_store is not None \
@@ -4427,6 +4598,43 @@ if __name__ == '__main__':
                     "backend": asr_provenance,
                 },
             )
+
+        if clips_data is None and audio_event_settings.enabled \
+                and asr_payload is not None \
+                and asr_payload.get("outcome") != "no_audio":
+            (
+                audio_event_artifact,
+                audio_event_key,
+                audio_event_stream_available,
+            ) = _run_audio_events_stage(
+                audio_event_settings,
+                input_video=input_video,
+                duration=duration,
+                source_identity=source_identity,
+                asr_provenance=asr_provenance,
+                checkpoint_store_instance=compute_checkpoint_store,
+                checkpoint_job_config=checkpoint_job_config,
+                checkpoint_project=checkpoint_project,
+            )
+            if sparse_speech and not (
+                audio_event_artifact
+                and audio_event_artifact["summary"]["qualified_event_count"]
+            ):
+                if (
+                    audio_event_stream_available is False
+                    and asr_provenance.get("effective_route")
+                    == "precomputed-transcript"
+                ):
+                    print(
+                        "🔊 No source audio was available for CED; retaining "
+                        "the supplied transcript for text selection."
+                    )
+                else:
+                    print(
+                        "🔇 CED found no qualified gameplay-audio events — "
+                        "switching to visual analysis."
+                    )
+                    transcript = None
 
         source_context_prompt = ""
         if clips_data is None and transcript is not None:
@@ -4468,6 +4676,12 @@ if __name__ == '__main__':
                 job_config=checkpoint_job_config,
                 source_identity=source_identity,
                 source_context_prompt=source_context_prompt,
+                audio_event_artifact=(
+                    audio_event_artifact
+                    if audio_event_artifact
+                    and audio_event_artifact["summary"]["qualified_event_count"]
+                    else None
+                ),
             )
         else:
             clips_data = get_visual_clips(
@@ -4525,6 +4739,14 @@ if __name__ == '__main__':
                     "selection_route": selection_route,
                     "asr_effective_route": asr_provenance["effective_route"],
                     "asr_outcome": asr_payload["outcome"],
+                    **({
+                        "audio_events_effective_route": audio_events.effective_route(
+                            audio_event_settings
+                        ),
+                        "audio_events_compatibility_key": audio_event_key,
+                        "audio_events_has_qualified_events": True,
+                    } if audio_event_artifact and audio_event_key
+                    and audio_event_artifact["summary"]["qualified_event_count"] else {}),
                     "selection_model_revision": (
                         selection_descriptor.get("digest")
                         if selection_route == "silent-local"

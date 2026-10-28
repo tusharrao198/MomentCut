@@ -5,8 +5,9 @@ Run from the OpenShorts checkout:
     ./.venv/bin/python -m platforms.macos.capabilities
 
 The check does not download models, instantiate ASR models, or start a server.
-It only reports whether the pinned model snapshots and optional runtimes already
-exist on this Mac.
+It reports whether the pinned model snapshots and optional runtimes already
+exist on this Mac. When opt-in CED audio-event analysis is enabled, it also
+runs CED's bounded model/device probe; disabled CED does not touch its model.
 """
 from __future__ import annotations
 
@@ -15,10 +16,22 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import accelerator_runtime
+import audio_events
 from platforms.macos import asr
 from platforms.macos import ffmpeg as macos_ffmpeg
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_repository_env():
+    """Load checkout configuration without replacing exported settings."""
+    from dotenv import load_dotenv
+
+    load_dotenv(REPOSITORY_ROOT / ".env")
 
 
 def _error(error):
@@ -110,6 +123,29 @@ def _ffmpeg_capabilities(*, apple_silicon):
     return result
 
 
+def _ced():
+    """Validate opt-in CED, including its bounded model/device probe."""
+    try:
+        settings = audio_events.AudioEventSettings.from_env()
+    except Exception as error:
+        return {"enabled": True, "ready": False, "error": _error(error)}
+    if not settings.enabled:
+        return {"enabled": False, "ready": True}
+    try:
+        from platforms.macos import audio_events as macos_audio_events
+        resolved = macos_audio_events.resolve_settings(settings)
+    except Exception as error:
+        return {"enabled": True, "ready": False, "error": _error(error)}
+    return {
+        "enabled": True,
+        "ready": True,
+        "provider": resolved.provider,
+        "device": resolved.device,
+        "model_sha256": resolved.model_sha256,
+        "worker_build": resolved.worker_build,
+    }
+
+
 def _required_models(transcribe_backend):
     # Parakeet may fall back to Whisper, so that mode requires both snapshots.
     return {
@@ -150,6 +186,7 @@ def collect():
         parakeet["configuration_error"] = parakeet_error
     fallback = _module("faster_whisper")
     ffmpeg = _ffmpeg_capabilities(apple_silicon=apple_silicon)
+    ced = _ced()
     required_ready = all((
         not whisper["required"]
         or (whisper_engine != "mlx" or (
@@ -160,6 +197,7 @@ def collect():
         ffmpeg["ffmpeg"]["available"],
         ffmpeg["ffprobe"]["available"],
         fallback["available"],
+        ced["ready"],
     ))
     return {
         "host": {
@@ -172,6 +210,7 @@ def collect():
         "whisper": whisper,
         "parakeet": parakeet,
         "faster_whisper_fallback": fallback,
+        "audio_events": ced,
         "ffmpeg": ffmpeg,
         # VideoToolbox is reported but not required: automatic x264 replay is
         # the selected usable fallback when its strict hardware probe fails.
@@ -187,6 +226,7 @@ def collect():
 
 
 def main():
+    _load_repository_env()
     report = collect()
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["ready"] else 1
